@@ -9,6 +9,8 @@ border_radius: lu.Corners = .all(0),
 background: lu.Background,
 effects: []lu.Effect = &.{},
 layout: lu.Layout,
+padding: lu.Sides = .all(0),
+margin: lu.Sides = .all(0),
 events: Events,
 
 const Element = @This();

@@ -20,6 +20,7 @@ const Layout = @This();
 pub const Request = struct {
     size: ?lu.Rect = null,
     pos: ?lu.Pos = null,
+    margin: ?lu.Margin = null,
 };
 
 pub const Item = struct {

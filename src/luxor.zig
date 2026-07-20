@@ -4,6 +4,9 @@ const std = @import("std");
 
 pub const Element = @import("Element.zig");
 pub const Layout = @import("Layout.zig");
+pub const Window = @import("Window.zig");
+pub const Platform = @import("Platform.zig");
+pub const Renderer = @import("Renderer.zig");
 
 pub const Rect = struct {
     w: u32,
@@ -261,12 +264,12 @@ pub fn Hook(comptime T: type) type {
                     for (ps) |p| {
                         p.func(p.data, data);
                     }
-                }
+                },
             }
         }
 
         pub fn isEnabled(self: *Self) bool {
-            return blk: switch  (self.handle) {
+            return blk: switch (self.handle) {
                 .fptrs => |ps| {
                     break :blk ps.len != 0;
                 },
@@ -274,3 +277,81 @@ pub fn Hook(comptime T: type) type {
         }
     };
 }
+
+pub const MouseButton = enum {
+    scroll,
+    left,
+    right,
+};
+
+// zig fmt: off
+pub const Key = enum {
+    a, b, c, d, e, f, g, h, i, j, k, l, m,
+    n, o, p, q, r, s, t, u, v, w, x, y, z,
+
+    num0, num1, num2, num3, num4,
+    num5, num6, num7, num8, num9,
+
+    f1, f2, f3, f4, f5, f6,
+    f7, f8, f9, f10, f11, f12,
+
+    kp0, kp1, kp2, kp3, kp4,
+    kp5, kp6, kp7, kp8, kp9,
+
+    kp_decimal,
+    kp_add,
+    kp_subtract,
+    kp_multiply,
+    kp_divide,
+    kp_enter,
+
+    left,
+    right,
+    up,
+    down,
+
+    left_shift,
+    right_shift,
+    left_ctrl,
+    right_ctrl,
+    left_alt,
+    right_alt,
+    left_super,
+    right_super,
+
+    caps_lock,
+    num_lock,
+    scroll_lock,
+
+    insert,
+    delete,
+    home,
+    end,
+    page_up,
+    page_down,
+
+    backspace,
+    enter,
+    tab,
+    escape,
+    space,
+
+    grave,
+    minus,
+    equal,
+    left_bracket,
+    right_bracket,
+    backslash,
+    semicolon,
+    apostrophe,
+    comma,
+    period,
+    slash,
+
+    print_screen,
+    pause,
+    menu,
+
+    unknown,
+};
+// zig fmt: on
