@@ -1,5 +1,6 @@
 /// The translateC for SDL3.h
 pub const sdl = @import("sdl");
+pub const vk = @import("vulkan");
 const std = @import("std");
 
 pub const Element = @import("Element.zig");

@@ -4,6 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const vk = b.dependency("vulkan", .{
+        .registry = b.path("vendor/vk.xml"),
+    }).module("vulkan-zig");
+
     const lib = b.addLibrary(.{
         .name = "luxor",
         .root_module = b.addModule("luxor", .{
@@ -15,7 +19,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const sdl = b.addTranslateC(.{
-        .root_source_file = b.path("vendor/SDL.h"),
+        .root_source_file = b.path("vendor/sdl_unified.h"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -23,6 +27,10 @@ pub fn build(b: *std.Build) void {
 
     lib.root_module.addImport("sdl", sdl.createModule());
     lib.root_module.linkSystemLibrary("sdl3", .{ .needed = true });
+    lib.root_module.addImport("vulkan", vk);
+    lib.root_module.linkSystemLibrary("vulkan", .{
+        .preferred_link_mode = .static,
+    });
 
     b.installArtifact(lib);
 
@@ -33,8 +41,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "luxor", .module = lib.root_module },
             },
         }),
+        .use_llvm = true,
     });
 
     const exe_install = b.addInstallArtifact(exe, .{});

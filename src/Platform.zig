@@ -5,24 +5,17 @@
 
 const std = @import("std");
 const lu = @import("luxor.zig");
+const vk = @import("vulkan");
+const sdl_ = @import("platforms/sdl.zig");
 
 vtable: VTable,
-events: Events,
 
 const Platform = @This();
-
-pub const Events = struct {
-    resize: lu.Hook(lu.Rect),
-    draw: lu.Hook(void),
-    cursor_move: lu.Hook(lu.Pos),
-    click: lu.Hook(lu.MouseButton),
-    key: lu.Hook(lu.Key),
-    exit: lu.Hook(void),
-};
 
 pub const VTable = struct {
     /// Should be initialized later by `init`.
     data: *anyopaque = undefined,
+    getExtentions: *const fn () [][*:0]const u8,
     /// Load library, create `data` and initialize it.
     /// The return value here is `data`.
     init: *const fn (std.mem.Allocator) anyerror!*anyopaque,
@@ -31,19 +24,29 @@ pub const VTable = struct {
     deinit: *const fn (*anyopaque, std.mem.Allocator) void,
     /// Create a window (or some surface creating object)
     /// The `data` here is the platform data
-    createWindow: *const fn (*anyopaque, lu.Window.Config) anyerror!void,
+    createWindow: *const fn (*anyopaque, lu.Window.Config) anyerror!*anyopaque,
     /// Get a surface that can be used by the renderer
     /// The first `data` here is the platform data.
     /// The second `data` here is the window handler.
-    getSurface: *const fn (*anyopaque, *anyopaque, lu.Renderer.Kind) lu.Renderer.Surface,
+    getSurface: *const fn (*anyopaque, *anyopaque) anyerror!lu.Renderer.Surface,
     /// Close a window.
     /// The first `data` here is the platform data.
     /// The second `data` here is the window handler.
     closeWindow: *const fn (*anyopaque, *anyopaque) void,
 };
 
+pub const sdl = sdl.vtable;
+
+pub var current: Platform = .{
+    .vtable = sdl,
+};
+
 pub fn init(self: *Platform, alloc: std.mem.Allocator) !void {
     self.vtable.data = try self.vtable.init(alloc);
+}
+
+pub fn getExtentions(self: *Platform) [][*:0]const u8 {
+    return self.vtable.getExtentions();
 }
 
 pub fn deinit(self: *Platform, alloc: std.mem.Allocator) void {
