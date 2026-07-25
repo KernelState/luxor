@@ -6,6 +6,154 @@ pub const Layout = @import("Layout.zig");
 pub const Window = @import("Window.zig");
 pub const Platform = @import("Platform.zig");
 
+pub const RunConfig = struct {
+    width: u32 = 800,
+    height: u32 = 600,
+    title: [*:0]const u8 = "Luxor",
+};
+
+pub const Callbacks = struct {
+    init: *const fn () void = struct {
+        fn noop() void {}
+    }.noop,
+    frame: *const fn () void = struct {
+        fn noop() void {}
+    }.noop,
+    event: *const fn (Event) void = struct {
+        fn noop(_: Event) void {}
+    }.noop,
+    cleanup: *const fn () void = struct {
+        fn noop() void {}
+    }.noop,
+};
+
+pub const Event = union(enum) {
+    quit,
+    key_down: Key,
+    key_up: Key,
+    char_input: u21,
+    mouse_move: struct { x: f32, y: f32 },
+    mouse_down: MouseButton,
+    mouse_up: MouseButton,
+    mouse_scroll: struct { x: f32, y: f32 },
+    resized: struct { width: u32, height: u32 },
+    focused: void,
+    unfocused: void,
+    suspended: void,
+    resumed: void,
+};
+
+var g_surface_id: Platform.renderer.ObjectId = 0;
+var g_callbacks: Callbacks = .{};
+
+pub fn run(config: RunConfig, callbacks: Callbacks) void {
+    g_callbacks = callbacks;
+    sokol.app.run(.{
+        .init_cb = sokolInit,
+        .frame_cb = sokolFrame,
+        .cleanup_cb = sokolCleanup,
+        .event_cb = sokolEvent,
+        .width = @intCast(config.width),
+        .height = @intCast(config.height),
+        .window_title = config.title,
+    });
+}
+
+pub fn quit() void {
+    sokol.app.requestQuit();
+}
+
+fn sokolInit() callconv(.c) void {
+    const ctx = Platform.renderer.current.vtable.init(std.heap.page_allocator) catch return;
+    Platform.renderer.current.ctx = ctx;
+    g_surface_id = Platform.renderer.current.vtable.createSurface(
+        ctx,
+        .{ .xlib = .{ .display = undefined, .window = 0 } },
+    ) catch return;
+    g_callbacks.init();
+}
+
+fn sokolFrame() callconv(.c) void {
+    Platform.renderer.current.beginFrame(g_surface_id) catch return;
+    defer Platform.renderer.current.endFrame() catch {};
+    g_callbacks.frame();
+}
+
+fn sokolCleanup() callconv(.c) void {
+    g_callbacks.cleanup();
+    Platform.renderer.current.deinit();
+}
+
+fn sokolEvent(e: [*c]const sokol.app.Event) callconv(.c) void {
+    const ev = (e orelse return).*;
+    const lu_event: ?Event = switch (ev.type) {
+        .QUIT_REQUESTED => .quit,
+        .KEY_DOWN => .{ .key_down = translateKey(ev.key_code) },
+        .KEY_UP => .{ .key_up = translateKey(ev.key_code) },
+        .CHAR => .{ .char_input = @intCast(ev.char_code) },
+        .MOUSE_MOVE => .{ .mouse_move = .{ .x = ev.mouse_x, .y = ev.mouse_y } },
+        .MOUSE_DOWN => .{ .mouse_down = translateMouseButton(ev.mouse_button) },
+        .MOUSE_UP => .{ .mouse_up = translateMouseButton(ev.mouse_button) },
+        .MOUSE_SCROLL => .{ .mouse_scroll = .{ .x = ev.scroll_x, .y = ev.scroll_y } },
+        .RESIZED => .{ .resized = .{ .width = @intCast(ev.window_width), .height = @intCast(ev.window_height) } },
+        .FOCUSED => .{ .focused = {} },
+        .UNFOCUSED => .{ .unfocused = {} },
+        .SUSPENDED => .{ .suspended = {} },
+        .RESUMED => .{ .resumed = {} },
+        else => null,
+    };
+    if (lu_event) |le| g_callbacks.event(le);
+}
+
+fn translateKey(kc: sokol.app.Keycode) Key {
+    return switch (kc) {
+        .A => .a, .B => .b, .C => .c, .D => .d, .E => .e,
+        .F => .f, .G => .g, .H => .h, .I => .i, .J => .j,
+        .K => .k, .L => .l, .M => .m, .N => .n, .O => .o,
+        .P => .p, .Q => .q, .R => .r, .S => .s, .T => .t,
+        .U => .u, .V => .v, .W => .w, .X => .x, .Y => .y,
+        .Z => .z,
+        ._0 => .num0, ._1 => .num1, ._2 => .num2, ._3 => .num3, ._4 => .num4,
+        ._5 => .num5, ._6 => .num6, ._7 => .num7, ._8 => .num8, ._9 => .num9,
+        .F1 => .f1, .F2 => .f2, .F3 => .f3, .F4 => .f4, .F5 => .f5,
+        .F6 => .f6, .F7 => .f7, .F8 => .f8, .F9 => .f9, .F10 => .f10,
+        .F11 => .f11, .F12 => .f12,
+        .KP_0 => .kp0, .KP_1 => .kp1, .KP_2 => .kp2, .KP_3 => .kp3, .KP_4 => .kp4,
+        .KP_5 => .kp5, .KP_6 => .kp6, .KP_7 => .kp7, .KP_8 => .kp8, .KP_9 => .kp9,
+        .KP_DECIMAL => .kp_decimal, .KP_ADD => .kp_add,
+        .KP_SUBTRACT => .kp_subtract, .KP_MULTIPLY => .kp_multiply,
+        .KP_DIVIDE => .kp_divide, .KP_ENTER => .kp_enter,
+        .LEFT => .left, .RIGHT => .right, .UP => .up, .DOWN => .down,
+        .LEFT_SHIFT => .left_shift, .RIGHT_SHIFT => .right_shift,
+        .LEFT_CONTROL => .left_ctrl, .RIGHT_CONTROL => .right_ctrl,
+        .LEFT_ALT => .left_alt, .RIGHT_ALT => .right_alt,
+        .LEFT_SUPER => .left_super, .RIGHT_SUPER => .right_super,
+        .CAPS_LOCK => .caps_lock, .NUM_LOCK => .num_lock,
+        .SCROLL_LOCK => .scroll_lock,
+        .INSERT => .insert, .DELETE => .delete,
+        .HOME => .home, .END => .end,
+        .PAGE_UP => .page_up, .PAGE_DOWN => .page_down,
+        .BACKSPACE => .backspace, .ENTER => .enter, .TAB => .tab,
+        .ESCAPE => .escape, .SPACE => .space,
+        .GRAVE_ACCENT => .grave, .MINUS => .minus, .EQUAL => .equal,
+        .LEFT_BRACKET => .left_bracket, .RIGHT_BRACKET => .right_bracket,
+        .BACKSLASH => .backslash, .SEMICOLON => .semicolon,
+        .APOSTROPHE => .apostrophe, .COMMA => .comma,
+        .PERIOD => .period, .SLASH => .slash,
+        .PRINT_SCREEN => .print_screen, .PAUSE => .pause, .MENU => .menu,
+        else => .unknown,
+    };
+}
+
+fn translateMouseButton(mb: sokol.app.Mousebutton) MouseButton {
+    return switch (mb) {
+        .LEFT => .left,
+        .RIGHT => .right,
+        .MIDDLE => .scroll,
+        else => .left,
+    };
+}
+
 pub const Rect = struct {
     w: u32,
     h: u32,

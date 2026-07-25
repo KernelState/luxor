@@ -1,10 +1,7 @@
-const std = @import("std");
-const sapp = @import("sokol").app;
 const lu = @import("luxor");
 
 var mouse_x: f32 = 0;
 var mouse_y: f32 = 0;
-var surface_id: lu.Platform.renderer.ObjectId = undefined;
 
 const tri = [3]lu.Pos{
     .{ .x = 400, .y = 100 },
@@ -18,28 +15,14 @@ const tri_colors = [3]lu.Platform.renderer.Color{
     .{ .r = 0.0, .g = 0.0, .b = 1.0 },
 };
 
-pub fn main() !void {
-    sapp.run(.{
-        .init_cb = init,
-        .frame_cb = frame,
-        .cleanup_cb = cleanup,
-        .event_cb = event,
-        .width = 800,
-        .height = 600,
-        .window_title = "Luxor",
+pub fn main() void {
+    lu.run(.{ .width = 800, .height = 600, .title = "Luxor" }, .{
+        .frame = frame,
+        .event = onEvent,
     });
 }
 
-fn init() callconv(.c) void {
-    const ctx = lu.Platform.renderer.current.vtable.init(std.heap.page_allocator) catch return;
-    lu.Platform.renderer.current.ctx = ctx;
-    surface_id = lu.Platform.renderer.current.vtable.createSurface(ctx, .{ .xlib = .{ .display = undefined, .window = 0 } }) catch return;
-}
-
-fn frame() callconv(.c) void {
-    lu.Platform.renderer.current.vtable.beginFrame(lu.Platform.renderer.current.ctx, surface_id) catch return;
-    defer lu.Platform.renderer.current.vtable.endFrame(lu.Platform.renderer.current.ctx) catch {};
-
+fn frame() void {
     const hovered = pointInTriangle(mouse_x, mouse_y);
 
     var colors: [3]lu.Platform.renderer.Color = undefined;
@@ -52,8 +35,7 @@ fn frame() callconv(.c) void {
         }
     }
 
-    lu.Platform.renderer.current.vtable.drawTriangle(
-        lu.Platform.renderer.current.ctx,
+    lu.Platform.renderer.current.drawTriangle(
         tri[0],
         tri[1],
         tri[2],
@@ -61,20 +43,15 @@ fn frame() callconv(.c) void {
     );
 }
 
-fn cleanup() callconv(.c) void {
-    lu.Platform.renderer.current.vtable.deinit(lu.Platform.renderer.current.ctx);
-}
-
-fn event(e: [*c]const sapp.Event) callconv(.c) void {
-    const ev = (e orelse return).*;
-    switch (ev.type) {
-        .QUIT_REQUESTED => sapp.requestQuit(),
-        .KEY_DOWN => {
-            if (ev.key_code == .ESCAPE) sapp.requestQuit();
+fn onEvent(e: lu.Event) void {
+    switch (e) {
+        .quit => lu.quit(),
+        .key_down => |k| {
+            if (k == .escape) lu.quit();
         },
-        .MOUSE_MOVE => {
-            mouse_x = ev.mouse_x;
-            mouse_y = ev.mouse_y;
+        .mouse_move => |m| {
+            mouse_x = m.x;
+            mouse_y = m.y;
         },
         else => {},
     }

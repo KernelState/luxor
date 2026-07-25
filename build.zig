@@ -38,7 +38,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "luxor", .module = lib.root_module },
-                .{ .name = "sokol", .module = dep_sokol.module("sokol") },
             },
         }),
         .use_llvm = true,

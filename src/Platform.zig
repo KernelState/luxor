@@ -195,6 +195,9 @@ pub const renderer = struct {
         pub inline fn endFrame(self: Instance) !void {
             return self.vtable.endFrame(self.ctx);
         }
+        pub inline fn deinit(self: Instance) void {
+            self.vtable.deinit(self.ctx);
+        }
 
         pub inline fn drawRect(self: Instance, rect: Rect, pos: Pos, corners: Corners, bg: Background) void {
             self.vtable.drawRect(self.ctx, rect, pos, corners, bg);
