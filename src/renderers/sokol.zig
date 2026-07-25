@@ -1,7 +1,7 @@
 const std = @import("std");
 const sg = @import("sokol").gfx;
 const sgl = @import("sokol").gl;
-const sapp = @import("sokol").app;
+const sdtx = @import("sokol").debugtext;
 
 const VTable = @import("../Platform.zig").renderer.VTable;
 const Surface = @import("../Platform.zig").renderer.Surface;
@@ -28,6 +28,8 @@ surfaces: [max_surfaces]SurfaceState,
 textures: [max_textures]TextureState,
 clip_stack: [max_clip_depth]ClipState,
 clip_depth: u32,
+window_width: u32,
+window_height: u32,
 
 const SurfaceState = struct {
     width: u32 = 0,
@@ -68,13 +70,22 @@ pub const vtable = VTable{
     .drawTriangle = drawTriangle,
     .drawSvg = drawSvg,
     .drawMask = drawMask,
+    .drawText = drawText,
     .pushClip = pushClip,
     .popClip = popClip,
+    .pushOverlay = pushOverlayFn,
+    .popOverlay = popOverlayFn,
 };
 
 fn init(alloc: std.mem.Allocator) anyerror!*anyopaque {
     sg.setup(.{});
     sgl.setup(.{});
+    sdtx.setup(.{
+        .fonts = .{
+            sdtx.fontKc853(), sdtx.fontKc854(), sdtx.fontZ1013(), sdtx.fontCpc(),
+            sdtx.fontC64(), sdtx.fontOric(), .{}, .{},
+        },
+    });
     const self = try alloc.create(Renderer);
     self.* = .{
         .allocator = alloc,
@@ -83,6 +94,8 @@ fn init(alloc: std.mem.Allocator) anyerror!*anyopaque {
         .textures = @splat(.{}),
         .clip_stack = @splat(.{}),
         .clip_depth = 0,
+        .window_width = 800,
+        .window_height = 600,
     };
     return self;
 }
@@ -96,6 +109,7 @@ fn deinitFn(ctx: *anyopaque) void {
             sg.destroySampler(tex.sampler);
         }
     }
+    sdtx.shutdown();
     sgl.shutdown();
     sg.shutdown();
     self.initialized = false;
@@ -108,8 +122,8 @@ fn createSurface(ctx: *anyopaque, native_surface: Surface) anyerror!ObjectId {
     for (0..max_surfaces) |i| {
         if (!self.surfaces[i].active) {
             self.surfaces[i] = .{
-                .width = @intCast(sapp.width()),
-                .height = @intCast(sapp.height()),
+                .width = self.window_width,
+                .height = self.window_height,
                 .active = true,
             };
             return @intCast(i);
@@ -137,8 +151,8 @@ fn getSurfaceInfo(ctx: *anyopaque, id: ObjectId) SurfaceInfo {
         };
     }
     return .{
-        .width = @intCast(sapp.width()),
-        .height = @intCast(sapp.height()),
+        .width = self.window_width,
+        .height = self.window_height,
         .format = .rgba8,
         .vsync = true,
     };
@@ -205,11 +219,11 @@ fn beginFrame(ctx: *anyopaque, surface: ObjectId) anyerror!void {
     const w: u32 = if (surface < max_surfaces and self.surfaces[surface].active)
         self.surfaces[surface].width
     else
-        @intCast(sapp.width());
+        self.window_width;
     const h: u32 = if (surface < max_surfaces and self.surfaces[surface].active)
         self.surfaces[surface].height
     else
-        @intCast(sapp.height());
+        self.window_height;
 
     sg.beginPass(.{
         .action = .{
@@ -228,12 +242,18 @@ fn beginFrame(ctx: *anyopaque, surface: ObjectId) anyerror!void {
     sgl.matrixModeProjection();
     sgl.loadIdentity();
     sgl.ortho(0, @floatFromInt(w), @floatFromInt(h), 0, -1, 1);
+    sgl.layer(0);
 
     self.clip_depth = 0;
+
+    sdtx.home();
+    sdtx.font(0);
+    sdtx.color4f(1.0, 1.0, 1.0, 1.0);
 }
 
 fn endFrame(ctx: *anyopaque) anyerror!void {
     _ = ctx;
+    sdtx.draw();
     sgl.draw();
     sg.endPass();
     sg.commit();
@@ -371,6 +391,14 @@ fn drawSvg(ctx: *anyopaque, svg_id: ObjectId, pos: Pos, size: Size) void {
     _ = size;
 }
 
+fn drawText(ctx: *anyopaque, text: []const u8, x: f32, y: f32) void {
+    _ = ctx;
+    sdtx.font(0);
+    sdtx.color4f(1.0, 1.0, 1.0, 1.0);
+    sdtx.pos(x / 8.0, y / 8.0);
+    sdtx.print("{s}", .{text});
+}
+
 fn drawMask(ctx: *anyopaque, mask: Mask, pos: Pos, bg: Background) void {
     const self: *Renderer = @alignCast(@ptrCast(ctx));
     switch (mask) {
@@ -411,6 +439,16 @@ fn popClip(ctx: *anyopaque) void {
     popClipRect(self);
 }
 
+fn pushOverlayFn(ctx: *anyopaque) void {
+    _ = ctx;
+    sgl.layer(1);
+}
+
+fn popOverlayFn(ctx: *anyopaque) void {
+    _ = ctx;
+    sgl.layer(0);
+}
+
 fn pushClipRect(self: *Renderer, x: u32, y: u32, w: u32, h: u32) void {
     if (self.clip_depth < max_clip_depth) {
         self.clip_stack[self.clip_depth] = .{ .x = x, .y = y, .w = w, .h = h };
@@ -427,9 +465,7 @@ fn popClipRect(self: *Renderer) void {
         const prev = self.clip_stack[self.clip_depth - 1];
         sgl.scissorRect(@intCast(prev.x), @intCast(prev.y), @intCast(prev.w), @intCast(prev.h), true);
     } else {
-        const w = sapp.width();
-        const h = sapp.height();
-        sgl.scissorRect(0, 0, w, h, true);
+        sgl.scissorRect(0, 0, @intCast(self.window_width), @intCast(self.window_height), true);
     }
 }
 

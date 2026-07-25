@@ -1,7 +1,12 @@
 const lu = @import("luxor");
 
-var mouse_x: f32 = 0;
-var mouse_y: f32 = 0;
+const Context = struct {
+    mouse_x: f32 = 0,
+    mouse_y: f32 = 0,
+    tooltip_visible: bool = false,
+    tooltip_x: f32 = 0,
+    tooltip_y: f32 = 0,
+};
 
 const tri = [3]lu.Pos{
     .{ .x = 400, .y = 100 },
@@ -15,15 +20,25 @@ const tri_colors = [3]lu.Platform.renderer.Color{
     .{ .r = 0.0, .g = 0.0, .b = 1.0 },
 };
 
+var g_ctx = Context{};
+
 pub fn main() void {
     lu.run(.{ .width = 800, .height = 600, .title = "Luxor" }, .{
+        .init = init,
         .frame = frame,
         .event = onEvent,
+        .cleanup = cleanup,
+        .user_data = &g_ctx,
     });
 }
 
-fn frame() void {
-    const hovered = pointInTriangle(mouse_x, mouse_y);
+fn init(user_data: ?*anyopaque) void {
+    _ = user_data;
+}
+
+fn frame(user_data: ?*anyopaque) void {
+    const ctx: *Context = @alignCast(@ptrCast(user_data.?));
+    const hovered = pointInTriangle(ctx.mouse_x, ctx.mouse_y);
 
     var colors: [3]lu.Platform.renderer.Color = undefined;
     for (0..3) |i| {
@@ -41,17 +56,77 @@ fn frame() void {
         tri[2],
         .{ .vertex_colors = colors },
     );
+
+    // Tooltip on overlay layer
+    if (ctx.tooltip_visible) {
+        lu.Platform.renderer.current.pushOverlay();
+        lu.Platform.renderer.current.drawRect(
+            .{ .w = 120, .h = 24 },
+            .{ .x = @intFromFloat(ctx.tooltip_x + 10), .y = @intFromFloat(ctx.tooltip_y - 30) },
+            .{ .top_left = 4, .top_right = 4, .bottom_left = 4, .bottom_right = 4 },
+            .{ .solid = .{ .r = 0.1, .g = 0.1, .b = 0.1, .a = 0.9 } },
+        );
+        lu.Platform.renderer.current.drawText(
+            "Hovering triangle",
+            ctx.tooltip_x + 14,
+            ctx.tooltip_y - 22,
+        );
+        lu.Platform.renderer.current.popOverlay();
+    }
 }
 
-fn onEvent(e: lu.Event) void {
+fn onEvent(user_data: ?*anyopaque, e: lu.Event) void {
+    const ctx: *Context = @alignCast(@ptrCast(user_data.?));
     switch (e) {
         .quit => lu.quit(),
         .key_down => |k| {
             if (k == .escape) lu.quit();
+            if (k == .p) {
+                lu.openPopupWindow(
+                    ctx,
+                    .{ .w = 400, .h = 300, .title = "Popup" },
+                    popupFrame,
+                    popupEvent,
+                );
+            }
         },
         .mouse_move => |m| {
-            mouse_x = m.x;
-            mouse_y = m.y;
+            ctx.mouse_x = m.x;
+            ctx.mouse_y = m.y;
+            const hovered = pointInTriangle(m.x, m.y);
+            if (hovered) {
+                ctx.tooltip_visible = true;
+                ctx.tooltip_x = m.x;
+                ctx.tooltip_y = m.y;
+            } else {
+                ctx.tooltip_visible = false;
+            }
+        },
+        else => {},
+    }
+}
+
+fn cleanup(user_data: ?*anyopaque) void {
+    _ = user_data;
+}
+
+fn popupFrame(user_data: ?*anyopaque) void {
+    _ = user_data;
+    lu.Platform.renderer.current.drawRect(
+        .{ .w = 380, .h = 280 },
+        .{ .x = 10, .y = 10 },
+        .{ .top_left = 8, .top_right = 8, .bottom_left = 8, .bottom_right = 8 },
+        .{ .solid = .{ .r = 0.2, .g = 0.2, .b = 0.3, .a = 1.0 } },
+    );
+    lu.Platform.renderer.current.drawText("Popup Window", 20, 20);
+}
+
+fn popupEvent(user_data: ?*anyopaque, e: lu.Event) void {
+    _ = user_data;
+    switch (e) {
+        .quit => {},
+        .key_down => |k| {
+            if (k == .escape) lu.quit();
         },
         else => {},
     }

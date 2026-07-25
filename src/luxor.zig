@@ -1,10 +1,26 @@
-pub const sokol = @import("sokol");
 const std = @import("std");
+const sdl = @import("sdl");
+pub const Platform = @import("Platform.zig");
 
 pub const Element = @import("Element.zig");
 pub const Layout = @import("Layout.zig");
 pub const Window = @import("Window.zig");
-pub const Platform = @import("Platform.zig");
+
+// SDL event type constants (u32 to match ev.type)
+const SDL_EVENT_QUIT: u32 = 256;
+const SDL_EVENT_KEY_DOWN: u32 = 768;
+const SDL_EVENT_KEY_UP: u32 = 769;
+const SDL_EVENT_MOUSE_MOTION: u32 = 1024;
+const SDL_EVENT_MOUSE_BUTTON_DOWN: u32 = 1025;
+const SDL_EVENT_MOUSE_BUTTON_UP: u32 = 1026;
+const SDL_EVENT_WINDOW_RESIZED: u32 = 518;
+const SDL_EVENT_WINDOW_CLOSE_REQUESTED: u32 = 528;
+
+const SDL_INIT_VIDEO: u32 = 0x20;
+const SDL_WINDOW_OPENGL: u64 = 0x2;
+const SDL_WINDOW_RESIZABLE: u64 = 0x20;
+const SDL_WINDOW_TOOLTIP: u64 = 0x40000;
+const SDL_WINDOW_POPUP_MENU: u64 = 0x80000;
 
 pub const RunConfig = struct {
     width: u32 = 800,
@@ -12,19 +28,26 @@ pub const RunConfig = struct {
     title: [*:0]const u8 = "Luxor",
 };
 
+pub const PopupConfig = struct {
+    w: u32 = 800,
+    h: u32 = 600,
+    title: [*:0]const u8 = "Popup",
+};
+
 pub const Callbacks = struct {
-    init: *const fn () void = struct {
-        fn noop() void {}
+    init: *const fn (?*anyopaque) void = struct {
+        fn noop(_: ?*anyopaque) void {}
     }.noop,
-    frame: *const fn () void = struct {
-        fn noop() void {}
+    frame: *const fn (?*anyopaque) void = struct {
+        fn noop(_: ?*anyopaque) void {}
     }.noop,
-    event: *const fn (Event) void = struct {
-        fn noop(_: Event) void {}
+    event: *const fn (?*anyopaque, Event) void = struct {
+        fn noop(_: ?*anyopaque, _: Event) void {}
     }.noop,
-    cleanup: *const fn () void = struct {
-        fn noop() void {}
+    cleanup: *const fn (?*anyopaque) void = struct {
+        fn noop(_: ?*anyopaque) void {}
     }.noop,
+    user_data: ?*anyopaque = null,
 };
 
 pub const Event = union(enum) {
@@ -43,113 +66,349 @@ pub const Event = union(enum) {
     resumed: void,
 };
 
-var g_surface_id: Platform.renderer.ObjectId = 0;
+const max_popups = 16;
+
+const PopupState = struct {
+    window: ?*sdl.SDL_Window = null,
+    gl_ctx: sdl.SDL_GLContext = null,
+    window_id: u32 = 0,
+    surface_id: Platform.renderer.ObjectId = 0,
+    frame_fn: *const fn (?*anyopaque) void = undefined,
+    event_fn: *const fn (?*anyopaque, Event) void = undefined,
+    user_data: ?*anyopaque = null,
+    active: bool = false,
+};
+
+var g_main_window: ?*sdl.SDL_Window = null;
+var g_main_gl_ctx: sdl.SDL_GLContext = null;
+var g_main_window_id: u32 = 0;
+var g_main_surface_id: Platform.renderer.ObjectId = 0;
 var g_callbacks: Callbacks = .{};
+var g_running: bool = false;
+var g_popups: [max_popups]PopupState = [_]PopupState{.{}} ** max_popups;
 
 pub fn run(config: RunConfig, callbacks: Callbacks) void {
     g_callbacks = callbacks;
-    sokol.app.run(.{
-        .init_cb = sokolInit,
-        .frame_cb = sokolFrame,
-        .cleanup_cb = sokolCleanup,
-        .event_cb = sokolEvent,
-        .width = @intCast(config.width),
-        .height = @intCast(config.height),
-        .window_title = config.title,
-    });
-}
+    g_running = true;
 
-pub fn quit() void {
-    sokol.app.requestQuit();
-}
+    if (!sdl.SDL_Init(SDL_INIT_VIDEO)) return;
 
-fn sokolInit() callconv(.c) void {
+    g_main_window = sdl.SDL_CreateWindow(
+        config.title,
+        @intCast(config.width),
+        @intCast(config.height),
+        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE,
+    ) orelse return;
+
+    g_main_gl_ctx = sdl.SDL_GL_CreateContext(g_main_window);
+    _ = sdl.SDL_GL_MakeCurrent(g_main_window, g_main_gl_ctx);
+
     const ctx = Platform.renderer.current.vtable.init(std.heap.page_allocator) catch return;
     Platform.renderer.current.ctx = ctx;
-    g_surface_id = Platform.renderer.current.vtable.createSurface(
+    g_main_surface_id = Platform.renderer.current.vtable.createSurface(
         ctx,
         .{ .xlib = .{ .display = undefined, .window = 0 } },
     ) catch return;
-    g_callbacks.init();
-}
+    Platform.renderer.current.vtable.resizeSurface(
+        ctx,
+        g_main_surface_id,
+        config.width,
+        config.height,
+    ) catch {};
 
-fn sokolFrame() callconv(.c) void {
-    Platform.renderer.current.beginFrame(g_surface_id) catch return;
-    defer Platform.renderer.current.endFrame() catch {};
-    g_callbacks.frame();
-}
+    var w: c_int = 0;
+    var h: c_int = 0;
+    _ = sdl.SDL_GetWindowSize(g_main_window, &w, &h);
+    g_main_window_id = sdl.SDL_GetWindowID(g_main_window);
 
-fn sokolCleanup() callconv(.c) void {
-    g_callbacks.cleanup();
+    g_callbacks.init(g_callbacks.user_data);
+
+    var ev: sdl.SDL_Event = undefined;
+    while (g_running) {
+        while (sdl.SDL_PollEvent(&ev)) {
+            handleEvent(&ev);
+        }
+
+        // Render main window
+        _ = sdl.SDL_GL_MakeCurrent(g_main_window, g_main_gl_ctx);
+        Platform.renderer.current.beginFrame(g_main_surface_id) catch continue;
+        g_callbacks.frame(g_callbacks.user_data);
+        Platform.renderer.current.endFrame() catch continue;
+        _ = sdl.SDL_GL_SwapWindow(g_main_window);
+
+        // Render popup windows
+        for (&g_popups) |*popup| {
+            if (popup.active and popup.window != null) {
+                _ = sdl.SDL_GL_MakeCurrent(popup.window, popup.gl_ctx);
+                Platform.renderer.current.beginFrame(popup.surface_id) catch continue;
+                popup.frame_fn(popup.user_data);
+                Platform.renderer.current.endFrame() catch continue;
+                _ = sdl.SDL_GL_SwapWindow(popup.window);
+            }
+        }
+    }
+
+    // Cleanup popups
+    for (&g_popups) |*popup| {
+        if (popup.active) {
+            popup.event_fn(popup.user_data, .quit);
+            Platform.renderer.current.vtable.destroySurface(
+                Platform.renderer.current.ctx,
+                popup.surface_id,
+            );
+            if (popup.gl_ctx) |gl| _ = sdl.SDL_GL_DestroyContext(gl);
+            if (popup.window) |win| sdl.SDL_DestroyWindow(win);
+            popup.active = false;
+        }
+    }
+
+    g_callbacks.cleanup(g_callbacks.user_data);
     Platform.renderer.current.deinit();
+    if (g_main_gl_ctx) |gl| _ = sdl.SDL_GL_DestroyContext(gl);
+    if (g_main_window) |win| sdl.SDL_DestroyWindow(win);
+    sdl.SDL_Quit();
 }
 
-fn sokolEvent(e: [*c]const sokol.app.Event) callconv(.c) void {
-    const ev = (e orelse return).*;
-    const lu_event: ?Event = switch (ev.type) {
-        .QUIT_REQUESTED => .quit,
-        .KEY_DOWN => .{ .key_down = translateKey(ev.key_code) },
-        .KEY_UP => .{ .key_up = translateKey(ev.key_code) },
-        .CHAR => .{ .char_input = @intCast(ev.char_code) },
-        .MOUSE_MOVE => .{ .mouse_move = .{ .x = ev.mouse_x, .y = ev.mouse_y } },
-        .MOUSE_DOWN => .{ .mouse_down = translateMouseButton(ev.mouse_button) },
-        .MOUSE_UP => .{ .mouse_up = translateMouseButton(ev.mouse_button) },
-        .MOUSE_SCROLL => .{ .mouse_scroll = .{ .x = ev.scroll_x, .y = ev.scroll_y } },
-        .RESIZED => .{ .resized = .{ .width = @intCast(ev.window_width), .height = @intCast(ev.window_height) } },
-        .FOCUSED => .{ .focused = {} },
-        .UNFOCUSED => .{ .unfocused = {} },
-        .SUSPENDED => .{ .suspended = {} },
-        .RESUMED => .{ .resumed = {} },
-        else => null,
+pub fn quit() void {
+    g_running = false;
+}
+
+pub fn pushOverlay() void {
+    Platform.renderer.current.pushOverlay();
+}
+
+pub fn popOverlay() void {
+    Platform.renderer.current.popOverlay();
+}
+
+pub fn openPopupWindow(
+    ctx: ?*anyopaque,
+    config: PopupConfig,
+    frame_fn: *const fn (?*anyopaque) void,
+    event_fn: *const fn (?*anyopaque, Event) void,
+) void {
+    for (&g_popups) |*popup| {
+        if (!popup.active) {
+            popup.window = sdl.SDL_CreatePopupWindow(
+                g_main_window,
+                0,
+                0,
+                @intCast(config.w),
+                @intCast(config.h),
+                SDL_WINDOW_OPENGL | SDL_WINDOW_TOOLTIP,
+            ) orelse return;
+
+            popup.gl_ctx = sdl.SDL_GL_CreateContext(popup.window);
+
+            popup.surface_id = Platform.renderer.current.vtable.createSurface(
+                Platform.renderer.current.ctx,
+                .{ .xlib = .{ .display = undefined, .window = 0 } },
+            ) catch return;
+            Platform.renderer.current.vtable.resizeSurface(
+                Platform.renderer.current.ctx,
+                popup.surface_id,
+                config.w,
+                config.h,
+            ) catch {};
+
+            popup.frame_fn = frame_fn;
+            popup.event_fn = event_fn;
+            popup.user_data = ctx;
+            popup.window_id = sdl.SDL_GetWindowID(popup.window);
+            popup.active = true;
+            return;
+        }
+    }
+}
+
+fn handleEvent(ev: *sdl.SDL_Event) void {
+    const event_type: u32 = @intCast(ev.type);
+
+    switch (event_type) {
+        SDL_EVENT_QUIT => {
+            g_running = false;
+            g_callbacks.event(g_callbacks.user_data, .quit);
+        },
+        SDL_EVENT_KEY_DOWN => {
+            const key = translateKey(ev.key.key);
+            if (getEventWindowID(ev) == g_main_window_id) {
+                g_callbacks.event(g_callbacks.user_data, .{ .key_down = key });
+            } else {
+                dispatchToPopup(ev, .{ .key_down = key });
+            }
+        },
+        SDL_EVENT_KEY_UP => {
+            const key = translateKey(ev.key.key);
+            if (getEventWindowID(ev) == g_main_window_id) {
+                g_callbacks.event(g_callbacks.user_data, .{ .key_up = key });
+            } else {
+                dispatchToPopup(ev, .{ .key_up = key });
+            }
+        },
+        SDL_EVENT_MOUSE_MOTION => {
+            const lu_ev = Event{ .mouse_move = .{ .x = ev.motion.x, .y = ev.motion.y } };
+            if (getEventWindowID(ev) == g_main_window_id) {
+                g_callbacks.event(g_callbacks.user_data, lu_ev);
+            } else {
+                dispatchToPopup(ev, lu_ev);
+            }
+        },
+        SDL_EVENT_MOUSE_BUTTON_DOWN => {
+            const btn = translateMouseButton(ev.button.button);
+            const lu_ev = Event{ .mouse_down = btn };
+            if (getEventWindowID(ev) == g_main_window_id) {
+                g_callbacks.event(g_callbacks.user_data, lu_ev);
+            } else {
+                dispatchToPopup(ev, lu_ev);
+            }
+        },
+        SDL_EVENT_MOUSE_BUTTON_UP => {
+            const btn = translateMouseButton(ev.button.button);
+            const lu_ev = Event{ .mouse_up = btn };
+            if (getEventWindowID(ev) == g_main_window_id) {
+                g_callbacks.event(g_callbacks.user_data, lu_ev);
+            } else {
+                dispatchToPopup(ev, lu_ev);
+            }
+        },
+        SDL_EVENT_WINDOW_RESIZED => {
+            const wid = ev.window.windowID;
+            const new_w: u32 = @intCast(ev.window.data1);
+            const new_h: u32 = @intCast(ev.window.data2);
+            if (wid == g_main_window_id) {
+                Platform.renderer.current.vtable.resizeSurface(
+                    Platform.renderer.current.ctx,
+                    g_main_surface_id,
+                    new_w,
+                    new_h,
+                ) catch {};
+                g_callbacks.event(g_callbacks.user_data, .{ .resized = .{ .width = new_w, .height = new_h } });
+            } else {
+                for (&g_popups) |*popup| {
+                    if (popup.active and popup.window_id == wid) {
+                        Platform.renderer.current.vtable.resizeSurface(
+                            Platform.renderer.current.ctx,
+                            popup.surface_id,
+                            new_w,
+                            new_h,
+                        ) catch {};
+                        break;
+                    }
+                }
+            }
+        },
+        SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
+            const wid = ev.window.windowID;
+            if (wid != g_main_window_id) {
+                for (&g_popups) |*popup| {
+                    if (popup.active and popup.window_id == wid) {
+                        popup.event_fn(popup.user_data, .quit);
+                        Platform.renderer.current.vtable.destroySurface(
+                            Platform.renderer.current.ctx,
+                            popup.surface_id,
+                        );
+                        if (popup.gl_ctx) |gl| _ = sdl.SDL_GL_DestroyContext(gl);
+                        if (popup.window) |win| sdl.SDL_DestroyWindow(win);
+                        popup.active = false;
+                        break;
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+fn dispatchToPopup(ev: *sdl.SDL_Event, lu_ev: Event) void {
+    const wid = getEventWindowID(ev);
+    for (&g_popups) |*popup| {
+        if (popup.active and popup.window_id == wid) {
+            popup.event_fn(popup.user_data, lu_ev);
+            break;
+        }
+    }
+}
+
+fn getEventWindowID(ev: *sdl.SDL_Event) u32 {
+    const event_type: u32 = @intCast(ev.type);
+    return switch (event_type) {
+        SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP => ev.key.windowID,
+        SDL_EVENT_MOUSE_MOTION => ev.motion.windowID,
+        SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_EVENT_MOUSE_BUTTON_UP => ev.button.windowID,
+        SDL_EVENT_WINDOW_RESIZED, SDL_EVENT_WINDOW_CLOSE_REQUESTED => ev.window.windowID,
+        else => 0,
     };
-    if (lu_event) |le| g_callbacks.event(le);
 }
 
-fn translateKey(kc: sokol.app.Keycode) Key {
-    return switch (kc) {
-        .A => .a, .B => .b, .C => .c, .D => .d, .E => .e,
-        .F => .f, .G => .g, .H => .h, .I => .i, .J => .j,
-        .K => .k, .L => .l, .M => .m, .N => .n, .O => .o,
-        .P => .p, .Q => .q, .R => .r, .S => .s, .T => .t,
-        .U => .u, .V => .v, .W => .w, .X => .x, .Y => .y,
-        .Z => .z,
-        ._0 => .num0, ._1 => .num1, ._2 => .num2, ._3 => .num3, ._4 => .num4,
-        ._5 => .num5, ._6 => .num6, ._7 => .num7, ._8 => .num8, ._9 => .num9,
-        .F1 => .f1, .F2 => .f2, .F3 => .f3, .F4 => .f4, .F5 => .f5,
-        .F6 => .f6, .F7 => .f7, .F8 => .f8, .F9 => .f9, .F10 => .f10,
-        .F11 => .f11, .F12 => .f12,
-        .KP_0 => .kp0, .KP_1 => .kp1, .KP_2 => .kp2, .KP_3 => .kp3, .KP_4 => .kp4,
-        .KP_5 => .kp5, .KP_6 => .kp6, .KP_7 => .kp7, .KP_8 => .kp8, .KP_9 => .kp9,
-        .KP_DECIMAL => .kp_decimal, .KP_ADD => .kp_add,
-        .KP_SUBTRACT => .kp_subtract, .KP_MULTIPLY => .kp_multiply,
-        .KP_DIVIDE => .kp_divide, .KP_ENTER => .kp_enter,
-        .LEFT => .left, .RIGHT => .right, .UP => .up, .DOWN => .down,
-        .LEFT_SHIFT => .left_shift, .RIGHT_SHIFT => .right_shift,
-        .LEFT_CONTROL => .left_ctrl, .RIGHT_CONTROL => .right_ctrl,
-        .LEFT_ALT => .left_alt, .RIGHT_ALT => .right_alt,
-        .LEFT_SUPER => .left_super, .RIGHT_SUPER => .right_super,
-        .CAPS_LOCK => .caps_lock, .NUM_LOCK => .num_lock,
-        .SCROLL_LOCK => .scroll_lock,
-        .INSERT => .insert, .DELETE => .delete,
-        .HOME => .home, .END => .end,
-        .PAGE_UP => .page_up, .PAGE_DOWN => .page_down,
-        .BACKSPACE => .backspace, .ENTER => .enter, .TAB => .tab,
-        .ESCAPE => .escape, .SPACE => .space,
-        .GRAVE_ACCENT => .grave, .MINUS => .minus, .EQUAL => .equal,
-        .LEFT_BRACKET => .left_bracket, .RIGHT_BRACKET => .right_bracket,
-        .BACKSLASH => .backslash, .SEMICOLON => .semicolon,
-        .APOSTROPHE => .apostrophe, .COMMA => .comma,
-        .PERIOD => .period, .SLASH => .slash,
-        .PRINT_SCREEN => .print_screen, .PAUSE => .pause, .MENU => .menu,
+fn translateKey(key: u32) Key {
+    if (key >= 0x61 and key <= 0x7a) {
+        return @enumFromInt(@intFromEnum(Key.a) + @as(u8, @intCast(key - 0x61)));
+    }
+    if (key >= 0x30 and key <= 0x39) {
+        return @enumFromInt(@intFromEnum(Key.num0) + @as(u8, @intCast(key - 0x30)));
+    }
+    return switch (key) {
+        0x1b => .escape,
+        0x0d => .enter,
+        0x08 => .backspace,
+        0x09 => .tab,
+        0x20 => .space,
+        0x7f => .delete,
+        0x2d => .minus,
+        0x3d => .equal,
+        0x5b => .left_bracket,
+        0x5d => .right_bracket,
+        0x5c => .backslash,
+        0x3b => .semicolon,
+        0x27 => .apostrophe,
+        0x2c => .comma,
+        0x2e => .period,
+        0x2f => .slash,
+        0x60 => .grave,
+        0x4000004f => .right,
+        0x40000050 => .left,
+        0x40000051 => .down,
+        0x40000052 => .up,
+        0x40000049 => .insert,
+        0x4000004a => .home,
+        0x4000004b => .page_up,
+        0x4000004d => .end,
+        0x4000004e => .page_down,
+        0x400000e0 => .left_ctrl,
+        0x400000e1 => .left_shift,
+        0x400000e2 => .left_alt,
+        0x400000e3 => .left_super,
+        0x400000e4 => .right_ctrl,
+        0x400000e5 => .right_shift,
+        0x400000e6 => .right_alt,
+        0x400000e7 => .right_super,
+        0x40000039 => .caps_lock,
+        0x40000053 => .num_lock,
+        0x40000047 => .scroll_lock,
+        0x4000003a => .f1,
+        0x4000003b => .f2,
+        0x4000003c => .f3,
+        0x4000003d => .f4,
+        0x4000003e => .f5,
+        0x4000003f => .f6,
+        0x40000040 => .f7,
+        0x40000041 => .f8,
+        0x40000042 => .f9,
+        0x40000043 => .f10,
+        0x40000044 => .f11,
+        0x40000045 => .f12,
+        0x40000046 => .print_screen,
+        0x40000048 => .pause,
+        0x40000076 => .menu,
         else => .unknown,
     };
 }
 
-fn translateMouseButton(mb: sokol.app.Mousebutton) MouseButton {
-    return switch (mb) {
-        .LEFT => .left,
-        .RIGHT => .right,
-        .MIDDLE => .scroll,
+fn translateMouseButton(button: u8) MouseButton {
+    return switch (button) {
+        1 => .left,
+        3 => .right,
+        2 => .scroll,
         else => .left,
     };
 }

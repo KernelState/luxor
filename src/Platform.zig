@@ -87,10 +87,15 @@ pub const renderer = struct {
         drawTriangle: *const fn (ctx: *anyopaque, a: Pos, b: Pos, c: Pos, bg: Background) void,
         drawSvg: *const fn (ctx: *anyopaque, svg_id: ObjectId, pos: Pos, size: Size) void,
         drawMask: *const fn (ctx: *anyopaque, mask: Mask, pos: Pos, bg: Background) void,
+        drawText: *const fn (ctx: *anyopaque, text: []const u8, x: f32, y: f32) void,
 
         // Clipping/Scissoring
         pushClip: *const fn (ctx: *anyopaque, rect: Rect) void,
         popClip: *const fn (ctx: *anyopaque) void,
+
+        // Overlay layers
+        pushOverlay: *const fn (ctx: *anyopaque) void,
+        popOverlay: *const fn (ctx: *anyopaque) void,
     };
 
     pub const ObjectId = u64;
@@ -214,12 +219,22 @@ pub const renderer = struct {
         pub inline fn drawMask(self: Instance, mask: Mask, pos: Pos, bg: Background) void {
             self.vtable.drawMask(self.ctx, mask, pos, bg);
         }
+        pub inline fn drawText(self: Instance, text: []const u8, x: f32, y: f32) void {
+            self.vtable.drawText(self.ctx, text, x, y);
+        }
 
         pub inline fn pushClip(self: Instance, rect: Rect) void {
             self.vtable.pushClip(self.ctx, rect);
         }
         pub inline fn popClip(self: Instance) void {
             self.vtable.popClip(self.ctx);
+        }
+
+        pub inline fn pushOverlay(self: Instance) void {
+            self.vtable.pushOverlay(self.ctx);
+        }
+        pub inline fn popOverlay(self: Instance) void {
+            self.vtable.popOverlay(self.ctx);
         }
     };
 
