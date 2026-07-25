@@ -1,13 +1,10 @@
-/// The translateC for SDL3.h
-pub const sdl = @import("sdl");
-pub const vk = @import("vulkan");
+pub const sokol = @import("sokol");
 const std = @import("std");
 
 pub const Element = @import("Element.zig");
 pub const Layout = @import("Layout.zig");
 pub const Window = @import("Window.zig");
 pub const Platform = @import("Platform.zig");
-pub const Renderer = @import("Renderer.zig");
 
 pub const Rect = struct {
     w: u32,

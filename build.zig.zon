@@ -32,9 +32,9 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .vulkan = .{
-            .url = "git+https://github.com/Snektron/vulkan-zig.git?ref=zig-0.16-compat#b496a6a561ffbbeb530b0f9ed4e059f88c0723a5",
-            .hash = "vulkan-0.0.0-r7Ytx7N9AwD7IZt5_XNHtkJ4G9qY0pCH-cpcOsbL8wzD",
+        .sokol = .{
+            .url = "git+https://github.com/floooh/sokol-zig.git#9bbabc13207ca6259d171f4c22e7d88a1f7030e9",
+            .hash = "sokol-0.1.0-pb1HK2HlNwCWJkvotHqrVhf8Z_Vb-T8kViYbqeVM61tp",
         },
     },
     .paths = .{
