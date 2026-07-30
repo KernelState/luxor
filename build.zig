@@ -4,18 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const dep_sokol = b.dependency("sokol", .{
-        .target = target,
-        .optimize = optimize,
-        .dont_link_system_libs = true,
-    });
-
-    const sdl_translate = b.addTranslateC(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("vendor/sdl_unified.h"),
-    });
-
     const lib = b.addLibrary(.{
         .name = "luxor",
         .root_module = b.addModule("luxor", .{
@@ -26,9 +14,6 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
 
-    lib.root_module.addImport("sokol", dep_sokol.module("sokol"));
-    lib.root_module.addImport("sdl", sdl_translate.createModule());
-    lib.root_module.linkLibrary(dep_sokol.artifact("sokol_clib"));
     lib.root_module.linkSystemLibrary("SDL3", .{ .needed = true });
     lib.root_module.linkSystemLibrary("asound", .{});
     lib.root_module.linkSystemLibrary("GL", .{});
@@ -51,7 +36,6 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
 
-    exe.root_module.linkLibrary(dep_sokol.artifact("sokol_clib"));
     exe.root_module.linkSystemLibrary("SDL3", .{ .needed = true });
     exe.root_module.linkSystemLibrary("asound", .{});
     exe.root_module.linkSystemLibrary("GL", .{});
