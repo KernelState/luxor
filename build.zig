@@ -4,7 +4,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const sdl = b.dependency("zsdl3", .{}).module("zsdl3");
+    const sdl = b.dependency("zsdl3", .{
+        .sdl_image = false,
+        .sdl_mixer = false,
+        .sdl_ttf = false,
+    }).module("zsdl3");
+
+    const options = b.addOptions();
+    options.addOption(bool, "vulkan", true);
 
     const lib = b.addLibrary(.{
         .name = "luxor",
@@ -12,6 +19,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/luxor.zig"),
             .optimize = optimize,
             .target = target,
+            .imports = &.{
+                .{ .name = "options", .module = options.createModule() },
+            },
         }),
         .use_llvm = true,
     });
@@ -29,11 +39,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "luxor", .module = lib.root_module },
+                .{ .name = "sdl", .module = sdl },
             },
         }),
         .use_llvm = true,
     });
-
 
     const exe_install = b.addInstallArtifact(exe, .{});
 

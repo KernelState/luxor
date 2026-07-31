@@ -2,7 +2,6 @@
 /// their request of size or position or both. Layouts are usually long lasting
 /// objects that are maintained externally, this struct only makes it so you can
 /// layout any externally initialized and handled layout handler.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const lu = @import("luxor.zig");
@@ -28,7 +27,7 @@ pub const Request = struct {
     element: lu.Element,
     size: ?lu.Rect = null,
     pos: ?lu.Pos = null,
-    margin: ?lu.Margin = null,
+    margin: ?lu.Sides = null,
 };
 
 pub const Item = struct {
@@ -36,13 +35,16 @@ pub const Item = struct {
     area: lu.Area,
 };
 
-pub fn lay(self: *Layout) ![]Item {
-    self.fn_lay(self.data);
+/// Layout all the saved requests for taking up some size, returning the
+/// resulting items to render.
+pub fn lay(self: *Layout) []Item {
+    self.fn_lay(self);
+    return self.items[0..self.iindex];
 }
 
 pub fn request(self: *Layout, req: Request) void {
     if (self.rindex == self.requests.len) {
-        if (builtin.mode == .debug) {
+        if (builtin.mode == .Debug) {
             @panic("Reached maximum layout requests");
         } else {
             std.log.warn("Reached maximum layout requests, please contact the developer to fix this");

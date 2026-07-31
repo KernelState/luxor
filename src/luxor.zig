@@ -67,12 +67,12 @@ pub const Area = struct {
     size: Rect,
     pos: Pos,
 
-    pub fn toSDL(self: *Area) sdl.SDL_Rect {
+    pub fn toSDL(self: *const Area) sdl.SDL_Rect {
         return .{
-            .x = self.pos.x,
-            .y = self.pos.y,
-            .w = self.size.w,
-            .h = self.size.h,
+            .x = @intCast(self.pos.x),
+            .y = @intCast(self.pos.y),
+            .w = @intCast(self.size.w),
+            .h = @intCast(self.size.h),
         };
     }
 };
