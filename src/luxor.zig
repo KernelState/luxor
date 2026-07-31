@@ -123,18 +123,40 @@ pub const Color = struct {
     pub const dark_gray = Color.fromU32(0x333333FF);
 };
 
-pub const Image = struct {};
-pub const Gradient = struct {};
+/// An image background, referencing a texture registered on the window.
+pub const Image = struct {
+    id: u64,
+    /// Optional source region inside the texture, in texture pixels.
+    src: ?Area = null,
+};
+/// A color stop of a `Gradient`. Positions are floats in the 0.0 to 1.0 space
+/// of the drawing area; the actual pixel position is
+/// `floor(pos * drawing area size) + drawing area position`.
+pub const GradientPoint = struct {
+    x: f32,
+    y: f32,
+    color: Color,
+};
+
+/// A multi-point gradient. The background or border transitions smoothly
+/// between every `points` color, weighted by the distance to each point.
+pub const Gradient = struct {
+    points: []const GradientPoint,
+    /// Multiplies the alpha of every point color.
+    opacity: f32 = 1.0,
+};
 
 pub const Effect = union(enum) {
     blur: Blur,
     opacity: f64,
-    pub const Blur = struct {};
+    pub const Blur = struct {
+        radius: u32 = 8,
+    };
 };
 
 pub const Background = struct {
     base: Base,
-    effects: []Effect,
+    effects: []const Effect,
 
     pub const Base = union(enum) {
         image: Image,
@@ -144,6 +166,14 @@ pub const Background = struct {
 
     pub fn solid(c: Color) Background {
         return .{ .base = .{ .solid = c }, .effects = &.{} };
+    }
+
+    pub fn gradient(g: Gradient) Background {
+        return .{ .base = .{ .gradient = g }, .effects = &.{} };
+    }
+
+    pub fn image(img: Image) Background {
+        return .{ .base = .{ .image = img }, .effects = &.{} };
     }
 };
 
