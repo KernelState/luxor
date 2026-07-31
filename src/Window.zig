@@ -38,23 +38,12 @@ const gradient_indices_max = gradient_cells_max * gradient_cells_max * 6;
 /// and stretched to the drawing area.
 const max_gradient_size: f32 = 512.0;
 
-/// Mirror of `surface.SDL_Surface`, needed because the sdl module
-/// does not export the type. Only used with the extern functions below.
-const SDL_Surface = extern struct {
-    flags: c_uint,
-    format: c_uint,
-    w: c_int,
-    h: c_int,
-    pitch: c_int,
-    pixels: ?*anyopaque,
-    refcount: c_int,
-    reserved: ?*anyopaque,
-};
+const Surface = sdl.surface.SDL_Surface;
 
-extern fn SDL_RenderReadPixels(renderer: *sdl.SDL_Renderer, rect: ?*const sdl.SDL_Rect) ?*SDL_Surface;
-extern fn SDL_DestroySurface(surface: ?*SDL_Surface) void;
-extern fn SDL_CreateTextureFromSurface(renderer: *sdl.SDL_Renderer, surface: ?*SDL_Surface) ?*sdl.SDL_Texture;
-extern fn SDL_PremultiplySurfaceAlpha(surface: ?*SDL_Surface, linear: bool) bool;
+// `sdl.renderReadPixels` is broken upstream: its extern return type references
+// the non-existent `pixels.SDL_Surface` type, so the call has to be declared
+// here. The surface and premultiply helpers are used from the sdl module.
+extern fn SDL_RenderReadPixels(renderer: *sdl.SDL_Renderer, rect: ?*const sdl.SDL_Rect) ?*Surface;
 
 const Window = @This();
 
@@ -211,12 +200,12 @@ pub fn render(self: *Window, root: lu.Element) void {
 fn beginBlur(self: *Window) void {
     defer _ = sdl.setRenderTarget(self.renderer, null);
     const surface = SDL_RenderReadPixels(self.renderer, null) orelse return;
-    defer SDL_DestroySurface(surface);
+    defer sdl.surface.destroySurface(surface);
     // Premultiply the alpha into the colors so that downsampling interpolates
     // the colors (bright content bleeds outward) instead of blending them
     // toward the transparent black backdrop.
-    _ = SDL_PremultiplySurfaceAlpha(surface, false);
-    const full = SDL_CreateTextureFromSurface(self.renderer, surface) orelse return;
+    _ = sdl.surface.premultiplySurfaceAlpha(surface, false);
+    const full = sdl.createTextureFromSurface(self.renderer, surface) orelse return;
     defer sdl.destroyTexture(full);
     _ = sdl.setTextureScaleMode(full, .SDL_SCALEMODE_LINEAR);
     _ = sdl.setTextureBlendMode(full, sdl.pixels.SDL_BLENDMODE_BLEND_PREMULTIPLIED);
