@@ -63,6 +63,20 @@ pub const Pos = struct {
     y: u32,
 };
 
+pub const Area = struct {
+    size: Rect,
+    pos: Pos,
+
+    pub fn toSDL(self: *Area) sdl.SDL_Rect {
+        return .{
+            .x = self.pos.x,
+            .y = self.pos.y,
+            .w = self.size.w,
+            .h = self.size.h,
+        };
+    }
+};
+
 pub const Sides = struct {
     top: u32,
     bottom: u32,

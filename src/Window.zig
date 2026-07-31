@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const lu = @import("luxor.zig");
 const sdl = @import("sdl");
 
@@ -8,8 +9,12 @@ transparent: bool,
 events: Events = .{},
 window: *sdl.SDL_Window,
 renderer: *sdl.SDL_Renderer,
-textures: [max_textures]?Texture = [_]?Texture{null} ** max_textures,
-clip_stack: [max_clips]?lu.Rect = [_]?lu.Rect{.{}} ** max_clips,
+textures: [max_textures]Texture = undefined,
+clip_stack: [max_clips]lu.Area = undefined,
+/// Current index in `textures`
+tindex: usize = 0,
+/// Current index in `clip_stack`
+cindex: usize = 0,
 
 const max_textures = 1024;
 const max_clips = 64;
@@ -77,7 +82,7 @@ pub fn init(config: Config) !Window {
         .size = undefined,
         .title = config.title,
     };
-    if (!sdl.SDL_CreateWindowAndRenderer(
+    if (!sdl.createWindowAndRenderer(
         config.title,
         config.min_size.w,
         config.min_size.h,
@@ -86,7 +91,7 @@ pub fn init(config: Config) !Window {
         @ptrCast(&self.renderer),
     ))
         return error.FailedToCreateWindow;
-    if (!sdl.SDL_GetWindowSize(
+    if (!sdl.getWindowSize(
         self.window,
         @ptrCast(&self.size.w),
         @ptrCast(&self.size.h),
@@ -97,81 +102,45 @@ pub fn init(config: Config) !Window {
 pub fn deinit(self: *Window) void {
     for (self.textures) |t| {
         if (t == null) break;
-        sdl.SDL_DestroyTexture(@ptrCast(t.?));
+        sdl.destroyTexture(@ptrCast(t.?));
     }
-    sdl.SDL_DestroyRenderer(self.renderer);
-    sdl.SDL_DestroyWindow(self.window);
+    sdl.destroyRenderer(self.renderer);
+    sdl.destroyWindow(self.window);
 }
 
-pub fn pushClip(self: *Window, pos: lu.Pos, rect: lu.Rect) void {
-    for (&self.clip_stack) |*c| {
-        if (c.* == null) {
-            c.* = rect;
-            if (!sdl.SDL_SetRenderClipRect(self.renderer, sdl.SDL_Rect{
-                .x = pos.x,
-                .y = pos.y,
-                .w = rect.w,
-                .h = rect.h,
-            }))
-                return error.FailedToAssignClipRect;
-        }
-        return;
-    }
-    return error.TooManyClipRects;
-}
-
-pub fn popClip(self: *Window) !void {
-    for (self.clip_stack, 0..) |c, i| {
-        if (c == null) {
-            if (i == 0)
-                return error.NoClipToPop;
-            self.clip_stack[i - 1] = null;
-            return;
-        }
-        if (i == self.clip_stack - 1) {
-            self.clip_stack[i - 1] = null;
+pub fn pushClip(self: *Window, area: lu.Area) void {
+    if (self.cindex >= self.clip_stack.len) {
+        if (builtin.mode == .Debug) {
+            @panic("Failed to add clip, clip_stack is full");
+        } else {
+            std.log.warn("Failed to add clip, clip_stack is full, please contact the developer to fix that", .{});
             return;
         }
     }
-    unreachable;
+    self.clip_stack[self.cindex] = area;
+    sdl.setRenderClipRect(self.renderer, &area.toSDL());
+    self.cindex += 1;
 }
 
-pub fn beginFrame(self: *Window) !void {
-    if (!sdl.SDL_RenderClear(self.renderer))
-        return error.FailedToBeginFrame;
+pub fn popClip(self: *Window) void {
+    self.clip_stack[self.cindex] = undefined;
+    if (self.cindex != 0) {
+        self.cindex -= 1;
+        sdl.setRenderClipRect(self.renderer, self.clip_stack[self.cindex].toSDL());
+    }
 }
 
-pub fn endFrame(self: *Window) !void {
-    if (!sdl.SDL_RenderPresent(self.renderer))
-        return error.FailedToBeginFrame;
-}
-
-pub fn drawImage(
-    self: *Window,
-    data: []const u8,
-    size: lu.Rect,
-    pos: lu.Pos,
-    format: Texture.Format,
-) void {
-    for (&self.textures) |*t| {
-        if (t.* == null) {
-            t.* = .{
-                .id = std.crypto.random.int(u64),
-                .texture = sdl.SDL_CreateTexture(
-                    self.renderer,
-                    format.toSDLPixelFormat(),
-                    sdl.SDL_TEXTUREACCESS_STATIC,
-                    size.width,
-                    size.height,
-                ) orelse return error.FailedToCreateTexture,
-            };
-            if (!sdl.SDL_UpdateTexture(t.?.texture, .{
-                .x = pos.x,
-                .y = pos.y,
-                .w = size.width,
-                .h = size.height,
-            }, data.ptr, 0))
-                return error.FailedToUpload;
-        }
+/// Renders a layout with elements inside, lays out the elements first then then
+/// loop over the elements to display then.
+pub fn render(self: *Window, root: lu.Element) void {
+    self.pushClip(lu.Area.toSDL(&.{ .pos = root.pos, .size = root.size }));
+    switch (root.background.base) {
+        .solid => |c| {
+            sdl.setRenderDrawColor(self.renderer, c.r, c.g, c.b, c.a);
+        },
+        .gradient => |c| {}
+    }
+    for (root.layout.items[0..root.layout.iindex+1]) |r| {
+        self.render(r);
     }
 }

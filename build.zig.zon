@@ -32,10 +32,6 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .sokol = .{
-            .url = "git+https://github.com/floooh/sokol-zig.git#9bbabc13207ca6259d171f4c22e7d88a1f7030e9",
-            .hash = "sokol-0.1.0-pb1HK2HlNwCWJkvotHqrVhf8Z_Vb-T8kViYbqeVM61tp",
-        },
         .zsdl3 = .{
             .url = "git+https://github.com/felixuxx/zsdl3.git#3659117a955d175c680add0ffaeeeb43e2537cfa",
             .hash = "zsdl3-0.0.0-l0pNpNL6BwCqFiKwNGiUePJa60agOcirrIiAgYDrYVLW",
