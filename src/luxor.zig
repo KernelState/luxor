@@ -115,17 +115,17 @@ pub const Color = struct {
     }
 
     pub const black = Color.fromU32(0x000000FF);
-    pub const white = Color.fromU32(0xFFFFFF);
-    pub const red = Color.fromU32(0xFF0000);
-    pub const green = Color.fromU32(0x00FF00);
-    pub const blue = Color.fromU32(0x0000FF);
-    pub const gray = Color.fromU32(0x808080);
+    pub const white = Color.fromU32(0xFFFFFFFF);
+    pub const red = Color.fromU32(0xFF0000FF);
+    pub const green = Color.fromU32(0x00FF00FF);
+    pub const blue = Color.fromU32(0x0000FFFF);
+    pub const gray = Color.fromU32(0x808080FF);
     pub const dark_gray = Color.fromU32(0x333333FF);
 };
 
 /// An image background, referencing a texture registered on the window.
 pub const Image = struct {
-    id: u64,
+    id: usize,
     /// Optional source region inside the texture, in texture pixels.
     src: ?Area = null,
 };
@@ -144,6 +144,14 @@ pub const Gradient = struct {
     points: []const GradientPoint,
     /// Multiplies the alpha of every point color.
     opacity: f32 = 1.0,
+};
+
+/// What the border is painted with: a flat color or a gradient.
+/// The gradient coordinates are relative to the element's full area, the
+/// smallest rectangle that contains all of the border shapes.
+pub const Border = union(enum) {
+    color: Color,
+    gradient: Gradient,
 };
 
 pub const Effect = union(enum) {

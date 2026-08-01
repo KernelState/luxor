@@ -51,13 +51,13 @@ pub fn main() !void {
         .size = .{ .w = 200, .h = 120 },
         .pos = .{ .x = 80, .y = 80 },
         .border = .all(6),
-        .border_gradient = .{
+        .border_color = .{ .gradient = .{
             .points = &.{
                 .{ .x = 0.0, .y = 0.0, .color = lu.Color.fromU32(0xFFFF00FF) },
                 .{ .x = 1.0, .y = 1.0, .color = lu.Color.fromU32(0xFF00FFFF) },
             },
             .opacity = 1.0,
-        },
+        } },
         .border_radius = .all(24),
         .background = lu.Background.image(.{ .id = img_id }),
         .layout = &box_layout,

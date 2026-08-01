@@ -18,8 +18,6 @@ blur_textures: [max_blur_levels]?*sdl.SDL_Texture = [_]?*sdl.SDL_Texture{null} *
 tindex: usize = 0,
 /// Current index in `clip_stack`
 cindex: usize = 0,
-/// Next texture id handed out by `addTexture`
-next_id: ObjectId = 1,
 
 const max_textures = 1024;
 const max_clips = 64;
@@ -68,11 +66,8 @@ pub const Events = struct {
     exit: lu.Hook(void) = .{ .handle = null },
 };
 
-pub const ObjectId = u64;
-
 pub const Texture = struct {
     texture: *sdl.SDL_Texture,
-    id: ObjectId,
 
     pub const Format = enum {
         rgba8,
@@ -102,7 +97,7 @@ pub fn init(config: Config) !Window {
     if (config.transparent)
         flags |= sdl.video.SDL_WINDOW_TRANSPARENT;
     var self = Window{
-        .transparent = (flags ^ sdl.video.SDL_WINDOW_TRANSPARENT != 0),
+        .transparent = (flags & sdl.video.SDL_WINDOW_TRANSPARENT != 0),
         .renderer = undefined,
         .window = undefined,
         .size = undefined,
@@ -135,8 +130,8 @@ pub fn deinit(self: *Window) void {
     sdl.destroyWindow(self.window);
 }
 
-/// Registers a texture and returns its id, usable in `lu.Image`.
-pub fn addTexture(self: *Window, tex: *sdl.SDL_Texture) !ObjectId {
+/// Registers a texture and returns its index, usable in `lu.Image`.
+pub fn addTexture(self: *Window, tex: *sdl.SDL_Texture) !usize {
     if (self.tindex >= max_textures) {
         if (builtin.mode == .Debug) {
             @panic("Failed to add texture, texture array is full");
@@ -144,19 +139,16 @@ pub fn addTexture(self: *Window, tex: *sdl.SDL_Texture) !ObjectId {
             return error.TextureLimitReached;
         }
     }
-    const id = self.next_id;
-    self.next_id += 1;
-    self.textures[self.tindex] = .{ .texture = tex, .id = id };
+    const id = self.tindex;
+    self.textures[id] = .{ .texture = tex };
     self.tindex += 1;
     return id;
 }
 
-/// Looks up a registered texture by id.
-pub fn texture(self: *Window, id: ObjectId) ?*sdl.SDL_Texture {
-    for (self.textures[0..self.tindex]) |t| {
-        if (t.id == id) return t.texture;
-    }
-    return null;
+/// Looks up a registered texture by index.
+pub fn texture(self: *Window, id: usize) ?*sdl.SDL_Texture {
+    if (id >= self.tindex) return null;
+    return self.textures[id].texture;
 }
 
 pub fn pushClip(self: *Window, area: lu.Area) void {
@@ -269,12 +261,12 @@ fn contentArea(e: lu.Element, area: lu.Area) lu.Area {
 }
 
 fn drawBackground(self: *Window, e: lu.Element, area: lu.Area) void {
-    const alpha = totalOpacity(&e.effects) * totalOpacity(e.background.effects);
+    const alpha = totalOpacity(e.effects) * totalOpacity(e.background.effects);
     if (hasBlur(e.background.effects))
         self.drawBlurBackdrop(area, e.border_radius, alpha, e.background.effects);
     switch (e.background.base) {
         .solid => |c| {
-            self.fillRoundedRect(area, e.border_radius, tint(tint(c, &e.effects), e.background.effects));
+            self.fillRoundedRect(area, e.border_radius, tint(tint(c, e.effects), e.background.effects));
         },
         .image => |img| self.drawImageBackground(img, area, e.border_radius, alpha),
         .gradient => |g| self.drawGradientBackground(g, area, e.border_radius, alpha),
@@ -305,32 +297,32 @@ fn drawBorder(self: *Window, e: lu.Element, area: lu.Area) void {
         },
     };
 
-    if (e.border_gradient) |g| {
-        self.drawGradientBorder(g, area, &bars);
-        return;
-    }
-
-    const color = tint(tint(e.border_color, &e.effects), e.background.effects);
-    switch (e.background.base) {
-        .solid => |c| {
-            const inner: lu.Area = .{
-                .pos = .{ .x = area.pos.x + b.left, .y = area.pos.y + b.top },
-                .size = .{ .w = area.size.w -| (b.left + b.right), .h = area.size.h -| (b.top + b.bottom) },
-            };
-            self.fillRoundedRect(area, e.border_radius, color);
-            self.fillRoundedRect(inner, e.border_radius, tint(tint(c, &e.effects), e.background.effects));
-        },
-        .image, .gradient => {
-            for (bars) |bar| self.fillRect(bar, color);
+    switch (e.border_color) {
+        .gradient => |g| self.drawGradientBorder(g, area, &bars),
+        .color => |c| {
+            const color = tint(tint(c, e.effects), e.background.effects);
+            switch (e.background.base) {
+                .solid => |bg| {
+                    const inner: lu.Area = .{
+                        .pos = .{ .x = area.pos.x + b.left, .y = area.pos.y + b.top },
+                        .size = .{ .w = area.size.w -| (b.left + b.right), .h = area.size.h -| (b.top + b.bottom) },
+                    };
+                    self.fillRoundedRect(area, e.border_radius, color);
+                    self.fillRoundedRect(inner, e.border_radius, tint(tint(bg, e.effects), e.background.effects));
+                },
+                .image, .gradient => {
+                    for (bars) |bar| self.fillRect(bar, color);
+                },
+            }
         },
     }
 }
 
 /// Draws the pre-blurred backbuffer masked to `area` with `radius`.
-fn drawBlurBackdrop(self: *Window, area: lu.Area, radius: lu.Corners, alpha: f32, effects: []const lu.Effect) void {
+fn drawBlurBackdrop(self: *Window, area: lu.Area, radius: lu.Corners, alpha: f32, effects: ?[]const lu.Effect) void {
     var level: usize = 0;
     var found = false;
-    for (effects) |effect| {
+    for (effects orelse &.{}) |effect| {
         switch (effect) {
             .blur => |b| {
                 level = blurLevelFor(b.radius);
@@ -509,9 +501,9 @@ fn gradientColor(g: lu.Gradient, x: f32, y: f32) sdl.SDL_FColor {
 }
 
 /// Multiplies the alpha channel of `color` by the `opacity` effect value.
-fn tint(color: lu.Color, effects: []const lu.Effect) lu.Color {
+fn tint(color: lu.Color, effects: ?[]const lu.Effect) lu.Color {
     var out = color;
-    for (effects) |effect| {
+    for (effects orelse &.{}) |effect| {
         switch (effect) {
             .opacity => |o| {
                 out.a = @intFromFloat(@min(@as(f64, @floatFromInt(out.a)) * o, 255.0));
@@ -523,9 +515,9 @@ fn tint(color: lu.Color, effects: []const lu.Effect) lu.Color {
 }
 
 /// The product of all `opacity` effects in `effects`, blur is transparent.
-fn totalOpacity(effects: []const lu.Effect) f32 {
+fn totalOpacity(effects: ?[]const lu.Effect) f32 {
     var out: f32 = 1.0;
-    for (effects) |effect| {
+    for (effects orelse &.{}) |effect| {
         switch (effect) {
             .opacity => |o| out *= @floatCast(o),
             .blur => {},
@@ -534,8 +526,8 @@ fn totalOpacity(effects: []const lu.Effect) f32 {
     return out;
 }
 
-fn hasBlur(effects: []const lu.Effect) bool {
-    for (effects) |effect| {
+fn hasBlur(effects: ?[]const lu.Effect) bool {
+    for (effects orelse &.{}) |effect| {
         switch (effect) {
             .blur => return true,
             .opacity => {},

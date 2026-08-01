@@ -4,14 +4,10 @@ const lu = @import("luxor.zig");
 size: lu.Rect,
 pos: lu.Pos,
 border: lu.Sides = .all(0),
-border_color: lu.Color = .black,
-/// When set, the border is drawn with this gradient instead of `border_color`.
-/// The gradient coordinates are relative to the element's full area, the
-/// smallest rectangle that contains all of the border shapes.
-border_gradient: ?lu.Gradient = null,
+border_color: lu.Border = .{ .color = .black },
 border_radius: lu.Corners = .all(0),
 background: lu.Background,
-effects: [10]lu.Effect = [_]lu.Effect{.{ .blur = .{} }} ** 10,
+effects: ?[]const lu.Effect = null,
 layout: *lu.Layout,
 padding: lu.Sides = .all(0),
 margin: lu.Sides = .all(0),
