@@ -27,5 +27,32 @@ pub const Events = struct {
 };
 
 pub const Overrides = struct {
+    size: ?lu.Rect = null,
+    pos: ?lu.Pos = null,
+    border: ?lu.Sides = null,
+    border_color: ?lu.Border = null,
+    border_radius: ?lu.Corners = null,
+    background: ?lu.Background = null,
+    has_effects: bool = false,
+    effects: []lu.Effect = undefined,
     layout: ?*lu.Layout = null,
+    padding: ?lu.Sides = null,
+    margin: ?lu.Sides = null,
+    events: ?Events = null,
+    focusable: ?bool = null,
 };
+
+pub fn override(self: *Element, o: Overrides) void {
+    if (o.size) |v| self.size = v;
+    if (o.pos) |v| self.pos = v;
+    if (o.border) |v| self.border = v;
+    if (o.border_color) |v| self.border_color = v;
+    if (o.border_radius) |v| self.border_radius = v;
+    if (o.background) |v| self.background = v;
+    if (o.has_effects) self.effects = o.effects;
+    if (o.layout) |v| self.layout = v;
+    if (o.padding) |v| self.padding = v;
+    if (o.margin) |v| self.margin = v;
+    if (o.events) |v| self.events = v;
+    if (o.focusable) |v| self.focusable = v;
+}

@@ -8,11 +8,12 @@ var box_layout = lu.Layout{ .fn_lay = &absoluteLayout, .parent = null };
 fn absoluteLayout(layout: *lu.Layout) void {
     layout.iindex = 0;
     for (layout.requests[0..layout.rindex]) |req| {
+        const element = req.element orelse continue;
         layout.items[layout.iindex] = .{
-            .node = req.element,
+            .node = element,
             .area = .{
                 .pos = req.pos orelse .{ .x = 0, .y = 0 },
-                .size = req.size orelse .{ .w = 0, .h = 0 },
+                .size = req.size orelse req.min_size,
             },
         };
         layout.iindex += 1;
@@ -145,79 +146,24 @@ pub fn main() !void {
         .events = events,
     };
 
-    var buf_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer buf_arena.deinit();
-
-    const english_buf = try widget.fonts[0].renderText(
-        buf_arena.allocator(),
-        "Hello, World!",
-        .{ .w = 400, .h = 64 },
-        .{ .w = 0, .h = 4 },
-        32,
-        .ltr,
-        lu.Color.fromU32(0xFFFFFFFF),
-        .{},
-    );
-    const english_box = lu.Element{
-        .size = .{ .w = english_buf.width, .h = english_buf.height },
-        .pos = .{ .x = 80, .y = 220 },
+    try widget.label(&root_layout, "Hello, World!", .{ .x = 80, .y = 220 }, .{}, .{
         .border_radius = .all(4),
-        .background = lu.Background.buffer(english_buf),
-        .layout = &box_layout,
-        .events = events,
-        .focusable = false,
-    };
-
-    const arabic_buf = try widget.fonts[1].renderText(
-        buf_arena.allocator(),
-        "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} \u{0628}\u{0627}\u{0644}\u{0639}\u{0627}\u{0644}\u{0645}",
-        .{ .w = 500, .h = 64 },
-        .{ .w = 0, .h = 4 },
-        32,
-        .rtl,
-        lu.Color.fromU32(0xFFFFFFFF),
-        .{},
-    );
-    const arabic_box = lu.Element{
-        .size = .{ .w = arabic_buf.width, .h = arabic_buf.height },
-        .pos = .{ .x = 500, .y = 220 },
+        .background = .{ .base = .{ .solid = .red }, .effects = &.{} },
+    });
+    try widget.label(&root_layout, "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} \u{0628}\u{0627}\u{0644}\u{0639}\u{0627}\u{0644}\u{0645}", .{ .x = 500, .y = 220 }, .{
+        .direction = .rtl,
+    }, .{
         .border_radius = .all(4),
-        .background = lu.Background.buffer(arabic_buf),
-        .layout = &box_layout,
-        .events = events,
-        .focusable = false,
-    };
+    });
 
-    root_layout.request(.{
-        .element = image_box,
-        .size = .{ .w = 200, .h = 120 },
-        .pos = .{ .x = 80, .y = 80 },
-    });
-    root_layout.request(.{
-        .element = blur_box,
-        .size = .{ .w = 260, .h = 180 },
-        .pos = .{ .x = 480, .y = 350 },
-    });
-    root_layout.request(.{
-        .element = gradient_box,
-        .size = .{ .w = 220, .h = 140 },
-        .pos = .{ .x = 60, .y = 380 },
-    });
-    root_layout.request(.{
-        .element = buffer_box,
-        .size = .{ .w = 160, .h = 80 },
-        .pos = .{ .x = 340, .y = 80 },
-    });
-    root_layout.request(.{
-        .element = english_box,
-        .size = .{ .w = english_buf.width, .h = english_buf.height },
-        .pos = .{ .x = 80, .y = 220 },
-    });
-    root_layout.request(.{
-        .element = arabic_box,
-        .size = .{ .w = arabic_buf.width, .h = arabic_buf.height },
-        .pos = .{ .x = 500, .y = 220 },
-    });
+    root_layout.request(.{ .w = 200, .h = 120 }, null, .{ .x = 80, .y = 80 }, null);
+    root_layout.addElement(image_box);
+    root_layout.request(.{ .w = 260, .h = 180 }, null, .{ .x = 480, .y = 350 }, null);
+    root_layout.addElement(blur_box);
+    root_layout.request(.{ .w = 220, .h = 140 }, null, .{ .x = 60, .y = 380 }, null);
+    root_layout.addElement(gradient_box);
+    root_layout.request(.{ .w = 160, .h = 80 }, null, .{ .x = 340, .y = 80 }, null);
+    root_layout.addElement(buffer_box);
 
     var event: sdl.SDL_Event = undefined;
     while (true) {

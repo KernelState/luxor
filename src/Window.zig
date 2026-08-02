@@ -240,7 +240,10 @@ fn drawElement(self: *Window, e: lu.Element, area: lu.Area) void {
     defer self.popClip();
 
     for (e.layout.lay()) |item| {
-        self.drawElement(item.node, item.area);
+        var child_area = item.area;
+        child_area.pos.x += content.pos.x;
+        child_area.pos.y += content.pos.y;
+        self.drawElement(item.node, child_area);
     }
 }
 
