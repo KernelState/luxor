@@ -20,6 +20,28 @@ fn absoluteLayout(layout: *lu.Layout) void {
 }
 
 pub fn main() !void {
+    var widget = lu.Widget{
+        .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        .freetype = try lu.Widget.Freetype.init(),
+    };
+    defer widget.freetype.deinit();
+    defer widget.arena.deinit();
+
+    widget.fonts[0] = try widget.freetype.createFont(
+        "/usr/share/fonts/TTF/IBMPlexSans-Regular.ttf",
+        32,
+    );
+    widget.fonts[1] = try widget.freetype.createFont(
+        "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
+        32,
+    );
+    widget.font_count = 2;
+    defer {
+        for (0..widget.font_count) |i| {
+            widget.fonts[i].deinit();
+        }
+    }
+
     if (!sdl.init(sdl.SDL_INIT_VIDEO))
         return error.SDLInitFailed;
     defer sdl.quit();
@@ -92,6 +114,80 @@ pub fn main() !void {
         .events = events,
     };
 
+    var pixel_data: [160 * 80 * 4]u8 = undefined;
+    for (0..80) |y| {
+        for (0..160) |x| {
+            const idx = (y * 160 + x) * 4;
+            const checker = ((x / 16) + (y / 16)) % 2 == 0;
+            if (checker) {
+                pixel_data[idx] = 0xFF;
+                pixel_data[idx + 1] = 0x88;
+                pixel_data[idx + 2] = 0x00;
+                pixel_data[idx + 3] = 0xFF;
+            } else {
+                pixel_data[idx] = 0x00;
+                pixel_data[idx + 1] = 0x44;
+                pixel_data[idx + 2] = 0xFF;
+                pixel_data[idx + 3] = 0xFF;
+            }
+        }
+    }
+    const buffer_box = lu.Element{
+        .size = .{ .w = 160, .h = 80 },
+        .pos = .{ .x = 340, .y = 80 },
+        .border_radius = .all(8),
+        .background = lu.Background.buffer(.{
+            .pixels = &pixel_data,
+            .width = 160,
+            .height = 80,
+        }),
+        .layout = &box_layout,
+        .events = events,
+    };
+
+    var buf_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer buf_arena.deinit();
+
+    const english_buf = try widget.fonts[0].renderText(
+        buf_arena.allocator(),
+        "Hello, World!",
+        .{ .w = 400, .h = 64 },
+        .{ .w = 0, .h = 4 },
+        32,
+        .ltr,
+        lu.Color.fromU32(0xFFFFFFFF),
+        .{},
+    );
+    const english_box = lu.Element{
+        .size = .{ .w = english_buf.width, .h = english_buf.height },
+        .pos = .{ .x = 80, .y = 220 },
+        .border_radius = .all(4),
+        .background = lu.Background.buffer(english_buf),
+        .layout = &box_layout,
+        .events = events,
+        .focusable = false,
+    };
+
+    const arabic_buf = try widget.fonts[1].renderText(
+        buf_arena.allocator(),
+        "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} \u{0628}\u{0627}\u{0644}\u{0639}\u{0627}\u{0644}\u{0645}",
+        .{ .w = 500, .h = 64 },
+        .{ .w = 0, .h = 4 },
+        32,
+        .rtl,
+        lu.Color.fromU32(0xFFFFFFFF),
+        .{},
+    );
+    const arabic_box = lu.Element{
+        .size = .{ .w = arabic_buf.width, .h = arabic_buf.height },
+        .pos = .{ .x = 500, .y = 220 },
+        .border_radius = .all(4),
+        .background = lu.Background.buffer(arabic_buf),
+        .layout = &box_layout,
+        .events = events,
+        .focusable = false,
+    };
+
     root_layout.request(.{
         .element = image_box,
         .size = .{ .w = 200, .h = 120 },
@@ -107,6 +203,21 @@ pub fn main() !void {
         .size = .{ .w = 220, .h = 140 },
         .pos = .{ .x = 60, .y = 380 },
     });
+    root_layout.request(.{
+        .element = buffer_box,
+        .size = .{ .w = 160, .h = 80 },
+        .pos = .{ .x = 340, .y = 80 },
+    });
+    root_layout.request(.{
+        .element = english_box,
+        .size = .{ .w = english_buf.width, .h = english_buf.height },
+        .pos = .{ .x = 80, .y = 220 },
+    });
+    root_layout.request(.{
+        .element = arabic_box,
+        .size = .{ .w = arabic_buf.width, .h = arabic_buf.height },
+        .pos = .{ .x = 500, .y = 220 },
+    });
 
     var event: sdl.SDL_Event = undefined;
     while (true) {
@@ -120,9 +231,6 @@ pub fn main() !void {
             }
         }
 
-        // Some colorful content behind the UI. This is what the blur effect
-        // captures, since the blur is applied to the render output before the
-        // element tree is drawn.
         _ = sdl.renderClear(window.renderer);
         _ = sdl.setRenderDrawColor(window.renderer, 230, 60, 60, 255);
         _ = sdl.renderFillRect(window.renderer, &.{ .x = 100, .y = 80, .w = 300, .h = 220 });

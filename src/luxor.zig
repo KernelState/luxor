@@ -4,10 +4,14 @@ const options = @import("options");
 
 pub const Element = @import("Element.zig");
 pub const Layout = @import("Layout.zig");
-pub const Window = if (options.vulkan)
+pub const Window = if (options.sdl)
     @import("Window.zig")
 else
     @compileError("Window.zig does not exist");
+pub const Widget = if (options.widgets)
+    @import("Widget.zig")
+else
+    @compileError("widgets.zig does not exist");
 
 pub const Event = union(enum) {
     quit,
@@ -129,6 +133,14 @@ pub const Image = struct {
     /// Optional source region inside the texture, in texture pixels.
     src: ?Area = null,
 };
+
+/// A CPU-side pixel buffer (RGBA8888). The Window uploads this to a texture
+/// when drawing the element.
+pub const PixelBuffer = struct {
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+};
 /// A color stop of a `Gradient`. Positions are floats in the 0.0 to 1.0 space
 /// of the drawing area; the actual pixel position is
 /// `floor(pos * drawing area size) + drawing area position`.
@@ -170,6 +182,7 @@ pub const Background = struct {
         image: Image,
         gradient: Gradient,
         solid: Color,
+        buffer: PixelBuffer,
     };
 
     pub fn solid(c: Color) Background {
@@ -182,6 +195,10 @@ pub const Background = struct {
 
     pub fn image(img: Image) Background {
         return .{ .base = .{ .image = img }, .effects = &.{} };
+    }
+
+    pub fn buffer(pb: PixelBuffer) Background {
+        return .{ .base = .{ .buffer = pb }, .effects = &.{} };
     }
 };
 

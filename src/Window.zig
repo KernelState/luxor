@@ -270,6 +270,7 @@ fn drawBackground(self: *Window, e: lu.Element, area: lu.Area) void {
         },
         .image => |img| self.drawImageBackground(img, area, e.border_radius, alpha),
         .gradient => |g| self.drawGradientBackground(g, area, e.border_radius, alpha),
+        .buffer => |pb| self.drawBufferBackground(pb, area, e.border_radius, alpha),
     }
 }
 
@@ -310,7 +311,7 @@ fn drawBorder(self: *Window, e: lu.Element, area: lu.Area) void {
                     self.fillRoundedRect(area, e.border_radius, color);
                     self.fillRoundedRect(inner, e.border_radius, tint(tint(bg, e.effects), e.background.effects));
                 },
-                .image, .gradient => {
+                .image, .gradient, .buffer => {
                     for (bars) |bar| self.fillRect(bar, color);
                 },
             }
@@ -360,6 +361,28 @@ fn drawImageBackground(self: *Window, img: lu.Image, area: lu.Area, radius: lu.C
         }
     else
         .{ .x = 0, .y = 0, .w = tex_w, .h = tex_h };
+    self.renderMasked(area, radius, tex, src, null, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = alpha });
+}
+
+/// Uploads a CPU pixel buffer to an SDL texture and draws it as the background.
+fn drawBufferBackground(self: *Window, pb: lu.PixelBuffer, area: lu.Area, radius: lu.Corners, alpha: f32) void {
+    if (pb.pixels.len == 0 or pb.width == 0 or pb.height == 0) return;
+    const tex = sdl.createTexture(
+        self.renderer,
+        sdl.pixels.SDL_PIXELFORMAT_ABGR8888,
+        sdl.SDL_TEXTUREACCESS_STREAMING,
+        @intCast(pb.width),
+        @intCast(pb.height),
+    ) orelse return;
+    defer sdl.destroyTexture(tex);
+
+    _ = sdl.setTextureBlendMode(tex, sdl.SDL_BLENDMODE_BLEND);
+    _ = sdl.updateTexture(tex, null, @ptrCast(pb.pixels.ptr), @intCast(pb.width * 4));
+
+    var tex_w: f32 = 0;
+    var tex_h: f32 = 0;
+    _ = sdl.textureSize(tex, &tex_w, &tex_h);
+    const src = sdl.SDL_FRect{ .x = 0, .y = 0, .w = tex_w, .h = tex_h };
     self.renderMasked(area, radius, tex, src, null, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = alpha });
 }
 

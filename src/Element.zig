@@ -7,11 +7,12 @@ border: lu.Sides = .all(0),
 border_color: lu.Border = .{ .color = .black },
 border_radius: lu.Corners = .all(0),
 background: lu.Background,
-effects: ?[]const lu.Effect = null,
+effects: ?[]lu.Effect = null,
 layout: *lu.Layout,
 padding: lu.Sides = .all(0),
 margin: lu.Sides = .all(0),
 events: Events,
+focusable: bool = true,
 
 const Element = @This();
 
@@ -23,4 +24,8 @@ pub const Events = struct {
     modify: lu.Hook(void),
     focus: lu.Hook(void),
     key: lu.Hook(void),
+};
+
+pub const Overrides = struct {
+    layout: ?*lu.Layout = null,
 };
