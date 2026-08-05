@@ -152,6 +152,7 @@ pub fn main() !void {
     });
     try widget.label(&root_layout, "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} \u{0628}\u{0627}\u{0644}\u{0639}\u{0627}\u{0644}\u{0645}", .{ .x = 500, .y = 220 }, .{
         .direction = .rtl,
+        .font_idx = 1,
     }, .{
         .border_radius = .all(4),
     });
