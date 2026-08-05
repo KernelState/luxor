@@ -11,9 +11,6 @@ window: *sdl.SDL_Window,
 renderer: *sdl.SDL_Renderer,
 textures: [max_textures]Texture = undefined,
 clip_stack: [max_clips]lu.Area = undefined,
-/// Downsampled copies of the backbuffer, one per blur level.
-/// Rebuilt every frame before any element is drawn.
-blur_textures: [max_blur_levels]?*sdl.SDL_Texture = [_]?*sdl.SDL_Texture{null} ** max_blur_levels,
 /// Current index in `textures`
 tindex: usize = 0,
 /// Current index in `clip_stack`
@@ -21,7 +18,7 @@ cindex: usize = 0,
 
 const max_textures = 1024;
 const max_clips = 64;
-/// Levels of the blur mip chain: 2^i downsampled from the screen.
+/// Max blur downsample exponent: blur factor is `2^level`, `level` capped here.
 const max_blur_levels = 5;
 
 const mask_segs = 8;
@@ -122,7 +119,6 @@ pub fn init(config: Config) !Window {
 }
 
 pub fn deinit(self: *Window) void {
-    self.endBlur();
     for (self.textures[0..self.tindex]) |t| {
         sdl.destroyTexture(t.texture);
     }
@@ -178,54 +174,16 @@ pub fn popClip(self: *Window) void {
 /// Renders an element tree, applying the background, border, padding, margin
 /// and effects of every element through SDL.
 ///
-/// Before drawing anything the current render output (the backbuffer) is
-/// snapshotted and downsampled into the global blur mip chain. Elements with a
-/// `blur` effect then just mask that pre-blurred backdrop with their geometry.
+/// Elements with a `blur` effect capture the pixels currently behind them in
+/// the backbuffer at draw time, so the blur is a live overlay: it only ever
+/// blurs what is directly underneath and is independent of the window size.
 pub fn render(self: *Window, root: lu.Element) void {
-    self.beginBlur();
-    defer self.endBlur();
+    _ = sdl.getWindowSize(
+        self.window,
+        @ptrCast(&self.size.w),
+        @ptrCast(&self.size.h),
+    );
     self.drawElement(root, .{ .pos = root.pos, .size = root.size });
-}
-
-/// Captures whatever is on the current render target and builds the global
-/// blur mip chain. Level `i` is the screen downsampled by `2^i`.
-fn beginBlur(self: *Window) void {
-    defer _ = sdl.setRenderTarget(self.renderer, null);
-    const surface = SDL_RenderReadPixels(self.renderer, null) orelse return;
-    defer sdl.surface.destroySurface(surface);
-    // Premultiply the alpha into the colors so that downsampling interpolates
-    // the colors (bright content bleeds outward) instead of blending them
-    // toward the transparent black backdrop.
-    _ = sdl.surface.premultiplySurfaceAlpha(surface, false);
-    const full = sdl.createTextureFromSurface(self.renderer, surface) orelse return;
-    defer sdl.destroyTexture(full);
-    _ = sdl.setTextureScaleMode(full, .SDL_SCALEMODE_LINEAR);
-    _ = sdl.setTextureBlendMode(full, sdl.pixels.SDL_BLENDMODE_BLEND_PREMULTIPLIED);
-
-    var prev = full;
-    for (&self.blur_textures, 0..) |*slot, i| {
-        const factor: u32 = @as(u32, 1) << @intCast(i);
-        const w: c_int = @intCast(@max(@as(u32, 1), @divTrunc(self.size.w, factor)));
-        const h: c_int = @intCast(@max(@as(u32, 1), @divTrunc(self.size.h, factor)));
-        const tex = sdl.createTexture(self.renderer, surface.format, sdl.SDL_TEXTUREACCESS_TARGET, w, h) orelse break;
-        _ = sdl.setTextureScaleMode(tex, .SDL_SCALEMODE_LINEAR);
-        _ = sdl.setTextureBlendMode(tex, sdl.pixels.SDL_BLENDMODE_BLEND_PREMULTIPLIED);
-        _ = sdl.setRenderTarget(self.renderer, tex);
-        _ = sdl.setRenderDrawBlendMode(self.renderer, sdl.SDL_BLENDMODE_BLEND);
-        _ = sdl.setRenderDrawColor(self.renderer, 0, 0, 0, 0);
-        _ = sdl.renderClear(self.renderer);
-        const dst = sdl.SDL_FRect{ .x = 0, .y = 0, .w = @floatFromInt(w), .h = @floatFromInt(h) };
-        _ = sdl.renderTexture(self.renderer, prev, null, &dst);
-        slot.* = tex;
-        prev = tex;
-    }
-}
-
-fn endBlur(self: *Window) void {
-    for (&self.blur_textures) |*slot| {
-        if (slot.*) |tex| sdl.destroyTexture(tex);
-        slot.* = null;
-    }
 }
 
 fn drawElement(self: *Window, e: lu.Element, area: lu.Area) void {
@@ -322,29 +280,149 @@ fn drawBorder(self: *Window, e: lu.Element, area: lu.Area) void {
     }
 }
 
-/// Draws the pre-blurred backbuffer masked to `area` with `radius`.
+/// Blurs whatever is currently in the backbuffer behind `area` and masks it to
+/// `area` with `radius`.
+///
+/// The element keeps its full footprint even when it extends past the window;
+/// the window clip just cuts off whatever sticks outside, so the element never
+/// shrinks to fit the window. The blur is computed from a region padded by the
+/// blur radius (so content around the element bleeds into its edges), whose
+/// size depends only on the element. That region is downsampled by repeatedly
+/// halving it, accumulating a smooth, gaussian-like blur, and the texel grid is
+/// anchored to the element. Interior texels are therefore pixel-identical no
+/// matter the window size; only the thin band actually cut off by a window
+/// edge differs (there is no content beyond it).
 fn drawBlurBackdrop(self: *Window, area: lu.Area, radius: lu.Corners, alpha: f32, effects: ?[]const lu.Effect) void {
-    var level: usize = 0;
+    var blur_radius: u32 = 8;
     var found = false;
     for (effects orelse &.{}) |effect| {
         switch (effect) {
             .blur => |b| {
-                level = blurLevelFor(b.radius);
+                blur_radius = b.radius;
                 found = true;
             },
             .opacity => {},
         }
     }
     if (!found) return;
-    const tex = self.blur_textures[level] orelse return;
-    // The blur chain is premultiplied, so modulate rgb by `alpha` too to keep
-    // the premultiplied colors consistent when effects reduce the opacity.
+    if (area.size.w == 0 or area.size.h == 0) return;
+
+    // Padded region, derived purely from the element (independent of the
+    // window). When it extends past the window, SDL clamps the source sampling
+    // to the edge, which is fine because that part is clipped off anyway.
+    const margin: u32 = blur_radius;
+    const px = area.pos.x -| margin;
+    const py = area.pos.y -| margin;
+    const pw = area.size.w + 2 * margin;
+    const ph = area.size.h + 2 * margin;
+
+    // Read the whole framebuffer (not just the region): the blur kernel
+    // reaches ~blur_radius beyond the element, and reading the whole target
+    // keeps whatever content is available even when the element is partially
+    // clipped by a window edge.
+    const surface = SDL_RenderReadPixels(self.renderer, null) orelse return;
+    defer sdl.surface.destroySurface(surface);
+    // Premultiply the alpha into the colors so that downsampling interpolates
+    // the colors (bright content bleeds outward) instead of blending them
+    // toward the transparent black backdrop.
+    _ = sdl.surface.premultiplySurfaceAlpha(surface, false);
+    const full = sdl.createTextureFromSurface(self.renderer, surface) orelse return;
+    defer sdl.destroyTexture(full);
+    _ = sdl.setTextureScaleMode(full, .SDL_SCALEMODE_LINEAR);
+    _ = sdl.setTextureBlendMode(full, sdl.pixels.SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+
+    // Stamp the full padded region at 1:1 into its own `pw` by `ph` texture so
+    // the blur chain never samples a sub-rect that pokes outside the window
+    // texture (which would make SDL clamp it and shift the texel grid). Only
+    // the in-window part is real; the rest is left transparent and is clipped
+    // out at draw time. This keeps the grid anchored to the element.
+    const pw_i: c_int = @intCast(pw);
+    const ph_i: c_int = @intCast(ph);
+    const t0 = sdl.createTexture(self.renderer, surface.format, sdl.SDL_TEXTUREACCESS_TARGET, pw_i, ph_i) orelse return;
+    _ = sdl.setTextureScaleMode(t0, .SDL_SCALEMODE_LINEAR);
+    _ = sdl.setTextureBlendMode(t0, sdl.pixels.SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+    _ = sdl.setRenderTarget(self.renderer, t0);
+    _ = sdl.setRenderDrawBlendMode(self.renderer, sdl.SDL_BLENDMODE_BLEND);
+    _ = sdl.setRenderDrawColor(self.renderer, 0, 0, 0, 0);
+    _ = sdl.renderClear(self.renderer);
+    const avail_w = @min(pw, self.size.w -| px);
+    const avail_h = @min(ph, self.size.h -| py);
+    if (avail_w > 0 and avail_h > 0) {
+        const isrc = sdl.SDL_FRect{
+            .x = @floatFromInt(px),
+            .y = @floatFromInt(py),
+            .w = @floatFromInt(avail_w),
+            .h = @floatFromInt(avail_h),
+        };
+        const idst = sdl.SDL_FRect{
+            .x = 0,
+            .y = 0,
+            .w = @floatFromInt(avail_w),
+            .h = @floatFromInt(avail_h),
+        };
+        _ = sdl.renderTexture(self.renderer, full, &isrc, &idst);
+    }
+    _ = sdl.setRenderTarget(self.renderer, null);
+
+    // Progressively halve the padded region until each texel covers about the
+    // blur factor in screen pixels. Each halving is a linear box filter, so
+    // the chain accumulates a smooth blur rather than one harsh downsample.
+    const factor = blurFactor(blur_radius);
+    var levels: usize = 0;
+    var f: u32 = factor;
+    while (f > 1) : (f >>= 1) levels += 1;
+
+    var chain: [6]*sdl.SDL_Texture = undefined;
+    chain[0] = t0;
+    var count: usize = 1;
+    defer for (chain[1..count]) |tex| sdl.destroyTexture(tex);
+
+    var prev: *sdl.SDL_Texture = t0;
+    var prev_w: u32 = pw;
+    var prev_h: u32 = ph;
+    var level: usize = 0;
+    while (level < levels) : (level += 1) {
+        const w: c_int = @intCast(@max(@as(u32, 1), prev_w / 2));
+        const h: c_int = @intCast(@max(@as(u32, 1), prev_h / 2));
+        const tex = sdl.createTexture(self.renderer, surface.format, sdl.SDL_TEXTUREACCESS_TARGET, w, h) orelse return;
+        _ = sdl.setTextureScaleMode(tex, .SDL_SCALEMODE_LINEAR);
+        _ = sdl.setTextureBlendMode(tex, sdl.pixels.SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+        _ = sdl.setRenderTarget(self.renderer, tex);
+        _ = sdl.setRenderDrawBlendMode(self.renderer, sdl.SDL_BLENDMODE_BLEND);
+        _ = sdl.setRenderDrawColor(self.renderer, 0, 0, 0, 0);
+        _ = sdl.renderClear(self.renderer);
+        const src = sdl.SDL_FRect{ .x = 0, .y = 0, .w = @floatFromInt(prev_w), .h = @floatFromInt(prev_h) };
+        const dst = sdl.SDL_FRect{ .x = 0, .y = 0, .w = @floatFromInt(w), .h = @floatFromInt(h) };
+        _ = sdl.renderTexture(self.renderer, prev, &src, &dst);
+        chain[count] = tex;
+        count += 1;
+        prev = tex;
+        prev_w = @intCast(w);
+        prev_h = @intCast(h);
+    }
+    _ = sdl.setRenderTarget(self.renderer, null);
+
+    // Draw the full element rect from the final texture, masked to `radius`.
+    // The window clip cuts off whatever sticks outside; the element itself
+    // never shrinks. The texture is premultiplied, so modulate rgb by `alpha`
+    // too to keep the premultiplied colors consistent when effects reduce
+    // opacity.
+    const tw: f32 = @floatFromInt(prev_w);
+    const th: f32 = @floatFromInt(prev_h);
+    const scale_x = tw / @as(f32, @floatFromInt(pw));
+    const scale_y = th / @as(f32, @floatFromInt(ph));
+    const src = sdl.SDL_FRect{
+        .x = @as(f32, @floatFromInt(area.pos.x - px)) * scale_x,
+        .y = @as(f32, @floatFromInt(area.pos.y - py)) * scale_y,
+        .w = @as(f32, @floatFromInt(area.size.w)) * scale_x,
+        .h = @as(f32, @floatFromInt(area.size.h)) * scale_y,
+    };
     self.renderMasked(
         area,
         radius,
-        tex,
-        undefined,
-        self.size,
+        prev,
+        src,
+        null,
         .{ .r = alpha, .g = alpha, .b = alpha, .a = alpha },
     );
 }
@@ -562,12 +640,12 @@ fn hasBlur(effects: ?[]const lu.Effect) bool {
     return false;
 }
 
-/// The blur level whose downsample factor best matches `radius`.
-fn blurLevelFor(radius: u32) usize {
+/// The downsample factor (`2^level`) whose size best matches `radius`.
+fn blurFactor(radius: u32) u32 {
     var level: usize = 0;
     var r = @max(radius, 1);
     while (r > 1 and level + 1 < max_blur_levels) : (r >>= 1) level += 1;
-    return level;
+    return @as(u32, 1) << @intCast(level);
 }
 
 fn fillRect(self: *Window, area: lu.Area, color: lu.Color) void {
