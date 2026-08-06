@@ -8,6 +8,7 @@ const std = @import("std");
 const lu = @import("luxor.zig");
 const c = @cImport({
     @cInclude("freetype2/freetype/freetype.h");
+    @cInclude("freetype2/freetype/ftoutln.h");
     @cInclude("harfbuzz/hb.h");
     @cInclude("harfbuzz/hb-ft.h");
 });
@@ -258,12 +259,19 @@ pub const Font = struct {
         };
     }
 
-    /// Get the bounding box of text without rendering.
-    pub fn textSize(self: *Font, alloc: std.mem.Allocator, text: []const u8, size: u32, direction: Direction) !lu.Rect {
+    /// Get the bounding box of text without rendering. A weight above the
+    /// regular 400 is measured with the same per-glyph embolden bump that
+    /// `renderText` applies, so a bold label wraps where it actually wraps.
+    pub fn textSize(self: *Font, alloc: std.mem.Allocator, text: []const u8, size: u32, direction: Direction, weight: u16) !lu.Rect {
         try self.setCharSize(size);
         const shaped = try self.shapeText(alloc, text, direction);
+        const strength: i64 = boldStrength26(weight);
+        var w_26: i64 = 0;
+        for (shaped.glyphs) |g| {
+            w_26 += @as(i64, g.x_advance) + strength;
+        }
         return .{
-            .w = @intCast(@max(0, shaped.width)),
+            .w = @intCast(@max(0, @divTrunc(w_26, 64))),
             .h = @intCast(@max(0, shaped.height)),
         };
     }
@@ -286,39 +294,44 @@ pub const Font = struct {
         opts: RenderOpts,
         origin: lu.Pos,
         wrap: ?u32,
+        weight: u16,
     ) !lu.PixelBuffer {
         try self.setCharSize(size);
         const shaped = try self.shapeText(alloc, text, direction);
         defer alloc.free(shaped.glyphs);
+        const strength: i64 = boldStrength26(weight);
 
         const buf_w = area.w;
         const buf_h = area.h;
         var pixels = try alloc.alloc(u8, buf_w * buf_h * 4);
         @memset(pixels, 0);
 
-        var pen_x: i32 = 0;
+        var pen_x: i64 = 0;
         var pen_y: i32 = shaped.ascender;
         const line_start_x: i32 = 0;
         const line_height: i32 = @intCast(self.pixel_size + spacing.h);
-        const wrap_w: i32 = if (wrap) |w| @intCast(w) else @as(i32, @as(i32, -1));
+        const wrap_26: i64 = if (wrap) |w| @as(i64, @intCast(w)) * 64 else -1;
 
         for (shaped.glyphs) |glyph| {
-            const adv_x: i32 = @intCast(@divTrunc(glyph.x_advance, 64));
+            const adv_26: i32 = glyph.x_advance;
             const off_x: i32 = @intCast(@divTrunc(glyph.x_offset, 64));
             const off_y: i32 = @intCast(@divTrunc(glyph.y_offset, 64));
 
-            if (opts.overflow_w == .newline and wrap_w > 0 and
-                pen_x - line_start_x + adv_x > @as(i32, @intCast(wrap_w)))
+            if (opts.overflow_w == .newline and wrap_26 > 0 and
+                pen_x - line_start_x + adv_26 + @as(i32, @intCast(strength)) > wrap_26)
             {
                 pen_x = line_start_x;
                 pen_y += line_height;
                 if (opts.overflow_h == .skip and pen_y > @as(i32, @intCast(buf_h))) break;
             }
 
-            const draw_x = @as(i32, @intCast(origin.x)) + pen_x + off_x;
+            const draw_x = @as(i32, @intCast(origin.x)) + @divTrunc(pen_x, 64) + off_x;
             const draw_y = @as(i32, @intCast(origin.y)) + pen_y + off_y - glyph.bitmap_top;
 
             _ = c.FT_Load_Glyph(self.face, glyph.glyph_index, c.FT_LOAD_DEFAULT);
+            if (strength > 0 and self.face.*.glyph.*.format == c.FT_GLYPH_FORMAT_OUTLINE) {
+                _ = c.FT_Outline_Embolden(&self.face.*.glyph.*.outline, @intCast(strength));
+            }
             _ = c.FT_Render_Glyph(self.face.*.glyph, c.FT_RENDER_MODE_NORMAL);
 
             const bitmap = self.face.*.glyph.*.bitmap;
@@ -342,7 +355,7 @@ pub const Font = struct {
                 }
             }
 
-            pen_x += adv_x;
+            pen_x += adv_26 + @as(i32, @intCast(strength));
         }
 
         return .{
@@ -370,6 +383,10 @@ pub const TextConfig = struct {
     /// Wrap the text onto extra lines when it does not fit the width it is
     /// given. On by default.
     wrap: bool = true,
+    /// Typeface weight. 400 is regular; higher values are rendered bold by
+    /// thickening each glyph and adding a matching per-glyph advance, so a
+    /// bold label also measures and wraps slightly wider.
+    weight: u16 = 400,
 };
 
 /// A layout that renders its text when `lay` runs: it shapes and rasterizes
@@ -380,6 +397,16 @@ pub const textVTable = lu.Layout.VTable{ .lay = textLay, .content = textContent 
 
 fn textCfg(layout: *const lu.Layout) ?*const TextConfig {
     return @ptrCast(@alignCast(layout.data orelse return null));
+}
+
+/// Per-glyph embolden amount (in FreeType 26.6 fixed-point) for a CSS-style
+/// `weight`. Regular is 400; each weight unit above that adds 0.001px of stroke
+/// on every side (and an equal pen advance, so bold glyphs do not overlap).
+/// Capped at 900 so absurd weights cannot balloon the glyphs.
+fn boldStrength26(weight: u16) i32 {
+    const above: i32 = @as(i32, @min(weight, 900)) - 400;
+    if (above <= 0) return 0;
+    return @intFromFloat(@as(f32, @floatFromInt(above)) * 0.064);
 }
 
 /// How many lines `text` occupies once word-wrapped to `wrap_w`px. Counts the
@@ -395,21 +422,23 @@ fn wrapLines(
     direction: Font.Direction,
     spacing: lu.Rect,
     wrap_w: u32,
+    weight: u16,
 ) !u32 {
     _ = spacing;
     if (text.len == 0) return 1;
     try font.setCharSize(size);
     const shaped = try font.shapeText(alloc, text, direction);
+    const strength: i64 = boldStrength26(weight);
     var lines: u32 = 1;
-    var cur: i32 = 0;
-    const ww: i32 = @intCast(wrap_w);
+    var cur: i64 = 0;
+    const ww: i64 = @intCast(wrap_w * 64);
     for (shaped.glyphs) |g| {
-        const adv: i32 = @intCast(@divTrunc(g.x_advance, 64));
-        if (ww > 0 and cur + adv > ww) {
+        const w: i64 = @as(i64, g.x_advance) + strength;
+        if (ww > 0 and cur + w > ww) {
             lines += 1;
             cur = 0;
         }
-        cur += adv;
+        cur += w;
     }
     return lines;
 }
@@ -423,11 +452,11 @@ fn textContent(layout: *const lu.Layout, avail: lu.Rect) ?lu.Rect {
     const cfg = textCfg(layout) orelse return null;
     const widget = (layout.element orelse return null).widget orelse return null;
     const alloc = widget.arena.allocator();
-    const natural = cfg.font.textSize(alloc, cfg.text, cfg.size, cfg.direction) catch return null;
+    const natural = cfg.font.textSize(alloc, cfg.text, cfg.size, cfg.direction, cfg.weight) catch return null;
     if (!cfg.wrap) return natural;
     if (avail.w == 0 or natural.w <= avail.w) return natural;
     const line_h: u32 = cfg.font.pixel_size + cfg.spacing.h;
-    const lines = wrapLines(cfg.font, alloc, cfg.text, cfg.size, cfg.direction, cfg.spacing, avail.w) catch return natural;
+    const lines = wrapLines(cfg.font, alloc, cfg.text, cfg.size, cfg.direction, cfg.spacing, avail.w, cfg.weight) catch return natural;
     return .{ .w = avail.w, .h = lines * line_h };
 }
 
@@ -443,10 +472,10 @@ fn textLay(layout: *lu.Layout) void {
     const box_w = layout.container.w;
     const box_h = layout.container.h;
 
-    const nat = cfg.font.textSize(alloc, cfg.text, cfg.size, cfg.direction) catch return;
+    const nat = cfg.font.textSize(alloc, cfg.text, cfg.size, cfg.direction, cfg.weight) catch return;
     var block_h: u32 = nat.h;
     if (cfg.wrap and box_w > 0 and nat.w > box_w) {
-        const lines = wrapLines(cfg.font, alloc, cfg.text, cfg.size, cfg.direction, cfg.spacing, box_w) catch block_h;
+        const lines = wrapLines(cfg.font, alloc, cfg.text, cfg.size, cfg.direction, cfg.spacing, box_w, cfg.weight) catch block_h;
         const line_h: u32 = cfg.font.pixel_size + cfg.spacing.h;
         block_h = lines * line_h;
     }
@@ -461,6 +490,7 @@ fn textLay(layout: *lu.Layout) void {
         cfg.render,
         .{ .x = 0, .y = 0 },
         if (cfg.wrap and box_w > 0) box_w else null,
+        cfg.weight,
     ) catch return;
 
     const child = lu.Element{
@@ -493,8 +523,9 @@ pub fn label(self: *Widget, text: []const u8, overrides: lu.Element.Overrides, o
         .color = opts.color,
         .render = opts.render,
         .wrap = opts.wrap,
+        .weight = opts.weight,
     };
-    const natural = try self.fonts[opts.font_idx].textSize(self.arena.allocator(), text, opts.size, opts.direction);
+    const natural = try self.fonts[opts.font_idx].textSize(self.arena.allocator(), text, opts.size, opts.direction, opts.weight);
     var e = self.base(.{ .w = 0, .h = 0 });
     e.override(overrides);
     const border = e.border;
@@ -545,13 +576,18 @@ pub const LabelOpts = struct {
     /// Allow the text to wrap onto extra lines when it does not fit the width
     /// it is given. Wrapping is on by default.
     wrap: bool = true,
+    /// Typeface weight: 400 (regular) to ~900 (heavy). Above 400 the text is
+    /// emboldened synthetically and its glyphs are advanced a little further so
+    /// they do not overlap. Weight also widens the measured label, so wrapping
+    /// matches what is drawn.
+    weight: u16 = 400,
 };
 
 /// Renders `text` into a leaf element (a pixel-buffer background). Used by
 /// `label` and reused by anything that puts text in a box (`button`).
 fn textElement(self: *Widget, text: []const u8, opts: LabelOpts) !lu.Element {
     const font = &self.fonts[opts.font_idx];
-    const text_size = try font.textSize(self.arena.allocator(), text, opts.size, opts.direction);
+    const text_size = try font.textSize(self.arena.allocator(), text, opts.size, opts.direction, opts.weight);
     const pixel_buf = try font.renderText(
         self.arena.allocator(),
         text,
@@ -563,6 +599,7 @@ fn textElement(self: *Widget, text: []const u8, opts: LabelOpts) !lu.Element {
         opts.render,
         .{ .x = 0, .y = 0 },
         null,
+        opts.weight,
     );
     return .{
         .size = text_size,
