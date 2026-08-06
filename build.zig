@@ -44,8 +44,8 @@ pub fn build(b: *std.Build) void {
     });
 
     if (use_sdl) {
-        lib.root_module.linkSystemLibrary("SDL3", .{ .needed = true });
         lib.root_module.addImport("sdl", sdl);
+        lib.root_module.linkSystemLibrary("SDL3", .{ .needed = true });
     }
     if (widgets) {
         lib.root_module.linkSystemLibrary("harfbuzz", .{});
@@ -82,6 +82,15 @@ pub fn build(b: *std.Build) void {
 
     const exe_install = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&exe_install.step);
+
+    const lib_tests = b.addTest(.{
+        .root_module = lib.root_module,
+    });
+
+    const run_lib_tests = b.addRunArtifact(lib_tests);
+
+    const lib_test_step = b.step("libtest", "Run library-only tests");
+    lib_test_step.dependOn(&run_lib_tests.step);
 
     const run_step = b.step("run", "Run the app");
 

@@ -1,9 +1,9 @@
 const std = @import("std");
-const sdl = @import("sdl");
+const sdl = if (options.sdl) @import("sdl") else @import("std");
 const options = @import("options");
 
 pub const Element = @import("Element.zig");
-pub const Layout = @import("Layout.zig");
+pub const Layout = @import("Layout.zig").Layout;
 pub const Window = if (options.sdl)
     @import("Window.zig")
 else
@@ -78,6 +78,7 @@ pub const Area = struct {
     pos: Pos,
 
     pub fn toSDL(self: *const Area) sdl.SDL_Rect {
+        if (!options.sdl) @compileError("SDL support is disabled");
         return .{
             .x = @intCast(self.pos.x),
             .y = @intCast(self.pos.y),

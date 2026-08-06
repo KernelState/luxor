@@ -177,13 +177,32 @@ pub fn popClip(self: *Window) void {
 /// Elements with a `blur` effect capture the pixels currently behind them in
 /// the backbuffer at draw time, so the blur is a live overlay: it only ever
 /// blurs what is directly underneath and is independent of the window size.
-pub fn render(self: *Window, root: lu.Element) void {
+pub fn render(self: *Window, root: *lu.Element) void {
     _ = sdl.getWindowSize(
         self.window,
         @ptrCast(&self.size.w),
         @ptrCast(&self.size.h),
     );
-    self.drawElement(root, .{ .pos = root.pos, .size = root.size });
+    // Top-down layout: size the root from the window, wire it to its layout,
+    // and let the layout tree size and position every descendant.
+    root.size = self.size;
+    root.pos = .{ .x = 0, .y = 0 };
+    root.layout.element = root;
+    _ = root.layout.lay();
+    self.drawElement(root.*, .{ .pos = root.pos, .size = root.size });
+}
+
+/// The current window state as `Overrides`, so a rebuilt root element tracks
+/// reactive values (the window size, for example). Apply these to the root
+/// before rendering each frame:
+///
+/// ```zig
+/// var root = lu.Element{ ... };
+/// root.override(window.overrides());
+/// window.render(root);
+/// ```
+pub fn overrides(self: *Window) lu.Element.Overrides {
+    return .{ .size = self.size };
 }
 
 fn drawElement(self: *Window, e: lu.Element, area: lu.Area) void {
@@ -197,11 +216,12 @@ fn drawElement(self: *Window, e: lu.Element, area: lu.Area) void {
     self.pushClip(content);
     defer self.popClip();
 
-    for (e.layout.lay(content.size)) |item| {
-        var child_area = item.area;
-        child_area.pos.x += content.pos.x;
-        child_area.pos.y += content.pos.y;
-        self.drawElement(item.node, child_area);
+    // Children were sized and positioned by the top-down `lay` pass; their
+    // `.pos`/`.size` are already final (world space), so draw them as-is.
+    const layout = e.layout;
+    for (0..layout.cindex) |i| {
+        const child = layout.children[i];
+        self.drawElement(child, .{ .pos = child.pos, .size = child.size });
     }
 }
 

@@ -2,22 +2,51 @@ const std = @import("std");
 const lu = @import("luxor");
 const sdl = @import("sdl");
 
-var root_layout = lu.Layout{ .fn_lay = &absoluteLayout, .parent = null };
+// Root column fills the window and lays everything top to bottom. It has no
+// parent, so it is the root of the tree.
+var root_cfg = lu.Layout.FlexConfig{ .direction = .column, .gap = 12, .align_items = .flex_start };
+var root_layout = lu.Layout{
+    .vtable = &lu.Layout.flex,
+    .parent = null,
+    .data = &root_cfg,
+};
 
-fn absoluteLayout(layout: *lu.Layout) void {
-    layout.iindex = 0;
-    for (layout.requests[0..layout.rindex]) |req| {
-        const element = req.element orelse continue;
-        layout.items[layout.iindex] = .{
-            .node = element,
-            .area = .{
-                .pos = req.pos orelse .{ .x = 0, .y = 0 },
-                .size = req.size orelse req.min_size,
-            },
-        };
-        layout.iindex += 1;
-    }
-}
+// A wrap row that fills the parent's width (main = fixed) and takes its height
+// from the wrapped content (cross = content).
+var toolbar_cfg = lu.Layout.FlexConfig{ .direction = .row, .gap = 8, .wrap = true, .sizing = .{ .main = .fixed, .cross = .content } };
+var toolbar_layout = lu.Layout{
+    .vtable = &lu.Layout.flex,
+    .parent = &root_layout,
+    .data = &toolbar_cfg,
+};
+
+// A long list of buttons wrapped into rows. Like the toolbar it fills the
+// window width and takes its height from the wrapped rows, but every button has
+// an explicit min/max so it never shrinks below `min_size`, never grows past
+// `max_size`, and never overflows: the surplus width in each row is handed to
+// `grow` buttons only up to their `max_size`, and wrapping grows this row's
+// height to fit the rows instead of letting them spill.
+var button_field_cfg = lu.Layout.FlexConfig{ .direction = .row, .gap = 8, .wrap = true, .sizing = .{ .main = .fixed, .cross = .content } };
+var button_field_layout = lu.Layout{
+    .vtable = &lu.Layout.flex,
+    .parent = &root_layout,
+    .data = &button_field_cfg,
+};
+
+// Sizes itself to its children's cells.
+var grid_cfg = lu.Layout.GridConfig{ .columns = 4, .gap = 8, .sizing = .{ .main = .content, .cross = .content } };
+var grid_layout = lu.Layout{
+    .vtable = &lu.Layout.grid,
+    .parent = &root_layout,
+    .data = &grid_cfg,
+};
+
+var slider_row_cfg = lu.Layout.FlexConfig{ .direction = .row, .gap = 16, .sizing = .{ .main = .content, .cross = .content } };
+var slider_row_layout = lu.Layout{
+    .vtable = &lu.Layout.flex,
+    .parent = &root_layout,
+    .data = &slider_row_cfg,
+};
 
 pub fn main() !void {
     var widget = lu.Widget{
@@ -54,70 +83,110 @@ pub fn main() !void {
     });
     defer window.deinit();
 
-    // Widgets are immediate-mode functions: each one spits out an element and
-    // places it inside `parent`. The tree is built once here and re-rendered
-    // each frame.
     var root = lu.Element{
         .size = .{ .w = 800, .h = 600 },
         .pos = .{ .x = 0, .y = 0 },
         .background = lu.Background.solid(lu.Color.fromU32(0x00000000)),
         .layout = &root_layout,
+        .widget = &widget,
         .events = lu.Widget.noEvents,
     };
 
-    _ = widget.box(&root, .{ .w = 300, .h = 120 }, .{
-        .pos = .{ .x = 60, .y = 60 },
-        .border_radius = .all(12),
-        .background = .{
-            .base = .{ .gradient = .{
-                .points = &.{
-                    .{ .x = 0.0, .y = 0.0, .color = lu.Color.fromU32(0xFF3355FF) },
-                    .{ .x = 1.0, .y = 0.0, .color = lu.Color.fromU32(0x33FF55FF) },
-                },
-                .opacity = 0.9,
-            } },
-            .effects = &.{},
-        },
-    });
+    // Start with the root as the current parent. Nested containers push the
+    // widget onto their own layout with `start` and restore it with `end`.
+    root_layout.element = &root;
+    root_layout.start();
 
-    _ = try widget.label(&root, "Hello, World!", .{
-        .pos = .{ .x = 60, .y = 220 },
+    _ = try widget.label("Hello, World!", .{
         .border_radius = .all(4),
         .background = .{ .base = .{ .solid = .red }, .effects = &.{} },
     }, .{ .size = 28, .color = .white });
-    _ = try widget.label(&root, "\u{645}\u{631}\u{62D}\u{628}\u{627} \u{628}\u{627}\u{644}\u{639}\u{627}\u{644}\u{645}", .{
-        .pos = .{ .x = 300, .y = 220 },
-    }, .{ .font_idx = 1, .direction = .rtl, .size = 28 });
+    _ = try widget.label("\u{645}\u{631}\u{62D}\u{628}\u{627} \u{628}\u{644}\u{639}\u{627}\u{644}\u{645}", .{}, .{
+        .font_idx = 1,
+        .direction = .rtl,
+        .size = 28,
+    });
 
-    _ = try widget.button(&root, "Click me", .{
-        .pos = .{ .x = 60, .y = 320 },
-        .border = .all(2),
-        .border_color = .{ .color = .white },
-    }, .{ .color = lu.Color.fromU32(0x2255AAFF) });
+    // Toolbar: a flexbox wrap row. It is a child of the root, so it is
+    // published while the root is the current parent; its buttons are built
+    // against `toolbar_layout`, and `end` restores the root as current.
+    var toolbar = lu.Element{
+        .size = .{ .w = 0, .h = 0 },
+        .pos = .{ .x = 0, .y = 0 },
+        .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
+        .layout = &toolbar_layout,
+        .widget = &widget,
+        .events = lu.Widget.noEvents,
+    };
+    // Stretch the toolbar across the window width (main is fixed), wrap the
+    // buttons, and let its height come from the wrapped content.
+    _ = widget.publishRequest(&toolbar, .{ .min_size = .{ .w = 0, .h = 0 }, .align_self = .stretch });
+    toolbar_layout.start();
+    const colors = [_]u32{ 0xFF5555FF, 0xFF55AAFF, 0xFF55FFAA, 0xFFAACCFF, 0xFFCCAAFF, 0xFFAA55FF, 0xFF55FFFF, 0xFFFFAA55 };
+    for (colors, 0..) |col, i| {
+        _ = try widget.button(
+            std.fmt.allocPrint(widget.arena.allocator(), "Button {d}", .{i + 1}) catch "Button",
+            .{},
+            .{ .color = lu.Color.fromU32(col) },
+        );
+    }
+    toolbar_layout.end();
 
-    _ = widget.checkbox(&root, true, .{ .pos = .{ .x = 60, .y = 380 } }, .{});
-    _ = widget.checkbox(&root, false, .{ .pos = .{ .x = 100, .y = 380 } }, .{});
+    var button_field = lu.Element{
+        .size = .{ .w = 0, .h = 0 },
+        .pos = .{ .x = 0, .y = 0 },
+        .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
+        .layout = &button_field_layout,
+        .widget = &widget,
+        .events = lu.Widget.noEvents,
+    };
+    // Stretch across the window; each row fills the width, and the field's own
+    // height comes from however many rows the buttons wrap into.
+    _ = widget.publishRequest(&button_field, .{ .min_size = .{ .w = 0, .h = 0 }, .align_self = .stretch });
+    button_field_layout.start();
+    for (0..32) |i| {
+        _ = try widget.button(
+            std.fmt.allocPrint(widget.arena.allocator(), "Item {d}", .{i + 1}) catch "Item",
+            .{},
+            .{
+                .min_size = .{ .w = 96, .h = 40 },
+                .max_size = .{ .w = 168, .h = 40 },
+                .grow = 1,
+                .color = lu.Color.fromU32(0x8844CCFF),
+            },
+        );
+    }
+    button_field_layout.end();
 
-    _ = widget.progress_bar(&root, 0.4, .{ .pos = .{ .x = 60, .y = 430 } }, .{});
-    _ = widget.slider(&root, 0.66, .{ .pos = .{ .x = 60, .y = 480 } }, .{});
+    // A content-sized grid of boxes nested inside the root.
+    _ = widget.box(.{ .w = 0, .h = 0 }, .{ .layout = &grid_layout });
+    grid_layout.start();
+    const tile_colors = [_]u32{ 0xEE3344, 0xEE8855, 0xEECC33, 0x66CC55, 0x3399EE, 0x7744CC, 0xCC3388, 0x4488AA };
+    for (tile_colors) |col| {
+        _ = widget.box(.{ .w = 40, .h = 40 }, .{
+            .background = .{ .base = .{ .solid = lu.Color.fromU32(col) }, .effects = &.{} },
+            .border_radius = .all(6),
+        });
+    }
+    grid_layout.end();
 
-    // SVG image: decoded once and cached; rasterized at 160x160.
-    const svg_src =
-        "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200' viewBox='0 0 200 200'>" ++
-        "<circle cx='100' cy='100' r='90' fill='#ffcc00'/>" ++
-        "<rect x='60' y='60' width='80' height='80' rx='12' fill='#2222ff'/>" ++
-        "</svg>";
-    _ = try widget.image(&root, .{ .svg = svg_src }, .{
-        .pos = .{ .x = 500, .y = 60 },
-        .border = .all(4),
-        .border_color = .{ .color = .white },
-    }, .{ .svg_width = 160, .svg_height = 160 });
+    var slider_row = lu.Element{
+        .size = .{ .w = 0, .h = 0 },
+        .pos = .{ .x = 0, .y = 0 },
+        .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
+        .layout = &slider_row_layout,
+        .widget = &widget,
+        .events = lu.Widget.noEvents,
+    };
+    _ = widget.publishRequest(&slider_row, .{ .min_size = .{ .w = 0, .h = 0 } });
+    slider_row_layout.start();
+    _ = widget.checkbox(true, .{}, .{});
+    _ = widget.progress_bar(0.4, .{}, .{});
+    _ = widget.slider(0.66, .{}, .{});
+    slider_row_layout.end();
 
-    // PNG image decoded from embedded bytes (cached after the first call).
-    _ = try widget.image(&root, .{ .png = @embedFile("test.png") }, .{
-        .pos = .{ .x = 500, .y = 260 },
-        .border_radius = .all(8),
-    }, .{ .fit = .contain, .filter = .nearest });
+    // Nothing is building any more; the window lays the tree out on render.
+    root_layout.end();
 
     var event: sdl.SDL_Event = undefined;
     while (true) {
@@ -132,22 +201,10 @@ pub fn main() !void {
         }
 
         _ = sdl.renderClear(window.renderer);
-        _ = sdl.setRenderDrawColor(window.renderer, 230, 60, 60, 255);
-        _ = sdl.renderFillRect(window.renderer, &.{ .x = 100, .y = 80, .w = 300, .h = 220 });
-        _ = sdl.setRenderDrawColor(window.renderer, 60, 220, 90, 255);
-        _ = sdl.renderFillRect(window.renderer, &.{ .x = 420, .y = 300, .w = 280, .h = 180 });
-        _ = sdl.setRenderDrawColor(window.renderer, 70, 120, 240, 255);
-        _ = sdl.renderFillRect(window.renderer, &.{ .x = 200, .y = 380, .w = 320, .h = 120 });
 
-        const root2 = lu.Element{
-            .size = .{ .w = 800, .h = 600 },
-            .pos = .{ .x = 0, .y = 0 },
-            .background = lu.Background.solid(lu.Color.fromU32(0x00000000)),
-            .layout = &root_layout,
-            .events = lu.Widget.noEvents,
-        };
-
-        window.render(root2);
+        // React to the live window size: override the root, then render.
+        root.override(window.overrides());
+        window.render(&root);
         _ = sdl.renderPresent(window.renderer);
     }
 }

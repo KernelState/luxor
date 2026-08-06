@@ -11,6 +11,10 @@ effects: ?[]lu.Effect = null,
 layout: *lu.Layout,
 padding: lu.Sides = .all(0),
 margin: lu.Sides = .all(0),
+/// The `Widget` context that built this element. Layouts reach the widget
+/// (for `start`/`end` current-parent routing) through here, so `Layout.start`
+/// takes no argument.
+widget: ?*lu.Widget = null,
 events: Events,
 focusable: bool = true,
 

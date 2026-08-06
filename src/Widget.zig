@@ -16,12 +16,14 @@ arena: std.heap.ArenaAllocator,
 freetype: Freetype,
 fonts: [10]Font = undefined,
 font_count: u8 = 0,
+/// The layout widget builders register their children into. Set with a
+/// layout's `start(&widget)`; null means the app is not currently building a
+/// container, so widgets build their element but do not place it.
+current: ?*lu.Layout = null,
 /// Empty layout for leaf elements that have no children.
-leaf_layout: lu.Layout = .{ .fn_lay = &leafLayout, .parent = null },
+leaf_layout: lu.Layout = .{ .vtable = &lu.Layout.leaf, .parent = null },
 /// Memoizes decoded images across frames; buffers live in `arena`.
 image_cache: lu.images.Cache = .{},
-
-fn leafLayout(_: *lu.Layout) void {}
 
 const Widget = @This();
 
@@ -48,45 +50,37 @@ fn base(self: *Widget, size: lu.Rect) lu.Element {
         .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
         .layout = &self.leaf_layout,
         .events = noEvents,
+        .widget = self,
         .focusable = false,
     };
 }
 
-/// Requests `e`'s size and position from `parent`'s layout and places `e`
-/// there. This is the only place a widget talks to a layout.
-fn publish(self: *Widget, parent: *lu.Element, e: *const lu.Element) void {
-    _ = self;
-    parent.layout.request(.{ .min_size = e.size, .pos = e.pos, .margin = e.margin });
-    parent.layout.addElement(e.*);
+/// Requests `e`'s size and position from the current parent layout (set with a
+/// layout's `start`) and places `e` there. Returns the request id the element
+/// got, or null when there is no current parent. This is the only place a
+/// widget talks to a layout.
+fn publish(self: *Widget, e: *const lu.Element) ?u32 {
+    return self.publishRequest(e, .{ .min_size = e.size, .pos = e.pos, .margin = e.margin });
 }
 
-/// A layout that places each child at exactly its requested position and size.
-fn absoluteLayout(layout: *lu.Layout) void {
-    layout.iindex = 0;
-    for (layout.requests[0..layout.rindex]) |req| {
-        const element = req.element orelse continue;
-        layout.items[layout.iindex] = .{
-            .node = element,
-            .area = .{
-                .pos = req.pos orelse .{ .x = 0, .y = 0 },
-                .size = req.size orelse req.min_size,
-            },
-        };
-        layout.iindex += 1;
-    }
+/// Like `publish`, but with a hand-written `Request` so callers control
+/// `min_size`/`max_size`, growth and alignment for the element.
+pub fn publishRequest(self: *Widget, e: *const lu.Element, req: lu.Layout.Request) ?u32 {
+    const parent = self.current orelse return null;
+    const id = parent.request(req);
+    parent.addElement(id, e.*);
+    return id;
 }
 
-fn makeAbsolute(self: *Widget, parent: *lu.Layout) *lu.Layout {
+fn makeAbsolute(self: *Widget) *lu.Layout {
     const layout = self.arena.allocator().create(lu.Layout) catch unreachable;
-    layout.* = .{ .fn_lay = &absoluteLayout, .parent = parent };
+    layout.* = .{ .vtable = &lu.Layout.absolute, .parent = self.current };
     return layout;
 }
 
-fn makeMono(self: *Widget, parent: *lu.Layout, pad: lu.Sides, child_size: lu.Rect) *lu.Layout {
-    const data = self.arena.allocator().create(MonoData) catch unreachable;
-    data.* = .{ .child_size = child_size };
+fn makeMono(self: *Widget, pad: lu.Sides) *lu.Layout {
     const layout = self.arena.allocator().create(lu.Layout) catch unreachable;
-    layout.* = .{ .fn_lay = &monoLayout, .parent = parent, .padding = pad, .data = data };
+    layout.* = .{ .vtable = &lu.Layout.mono, .parent = self.current, .padding = pad };
     return layout;
 }
 
@@ -349,57 +343,19 @@ pub const Font = struct {
     }
 };
 
-pub const MonoData = struct {
-    child_size: lu.Rect,
-};
-
-fn monoLayout(layout: *lu.Layout) void {
-    layout.iindex = 0;
-    if (layout.rindex == 0) return;
-    const req = layout.requests[0];
-    const element = req.element orelse return;
-    const data: *const MonoData = @ptrCast(@alignCast(layout.data orelse {
-        layout.items[0] = .{
-            .node = element,
-            .area = .{
-                .pos = req.pos orelse .{ .x = 0, .y = 0 },
-                .size = req.size orelse req.min_size,
-            },
-        };
-        layout.iindex = 1;
-        return;
-    }));
-    const outer_w = layout.container.w;
-    const outer_h = layout.container.h;
-    const cw = outer_w -| data.child_size.w;
-    const ch = outer_h -| data.child_size.h;
-    layout.items[0] = .{
-        .node = element,
-        .area = .{
-            .pos = .{
-                .x = @divTrunc(cw, 2),
-                .y = @divTrunc(ch, 2),
-            },
-            .size = data.child_size,
-        },
-    };
-    layout.iindex = 1;
-}
-
-/// Widgets are functions that spit out an element. They take the parent to
-/// place themselves in, their main input (text, a value, an image source...),
-/// the user `Overrides`, and a widget-specific `Opts` struct. Every widget
-/// builds on `box`, sets its own contents, applies the user `Overrides` last
-/// (so the user always wins), then requests space from `parent`'s layout and
-/// returns the element. Nothing holds state: the caller owns the returned
-/// element and re-creates it every time the tree is rebuilt.
-
-/// The simplest widget: requests `size` from `parent`'s layout, applies
-/// `overrides`, and returns a plain element. No contents, no opts.
-pub fn box(self: *Widget, parent: *lu.Element, size: lu.Rect, overrides: lu.Element.Overrides) lu.Element {
+/// Widgets are functions that spit out an element. They take their main input
+/// (text, a value, an image source...), the user `Overrides`, and a
+/// widget-specific `Opts` struct. Every widget builds on `box`, sets its own
+/// contents, applies the user `Overrides` last (so the user always wins), then
+/// requests space from the current parent layout and returns the element.
+/// Nothing holds state: the caller owns the returned element and re-creates it
+/// every time the tree is rebuilt.
+/// The simplest widget: requests `size` from the current parent's layout,
+/// applies `overrides`, and returns a plain element. No contents, no opts.
+pub fn box(self: *Widget, size: lu.Rect, overrides: lu.Element.Overrides) lu.Element {
     var e = self.base(size);
     e.override(overrides);
-    self.publish(parent, &e);
+    _ = self.publish(&e);
     return e;
 }
 
@@ -442,12 +398,13 @@ fn textElement(self: *Widget, text: []const u8, opts: LabelOpts) !lu.Element {
         .background = lu.Background.buffer(pixel_buf),
         .layout = &self.leaf_layout,
         .focusable = false,
+        .widget = self,
         .events = noEvents,
     };
 }
 
 /// A box of text, padded and centered.
-pub fn label(self: *Widget, parent: *lu.Element, text: []const u8, overrides: lu.Element.Overrides, opts: LabelOpts) !lu.Element {
+pub fn label(self: *Widget, text: []const u8, overrides: lu.Element.Overrides, opts: LabelOpts) !lu.Element {
     const inner = try self.textElement(text, opts);
     const pad = opts.padding;
     var e = self.base(.{ .w = 0, .h = 0 });
@@ -457,10 +414,10 @@ pub fn label(self: *Widget, parent: *lu.Element, text: []const u8, overrides: lu
         .w = inner.size.w + pad.left + pad.right + border.left + border.right,
         .h = inner.size.h + pad.top + pad.bottom + border.top + border.bottom,
     };
-    e.layout = self.makeMono(parent.layout, pad, inner.size);
-    e.layout.request(.{ .min_size = inner.size, .pos = .{ .x = 0, .y = 0 } });
-    e.layout.addElement(inner);
-    self.publish(parent, &e);
+    e.layout = self.makeMono(pad);
+    const inner_id = e.layout.request(.{ .min_size = inner.size, .pos = .{ .x = 0, .y = 0 } });
+    e.layout.addElement(inner_id, inner);
+    _ = self.publish(&e);
     return e;
 }
 
@@ -470,10 +427,16 @@ pub const ButtonOpts = struct {
     padding: lu.Sides = .all(8),
     color: lu.Color = .gray,
     radius: lu.Corners = .all(4),
+    /// Floor for the button's size. The button is never smaller than this.
+    min_size: ?lu.Rect = null,
+    /// Cap for the button's size. The button never grows past this.
+    max_size: ?lu.Rect = null,
+    /// Extra main-axis space this button claims when its row has room to give.
+    grow: u32 = 0,
 };
 
 /// A tappable box with a centered label.
-pub fn button(self: *Widget, parent: *lu.Element, text: []const u8, overrides: lu.Element.Overrides, opts: ButtonOpts) !lu.Element {
+pub fn button(self: *Widget, text: []const u8, overrides: lu.Element.Overrides, opts: ButtonOpts) !lu.Element {
     const inner = try self.textElement(text, opts.label);
     const pad = opts.padding;
     var e = self.base(.{ .w = 0, .h = 0 });
@@ -485,10 +448,16 @@ pub fn button(self: *Widget, parent: *lu.Element, text: []const u8, overrides: l
         .w = inner.size.w + pad.left + pad.right + border.left + border.right,
         .h = inner.size.h + pad.top + pad.bottom + border.top + border.bottom,
     };
-    e.layout = self.makeMono(parent.layout, pad, inner.size);
-    e.layout.request(.{ .min_size = inner.size, .pos = .{ .x = 0, .y = 0 } });
-    e.layout.addElement(inner);
-    self.publish(parent, &e);
+    e.layout = self.makeMono(pad);
+    const inner_id = e.layout.request(.{ .min_size = inner.size, .pos = .{ .x = 0, .y = 0 } });
+    e.layout.addElement(inner_id, inner);
+    _ = self.publishRequest(&e, .{
+        .min_size = opts.min_size orelse e.size,
+        .pos = e.pos,
+        .margin = e.margin,
+        .max_size = opts.max_size,
+        .grow = opts.grow,
+    });
     return e;
 }
 
@@ -505,14 +474,14 @@ pub const CheckboxOpts = struct {
 
 /// A box that reports whether it is checked. Immediate mode: the caller owns
 /// the boolean and rebuilds the widget when it changes.
-pub fn checkbox(self: *Widget, parent: *lu.Element, checked: bool, overrides: lu.Element.Overrides, opts: CheckboxOpts) lu.Element {
+pub fn checkbox(self: *Widget, checked: bool, overrides: lu.Element.Overrides, opts: CheckboxOpts) lu.Element {
     var e = self.base(opts.size);
     e.border = opts.border;
     e.border_color = .{ .color = opts.border_color };
     e.border_radius = opts.radius;
     if (checked) e.background = lu.Background.solid(opts.checked_color);
     e.override(overrides);
-    self.publish(parent, &e);
+    _ = self.publish(&e);
     return e;
 }
 
@@ -527,12 +496,12 @@ pub const ProgressBarOpts = struct {
 /// A track with a fill that reflects `value` (clamped to 0.0-1.0). The fill is
 /// a child element sized `value` wide, so rounding/effects on the fill remain
 /// independent from the track.
-pub fn progress_bar(self: *Widget, parent: *lu.Element, value: f32, overrides: lu.Element.Overrides, opts: ProgressBarOpts) lu.Element {
+pub fn progress_bar(self: *Widget, value: f32, overrides: lu.Element.Overrides, opts: ProgressBarOpts) lu.Element {
     const v = std.math.clamp(value, 0.0, 1.0);
     var e = self.base(opts.size);
     e.background = lu.Background.solid(opts.track_color);
     e.border_radius = opts.radius;
-    e.layout = self.makeAbsolute(parent.layout);
+    e.layout = self.makeAbsolute();
 
     const fill_w: u32 = @intFromFloat(@as(f32, @floatFromInt(opts.size.w)) * v);
     if (fill_w > 0) {
@@ -543,12 +512,12 @@ pub fn progress_bar(self: *Widget, parent: *lu.Element, value: f32, overrides: l
             r
         else
             .{ .top_left = r.top_left, .bottom_left = r.bottom_left, .top_right = 0, .bottom_right = 0 };
-        e.layout.request(.{ .min_size = fill.size, .pos = .{ .x = 0, .y = 0 } });
-        e.layout.addElement(fill);
+        const fill_id = e.layout.request(.{ .min_size = fill.size, .pos = .{ .x = 0, .y = 0 } });
+        e.layout.addElement(fill_id, fill);
     }
 
     e.override(overrides);
-    self.publish(parent, &e);
+    _ = self.publish(&e);
     return e;
 }
 
@@ -566,12 +535,12 @@ pub const SliderOpts = struct {
 /// A track + fill + knob that reflect `value` (clamped to 0.0-1.0). The knob
 /// travels the width of the track; keep `knob_size` <= the track height so it
 /// is not clipped to the track's box.
-pub fn slider(self: *Widget, parent: *lu.Element, value: f32, overrides: lu.Element.Overrides, opts: SliderOpts) lu.Element {
+pub fn slider(self: *Widget, value: f32, overrides: lu.Element.Overrides, opts: SliderOpts) lu.Element {
     const v = std.math.clamp(value, 0.0, 1.0);
     var e = self.base(opts.size);
     e.background = lu.Background.solid(opts.track_color);
     e.border_radius = opts.radius;
-    e.layout = self.makeAbsolute(parent.layout);
+    e.layout = self.makeAbsolute();
 
     const fill_w: u32 = @intFromFloat(@as(f32, @floatFromInt(opts.size.w)) * v);
     if (fill_w > 0) {
@@ -582,8 +551,8 @@ pub fn slider(self: *Widget, parent: *lu.Element, value: f32, overrides: lu.Elem
             r
         else
             .{ .top_left = r.top_left, .bottom_left = r.bottom_left, .top_right = 0, .bottom_right = 0 };
-        e.layout.request(.{ .min_size = fill.size, .pos = .{ .x = 0, .y = 0 } });
-        e.layout.addElement(fill);
+        const fill_id = e.layout.request(.{ .min_size = fill.size, .pos = .{ .x = 0, .y = 0 } });
+        e.layout.addElement(fill_id, fill);
     }
 
     const knob_size = if (opts.knob_size == 0) opts.size.h else opts.knob_size;
@@ -593,11 +562,11 @@ pub fn slider(self: *Widget, parent: *lu.Element, value: f32, overrides: lu.Elem
     var knob = self.base(.{ .w = knob_size, .h = knob_size });
     knob.background = lu.Background.solid(opts.knob_color);
     knob.border_radius = .all(knob_size / 2);
-    e.layout.request(.{ .min_size = knob.size, .pos = .{ .x = kx, .y = ky } });
-    e.layout.addElement(knob);
+    const knob_id = e.layout.request(.{ .min_size = knob.size, .pos = .{ .x = kx, .y = ky } });
+    e.layout.addElement(knob_id, knob);
 
     e.override(overrides);
-    self.publish(parent, &e);
+    _ = self.publish(&e);
     return e;
 }
 
@@ -618,7 +587,7 @@ pub const ImageOpts = struct {
 /// Decodes `source` (once, cached) and shows it in a box the size of the
 /// decoded image (or the `overrides.size`). SVG is rasterized at the size
 /// requested through `opts`.
-pub fn image(self: *Widget, parent: *lu.Element, source: lu.ImageSource, overrides: lu.Element.Overrides, opts: ImageOpts) !lu.Element {
+pub fn image(self: *Widget, source: lu.ImageSource, overrides: lu.Element.Overrides, opts: ImageOpts) !lu.Element {
     const decoded = try self.image_cache.decode(self.arena.allocator(), source, .{
         .svg_width = opts.svg_width,
         .svg_height = opts.svg_height,
@@ -636,6 +605,6 @@ pub fn image(self: *Widget, parent: *lu.Element, source: lu.ImageSource, overrid
         .filter = opts.filter,
     });
     e.override(overrides);
-    self.publish(parent, &e);
+    _ = self.publish(&e);
     return e;
 }
