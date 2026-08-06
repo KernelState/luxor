@@ -269,6 +269,11 @@ pub const Font = struct {
     }
 
     /// Render shaped text into a pixel buffer. The returned buffer is RGBA8888.
+    ///
+    /// `area` is the size of the buffer (usually the full element box). Glyphs
+    /// are drawn offset by `origin` (the padded content origin). When `wrap` is
+    /// given and `opts.overflow_w` is `.newline`, text longer than `wrap`
+    /// pixels breaks onto a new line.
     pub fn renderText(
         self: *Font,
         alloc: std.mem.Allocator,
@@ -279,6 +284,8 @@ pub const Font = struct {
         direction: Direction,
         color: lu.Color,
         opts: RenderOpts,
+        origin: lu.Pos,
+        wrap: ?u32,
     ) !lu.PixelBuffer {
         try self.setCharSize(size);
         const shaped = try self.shapeText(alloc, text, direction);
@@ -293,20 +300,23 @@ pub const Font = struct {
         var pen_y: i32 = shaped.ascender;
         const line_start_x: i32 = 0;
         const line_height: i32 = @intCast(self.pixel_size + spacing.h);
+        const wrap_w: i32 = if (wrap) |w| @intCast(w) else @as(i32, @as(i32, -1));
 
         for (shaped.glyphs) |glyph| {
             const adv_x: i32 = @intCast(@divTrunc(glyph.x_advance, 64));
             const off_x: i32 = @intCast(@divTrunc(glyph.x_offset, 64));
             const off_y: i32 = @intCast(@divTrunc(glyph.y_offset, 64));
 
-            if (opts.overflow_w == .newline and pen_x - line_start_x + adv_x > @as(i32, @intCast(area.w))) {
+            if (opts.overflow_w == .newline and wrap_w > 0 and
+                pen_x - line_start_x + adv_x > @as(i32, @intCast(wrap_w)))
+            {
                 pen_x = line_start_x;
                 pen_y += line_height;
-                if (opts.overflow_h == .skip and pen_y > @as(i32, @intCast(area.h))) break;
+                if (opts.overflow_h == .skip and pen_y > @as(i32, @intCast(buf_h))) break;
             }
 
-            const draw_x = pen_x + off_x;
-            const draw_y = pen_y + off_y - glyph.bitmap_top;
+            const draw_x = @as(i32, @intCast(origin.x)) + pen_x + off_x;
+            const draw_y = @as(i32, @intCast(origin.y)) + pen_y + off_y - glyph.bitmap_top;
 
             _ = c.FT_Load_Glyph(self.face, glyph.glyph_index, c.FT_LOAD_DEFAULT);
             _ = c.FT_Render_Glyph(self.face.*.glyph, c.FT_RENDER_MODE_NORMAL);
@@ -343,6 +353,163 @@ pub const Font = struct {
     }
 };
 
+/// Configuration for a `text` layout. Holds the font, the string and how to
+/// draw it; the layout reads it during `lay`, so rendering is deferred until
+/// the label has been given its box.
+pub const TextConfig = struct {
+    font: *Font,
+    text: []const u8,
+    /// Pixel size of the font.
+    size: u32 = 24,
+    /// Extra space between glyphs / lines.
+    spacing: lu.Rect = .{ .w = 2, .h = 4 },
+    /// Text direction; RTL is shaped by HarfBuzz.
+    direction: Font.Direction = .ltr,
+    color: lu.Color = .white,
+    render: Font.RenderOpts = .{},
+    /// Wrap the text onto extra lines when it does not fit the width it is
+    /// given. On by default.
+    wrap: bool = true,
+};
+
+/// A layout that renders its text when `lay` runs: it shapes and rasterizes
+/// the string into the box it is actually given (wrapping to any number of
+/// lines), then sets the element's `.background` to that bitmap. This is like
+/// `mono` but defers rendering until layout time, so the text can adapt.
+pub const textVTable = lu.Layout.VTable{ .lay = textLay, .content = textContent };
+
+fn textCfg(layout: *const lu.Layout) ?*const TextConfig {
+    return @ptrCast(@alignCast(layout.data orelse return null));
+}
+
+/// How many lines `text` occupies once word-wrapped to `wrap_w`px. Counts the
+/// same line breaks the renderer produces (see `renderText`): a line breaks
+/// the moment the running pen would cross `wrap_w`, so even a single word wider
+/// than the box spans multiple lines. A word never breaks mid-run horizontally
+/// carries over, matching how glyphs are pushed line-by-line when rendered.
+fn wrapLines(
+    font: *Font,
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    size: u32,
+    direction: Font.Direction,
+    spacing: lu.Rect,
+    wrap_w: u32,
+) !u32 {
+    _ = spacing;
+    if (text.len == 0) return 1;
+    try font.setCharSize(size);
+    const shaped = try font.shapeText(alloc, text, direction);
+    var lines: u32 = 1;
+    var cur: i32 = 0;
+    const ww: i32 = @intCast(wrap_w);
+    for (shaped.glyphs) |g| {
+        const adv: i32 = @intCast(@divTrunc(g.x_advance, 64));
+        if (ww > 0 and cur + adv > ww) {
+            lines += 1;
+            cur = 0;
+        }
+        cur += adv;
+    }
+    return lines;
+}
+
+/// The world size a label wants given the box `avail`. A fixed wrap controls
+/// the width, so the reported size is the wrapped block; otherwise it is the
+/// single-line size. When the parent can only offer a narrow box it recomputes
+/// the wrapped block that fits that width (main parent axis) plus the extra
+/// height the wrapped lines need (the expansion axis).
+fn textContent(layout: *const lu.Layout, avail: lu.Rect) ?lu.Rect {
+    const cfg = textCfg(layout) orelse return null;
+    const widget = (layout.element orelse return null).widget orelse return null;
+    const alloc = widget.arena.allocator();
+    const natural = cfg.font.textSize(alloc, cfg.text, cfg.size, cfg.direction) catch return null;
+    if (!cfg.wrap) return natural;
+    if (avail.w == 0 or natural.w <= avail.w) return natural;
+    const line_h: u32 = cfg.font.pixel_size + cfg.spacing.h;
+    const lines = wrapLines(cfg.font, alloc, cfg.text, cfg.size, cfg.direction, cfg.spacing, avail.w) catch return natural;
+    return .{ .w = avail.w, .h = lines * line_h };
+}
+
+/// Renders the text into a bitmap child element and centers it in the box the
+/// element was given (mono behavior). The element itself keeps its own
+/// `background`/`border`/settings; only the child carries the text image.
+/// This is where the string is actually turned into a bitmap.
+fn textLay(layout: *lu.Layout) void {
+    const el = layout.element orelse return;
+    const widget = el.widget orelse return;
+    const cfg = textCfg(layout) orelse return;
+    const alloc = widget.arena.allocator();
+    const box_w = layout.container.w;
+    const box_h = layout.container.h;
+
+    const nat = cfg.font.textSize(alloc, cfg.text, cfg.size, cfg.direction) catch return;
+    var block_h: u32 = nat.h;
+    if (cfg.wrap and box_w > 0 and nat.w > box_w) {
+        const lines = wrapLines(cfg.font, alloc, cfg.text, cfg.size, cfg.direction, cfg.spacing, box_w) catch block_h;
+        const line_h: u32 = cfg.font.pixel_size + cfg.spacing.h;
+        block_h = lines * line_h;
+    }
+    const buf = cfg.font.renderText(
+        alloc,
+        cfg.text,
+        .{ .w = box_w, .h = block_h },
+        cfg.spacing,
+        cfg.size,
+        cfg.direction,
+        cfg.color,
+        cfg.render,
+        .{ .x = 0, .y = 0 },
+        if (cfg.wrap and box_w > 0) box_w else null,
+    ) catch return;
+
+    const child = lu.Element{
+        .size = .{ .w = box_w, .h = block_h },
+        .pos = .{
+            .x = 0,
+            .y = @divTrunc(box_h -| block_h, 2),
+        },
+        .background = lu.Background.buffer(buf),
+        .layout = &widget.leaf_layout,
+        .widget = widget,
+        .events = noEvents,
+        .focusable = false,
+    };
+    layout.children[0] = child;
+    layout.cindex = 1;
+}
+
+/// A box of text, padded and centered inside its own box. The text is not
+/// rasterized here: the `text` layout renders it when the box is laid out,
+/// so it can wrap to the width it is actually given.
+pub fn label(self: *Widget, text: []const u8, overrides: lu.Element.Overrides, opts: LabelOpts) !lu.Element {
+    const cfg = self.arena.allocator().create(TextConfig) catch unreachable;
+    cfg.* = .{
+        .font = &self.fonts[opts.font_idx],
+        .text = text,
+        .size = opts.size,
+        .spacing = opts.spacing,
+        .direction = opts.direction,
+        .color = opts.color,
+        .render = opts.render,
+        .wrap = opts.wrap,
+    };
+    const natural = try self.fonts[opts.font_idx].textSize(self.arena.allocator(), text, opts.size, opts.direction);
+    var e = self.base(.{ .w = 0, .h = 0 });
+    e.override(overrides);
+    const border = e.border;
+    const pad = opts.padding;
+    e.size = .{
+        .w = natural.w + pad.left + pad.right + border.left + border.right,
+        .h = natural.h + pad.top + pad.bottom + border.top + border.bottom,
+    };
+    const layout = self.arena.allocator().create(lu.Layout) catch unreachable;
+    layout.* = .{ .vtable = &textVTable, .parent = self.current, .padding = pad, .data = @ptrCast(cfg) };
+    e.layout = layout;
+    _ = self.publish(&e);
+    return e;
+}
+
 /// Widgets are functions that spit out an element. They take their main input
 /// (text, a value, an image source...), the user `Overrides`, and a
 /// widget-specific `Opts` struct. Every widget builds on `box`, sets its own
@@ -375,6 +542,9 @@ pub const LabelOpts = struct {
     render: Font.RenderOpts = .{},
     /// Space around the text inside the label's box.
     padding: lu.Sides = .all(0),
+    /// Allow the text to wrap onto extra lines when it does not fit the width
+    /// it is given. Wrapping is on by default.
+    wrap: bool = true,
 };
 
 /// Renders `text` into a leaf element (a pixel-buffer background). Used by
@@ -391,6 +561,8 @@ fn textElement(self: *Widget, text: []const u8, opts: LabelOpts) !lu.Element {
         opts.direction,
         opts.color,
         opts.render,
+        .{ .x = 0, .y = 0 },
+        null,
     );
     return .{
         .size = text_size,
@@ -401,24 +573,6 @@ fn textElement(self: *Widget, text: []const u8, opts: LabelOpts) !lu.Element {
         .widget = self,
         .events = noEvents,
     };
-}
-
-/// A box of text, padded and centered.
-pub fn label(self: *Widget, text: []const u8, overrides: lu.Element.Overrides, opts: LabelOpts) !lu.Element {
-    const inner = try self.textElement(text, opts);
-    const pad = opts.padding;
-    var e = self.base(.{ .w = 0, .h = 0 });
-    e.override(overrides);
-    const border = e.border;
-    e.size = .{
-        .w = inner.size.w + pad.left + pad.right + border.left + border.right,
-        .h = inner.size.h + pad.top + pad.bottom + border.top + border.bottom,
-    };
-    e.layout = self.makeMono(pad);
-    const inner_id = e.layout.request(.{ .min_size = inner.size, .pos = .{ .x = 0, .y = 0 } });
-    e.layout.addElement(inner_id, inner);
-    _ = self.publish(&e);
-    return e;
 }
 
 /// Fine-tunable knobs for buttons.

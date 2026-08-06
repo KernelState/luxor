@@ -274,6 +274,9 @@ pub const Layout = struct {
             const cfg = gridCfg(self) orelse return .{ .w = false, .h = false };
             return .{ .w = cfg.sizing.main == .content, .h = cfg.sizing.cross == .content };
         }
+        // Any other layout that reports a content size (text, ...) is content
+        // on both axes: it can wrap/grow along both given what it is given.
+        if (self.vtable.content != null) return .{ .w = true, .h = true };
         return .{ .w = false, .h = false };
     }
 };
@@ -361,6 +364,7 @@ fn packFlex(layout: *Layout, cfg: *const Layout.FlexConfig, row: bool, pk: *Pack
         const exact = req.size != null;
         var b: u32 = req.basis orelse (if (row) own.w else own.h);
         var oc: u32 = if (row) own.h else own.w;
+        var sizes_cross: bool = false;
         pk.rigid[pk.n] = false;
         const cl = req.element.?.layout;
         if (cl.vtable.content) |content_fn| {
@@ -372,6 +376,7 @@ fn packFlex(layout: *Layout, cfg: *const Layout.FlexConfig, row: bool, pk: *Pack
                 if (axes.h) {
                     if (row) oc = p.h else b = p.h;
                 }
+                sizes_cross = (axes.w and !row) or (axes.h and row);
                 // A content-sized main axis is rigid: the parent may lay it
                 // out at its content size but never crush it below that.
                 if ((axes.w and row) or (axes.h and !row)) {
@@ -385,7 +390,13 @@ fn packFlex(layout: *Layout, cfg: *const Layout.FlexConfig, row: bool, pk: *Pack
         if (pk.rigid[n]) {
             pk.minm[n] = @max(pk.minm[n], b);
         }
-        pk.minc[n] = if (row) req.min_size.h else req.min_size.w;
+        // A content-sized axis reports the size that fits the box it is about
+        // to be given; a wrapping child may therefore shrink its cross axis to
+        // whatever width the parent offers, so its request min must not hold it
+        // rigid on that axis.
+        pk.minc[n] = if (sizes_cross and !exact)
+            oc
+        else if (row) req.min_size.h else req.min_size.w;
         // Ceilings clamp to the container when a max_size isn't given.
         pk.maxm[n] = if (req.max_size) |mx|
             if (row) mx.w else mx.h
@@ -1150,7 +1161,7 @@ test "content reports a wrap row's content height from its own requests" {
 
 test "column parent gives a wrap child its fixed width and content height" {
     var parent = mkLayout();
-    var pcfg = Layout.FlexConfig{ .direction = .column };
+    var pcfg = Layout.FlexConfig{ .direction = .column, .align_items = .flex_start };
     parent.data = &pcfg;
     var root = mkElement(800, 600);
     mkRoot(&parent, &root);
@@ -1172,4 +1183,50 @@ test "column parent gives a wrap child its fixed width and content height" {
     try std.testing.expectEqual(@as(u32, 136), children[0].size.h);
     // the child's own buttons were laid out into its content height
     try std.testing.expectEqual(@as(usize, 3), child.cindex);
+}
+
+// A stand-in text layout: a single line of 1170px, which word-wraps to the
+// offered width underneath two 30px lines.
+const wrapLine = struct {
+    fn lay(_: *Layout) void {}
+    fn content(_: *Layout, avail: lu.Rect) ?lu.Rect {
+        if (avail.w >= 1170) return .{ .w = 1170, .h = 30 };
+        return .{ .w = avail.w, .h = 60 };
+    }
+};
+var wrap_line_vtable = Layout.VTable{ .lay = wrapLine.lay, .content = wrapLine.content };
+var wrap_line_layout: Layout = .{ .vtable = &wrap_line_vtable, .parent = null };
+
+test "a wrapping content child shrinks to the parent's width" {
+    var parent = mkLayout();
+    var pcfg = Layout.FlexConfig{ .direction = .column, .align_items = .flex_start };
+    parent.data = &pcfg;
+    var root = mkElement(100, 200);
+    mkRoot(&parent, &root);
+
+    var ce = mkElement(1170, 30);
+    ce.layout = &wrap_line_layout;
+    parent.addElement(parent.request(.{ .min_size = .{ .w = 1170, .h = 30 } }), ce);
+
+    const children = parent.lay();
+    // The parent only offers 100px of width, so the child wraps: it uses that
+    // width (cross), and grows in height (main) to the wrapped block.
+    try std.testing.expectEqual(@as(u32, 100), children[0].size.w);
+    try std.testing.expectEqual(@as(u32, 60), children[0].size.h);
+}
+
+test "a fitting content child keeps its natural single-line size" {
+    var parent = mkLayout();
+    var pcfg = Layout.FlexConfig{ .direction = .column, .align_items = .flex_start };
+    parent.data = &pcfg;
+    var root = mkElement(2000, 200);
+    mkRoot(&parent, &root);
+
+    var ce = mkElement(1170, 30);
+    ce.layout = &wrap_line_layout;
+    parent.addElement(parent.request(.{ .min_size = .{ .w = 1170, .h = 30 } }), ce);
+
+    const children = parent.lay();
+    try std.testing.expectEqual(@as(u32, 1170), children[0].size.w);
+    try std.testing.expectEqual(@as(u32, 30), children[0].size.h);
 }

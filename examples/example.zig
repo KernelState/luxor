@@ -97,7 +97,7 @@ pub fn main() !void {
     root_layout.element = &root;
     root_layout.start();
 
-    _ = try widget.label("Hello, World!", .{
+    _ = try widget.label("Hello, World! adflahflajhlfhjkhdalvjnzn.dv,mneafhdpoapohzl;dfjkhalejkhlajkdhapdoifehwa---", .{
         .border_radius = .all(4),
         .background = .{ .base = .{ .solid = .red }, .effects = &.{} },
     }, .{ .size = 28, .color = .white });
