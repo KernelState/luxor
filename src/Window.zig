@@ -197,7 +197,7 @@ fn drawElement(self: *Window, e: lu.Element, area: lu.Area) void {
     self.pushClip(content);
     defer self.popClip();
 
-    for (e.layout.lay()) |item| {
+    for (e.layout.lay(content.size)) |item| {
         var child_area = item.area;
         child_area.pos.x += content.pos.x;
         child_area.pos.y += content.pos.y;
@@ -232,6 +232,7 @@ fn drawBackground(self: *Window, e: lu.Element, area: lu.Area) void {
         .image => |img| self.drawImageBackground(img, area, e.border_radius, alpha),
         .gradient => |g| self.drawGradientBackground(g, area, e.border_radius, alpha),
         .buffer => |pb| self.drawBufferBackground(pb, area, e.border_radius, alpha),
+        .image_buffer => |b| self.drawBufferFitBackground(b, area, e.border_radius, alpha),
     }
 }
 
@@ -272,7 +273,7 @@ fn drawBorder(self: *Window, e: lu.Element, area: lu.Area) void {
                     self.fillRoundedRect(area, e.border_radius, color);
                     self.fillRoundedRect(inner, e.border_radius, tint(tint(bg, e.effects), e.background.effects));
                 },
-                .image, .gradient, .buffer => {
+                .image, .gradient, .buffer, .image_buffer => {
                     for (bars) |bar| self.fillRect(bar, color);
                 },
             }
@@ -465,6 +466,58 @@ fn drawBufferBackground(self: *Window, pb: lu.PixelBuffer, area: lu.Area, radius
     _ = sdl.textureSize(tex, &tex_w, &tex_h);
     const src = sdl.SDL_FRect{ .x = 0, .y = 0, .w = tex_w, .h = tex_h };
     self.renderMasked(area, radius, tex, src, null, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = alpha });
+}
+
+/// Draws a decoded RGBA buffer into `area`, scaled according to `b.fit`.
+fn drawBufferFitBackground(self: *Window, b: lu.Buffer8, area: lu.Area, radius: lu.Corners, alpha: f32) void {
+    if (b.buffer.pixels.len == 0 or b.buffer.width == 0 or b.buffer.height == 0) return;
+    const tex = sdl.createTexture(
+        self.renderer,
+        sdl.pixels.SDL_PIXELFORMAT_ABGR8888,
+        sdl.SDL_TEXTUREACCESS_STREAMING,
+        @intCast(b.buffer.width),
+        @intCast(b.buffer.height),
+    ) orelse return;
+    defer sdl.destroyTexture(tex);
+
+    _ = sdl.setTextureBlendMode(tex, sdl.SDL_BLENDMODE_BLEND);
+    _ = sdl.setTextureScaleMode(tex, if (b.filter == .linear) sdl.SDL_SCALEMODE_LINEAR else sdl.SDL_SCALEMODE_NEAREST);
+    _ = sdl.updateTexture(tex, null, @ptrCast(b.buffer.pixels.ptr), @intCast(b.buffer.width * 4));
+
+    const dst = fitRect(b.fit, area, @floatFromInt(b.buffer.width), @floatFromInt(b.buffer.height));
+    const src = sdl.SDL_FRect{ .x = 0, .y = 0, .w = @floatFromInt(b.buffer.width), .h = @floatFromInt(b.buffer.height) };
+    self.renderMasked(dst, radius, tex, src, null, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = alpha });
+}
+
+/// The sub-area of `area` that an image of `iw` x `ih` covers under `fit`.
+fn fitRect(fit: lu.ImageFit, area: lu.Area, iw: f32, ih: f32) lu.Area {
+    if (fit == .stretch) return area;
+    const aw: f32 = @floatFromInt(area.size.w);
+    const ah: f32 = @floatFromInt(area.size.h);
+    if (aw == 0 or ah == 0 or iw == 0 or ih == 0) return area;
+    const ar = iw / ih;
+    const ar_area = aw / ah;
+    const cover = fit == .cover;
+    var dw: f32 = aw;
+    var dh: f32 = ah;
+    // contain: scale to the dimension that limits; cover: the one that overflows.
+    if ((ar > ar_area) == cover) {
+        dh = aw / ar;
+    } else {
+        dw = ah * ar;
+    }
+    const dx = @max(0.0, (aw - dw) / 2.0);
+    const dy = @max(0.0, (ah - dh) / 2.0);
+    return .{
+        .pos = .{
+            .x = area.pos.x + @as(u32, @intFromFloat(@floor(dx))),
+            .y = area.pos.y + @as(u32, @intFromFloat(@floor(dy))),
+        },
+        .size = .{
+            .w = @max(1, @as(u32, @intFromFloat(@ceil(dw)))),
+            .h = @max(1, @as(u32, @intFromFloat(@ceil(dh)))),
+        },
+    };
 }
 
 /// Draws `g` as the background of `area`, masked to `radius`.

@@ -12,6 +12,12 @@ pub const Widget = if (options.widgets)
     @import("Widget.zig")
 else
     @compileError("widgets.zig does not exist");
+/// Image decoding + caching (PNG/JPEG/WebP/SVG). `images` is the decode module;
+/// `Image` is the registered-texture reference type.
+pub const images = if (options.images)
+    @import("Image.zig")
+else
+    @compileError("Image.zig requires the 'images' build option");
 
 pub const Event = union(enum) {
     quit,
@@ -174,6 +180,42 @@ pub const Effect = union(enum) {
     };
 };
 
+/// How an image buffer is scaled into its drawing area.
+pub const ImageFit = enum {
+    /// Stretch to fill the area, ignoring the aspect ratio.
+    stretch,
+    /// Scale to fit inside the area, preserving the aspect ratio. Some of the
+    /// area may be uncovered (transparent) on the longer dimension.
+    contain,
+    /// Scale to fill the area, preserving the aspect ratio. The image is
+    /// centered and cropped on the longer dimension.
+    cover,
+};
+
+/// How a texture is sampled when it is scaled.
+pub const Filter = enum {
+    linear,
+    nearest,
+};
+
+/// An image background that scales a decoded RGBA buffer with an `ImageFit`.
+pub const Buffer8 = struct {
+    buffer: PixelBuffer,
+    fit: ImageFit = .stretch,
+    filter: Filter = .linear,
+};
+
+/// The raw data of an image before decoding. `buffer` is already-decoded
+/// RGBA8888 pixels; the others are encoded bytes produced by an image-widget
+/// function and are decoded (once, cached) into a pixel buffer.
+pub const ImageSource = union(enum) {
+    buffer: PixelBuffer,
+    png: []const u8,
+    jpeg: []const u8,
+    webp: []const u8,
+    svg: []const u8,
+};
+
 pub const Background = struct {
     base: Base,
     effects: []const Effect,
@@ -183,6 +225,7 @@ pub const Background = struct {
         gradient: Gradient,
         solid: Color,
         buffer: PixelBuffer,
+        image_buffer: Buffer8,
     };
 
     pub fn solid(c: Color) Background {
@@ -199,6 +242,10 @@ pub const Background = struct {
 
     pub fn buffer(pb: PixelBuffer) Background {
         return .{ .base = .{ .buffer = pb }, .effects = &.{} };
+    }
+
+    pub fn imageBuffer(img: Buffer8) Background {
+        return .{ .base = .{ .image_buffer = img }, .effects = &.{} };
     }
 };
 

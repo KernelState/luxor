@@ -13,6 +13,11 @@ pub fn build(b: *std.Build) void {
         "widgets",
         "enable Widget.zig, disabling this removes the dependency on harfbuzz and freetype2",
     ) orelse true;
+    const images = b.option(
+        bool,
+        "images",
+        "enable image decoding (png/jpeg/webp/svg) and the image widgets; links libpng, libjpeg, libwebp and vendored nanosvg",
+    ) orelse true;
 
     const sdl = b.dependency("zsdl3", .{
         .sdl_image = false,
@@ -23,6 +28,7 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption(bool, "sdl", use_sdl);
     options.addOption(bool, "widgets", widgets);
+    options.addOption(bool, "images", images);
 
     const lib = b.addLibrary(.{
         .name = "luxor",
@@ -46,6 +52,16 @@ pub fn build(b: *std.Build) void {
         lib.root_module.linkSystemLibrary("freetype2", .{});
         lib.root_module.addIncludePath(b.path("vendor/harfbuzz/"));
         lib.root_module.addIncludePath(b.path("vendor/freetype2/"));
+    }
+    if (images) {
+        lib.root_module.addCSourceFile(.{ .file = b.path("vendor/luxor_c/image_shim.c"), .flags = &.{ "-std=c11" } });
+        lib.root_module.addCSourceFile(.{ .file = b.path("vendor/luxor_c/svg_shim.c"), .flags = &.{ "-std=c11" } });
+        lib.root_module.addIncludePath(b.path("vendor/luxor_c"));
+        lib.root_module.addIncludePath(b.path("vendor/nanosvg"));
+        lib.root_module.linkSystemLibrary("png", .{});
+        lib.root_module.linkSystemLibrary("jpeg", .{});
+        lib.root_module.linkSystemLibrary("webp", .{});
+        lib.root_module.linkSystemLibrary("m", .{});
     }
 
     b.installArtifact(lib);

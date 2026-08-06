@@ -3,7 +3,6 @@ const lu = @import("luxor");
 const sdl = @import("sdl");
 
 var root_layout = lu.Layout{ .fn_lay = &absoluteLayout, .parent = null };
-var box_layout = lu.Layout{ .fn_lay = &absoluteLayout, .parent = null };
 
 fn absoluteLayout(layout: *lu.Layout) void {
     layout.iindex = 0;
@@ -55,116 +54,70 @@ pub fn main() !void {
     });
     defer window.deinit();
 
-    const surface = sdl.loadPNG("examples/test.png") orelse return error.LoadPNGFailed;
-    defer sdl.destroySurface(surface);
-    const texture = sdl.createTextureFromSurface(window.renderer, surface) orelse return error.CreateTextureFailed;
-    const img_id = try window.addTexture(texture);
-
-    const events = lu.Element.Events{
-        .hover = .{ .handle = null },
-        .click = .{ .handle = null },
-        .drag = .{ .handle = null },
-        .render = .{ .handle = null },
-        .modify = .{ .handle = null },
-        .focus = .{ .handle = null },
-        .key = .{ .handle = null },
+    // Widgets are immediate-mode functions: each one spits out an element and
+    // places it inside `parent`. The tree is built once here and re-rendered
+    // each frame.
+    var root = lu.Element{
+        .size = .{ .w = 800, .h = 600 },
+        .pos = .{ .x = 0, .y = 0 },
+        .background = lu.Background.solid(lu.Color.fromU32(0x00000000)),
+        .layout = &root_layout,
+        .events = lu.Widget.noEvents,
     };
 
-    const image_box = lu.Element{
-        .size = .{ .w = 200, .h = 120 },
-        .pos = .{ .x = 80, .y = 80 },
-        .border = .all(6),
-        .border_color = .{ .gradient = .{
-            .points = &.{
-                .{ .x = 0.0, .y = 0.0, .color = lu.Color.fromU32(0xFFFF00FF) },
-                .{ .x = 1.0, .y = 1.0, .color = lu.Color.fromU32(0xFF00FFFF) },
-            },
-            .opacity = 1.0,
-        } },
-        .border_radius = .all(24),
-        .background = lu.Background.image(.{ .id = img_id }),
-        .layout = &box_layout,
-        .events = events,
-    };
-
-    const blur_box = lu.Element{
-        .size = .{ .w = 260, .h = 180 },
-        .pos = .{ .x = 480, .y = 350 },
-        .border_radius = .all(24),
-        .background = .{
-            .base = .{ .solid = lu.Color.fromU32(0xFFFFFF22) },
-            .effects = &.{.{ .blur = .{ .radius = 16 } }},
-        },
-        .layout = &box_layout,
-        .events = events,
-    };
-
-    const gradient_box = lu.Element{
-        .size = .{ .w = 220, .h = 140 },
-        .pos = .{ .x = 60, .y = 380 },
+    _ = widget.box(&root, .{ .w = 300, .h = 120 }, .{
+        .pos = .{ .x = 60, .y = 60 },
         .border_radius = .all(12),
-        .background = lu.Background.gradient(.{
-            .points = &.{
-                .{ .x = 0.0, .y = 0.0, .color = lu.Color.fromU32(0xFF3355FF) },
-                .{ .x = 1.0, .y = 0.0, .color = lu.Color.fromU32(0x33FF55FF) },
-                .{ .x = 0.5, .y = 1.0, .color = lu.Color.fromU32(0xFF5533FF) },
-            },
-            .opacity = 0.9,
-        }),
-        .layout = &box_layout,
-        .events = events,
-    };
+        .background = .{
+            .base = .{ .gradient = .{
+                .points = &.{
+                    .{ .x = 0.0, .y = 0.0, .color = lu.Color.fromU32(0xFF3355FF) },
+                    .{ .x = 1.0, .y = 0.0, .color = lu.Color.fromU32(0x33FF55FF) },
+                },
+                .opacity = 0.9,
+            } },
+            .effects = &.{},
+        },
+    });
 
-    var pixel_data: [160 * 80 * 4]u8 = undefined;
-    for (0..80) |y| {
-        for (0..160) |x| {
-            const idx = (y * 160 + x) * 4;
-            const checker = ((x / 16) + (y / 16)) % 2 == 0;
-            if (checker) {
-                pixel_data[idx] = 0xFF;
-                pixel_data[idx + 1] = 0x88;
-                pixel_data[idx + 2] = 0x00;
-                pixel_data[idx + 3] = 0xFF;
-            } else {
-                pixel_data[idx] = 0x00;
-                pixel_data[idx + 1] = 0x44;
-                pixel_data[idx + 2] = 0xFF;
-                pixel_data[idx + 3] = 0xFF;
-            }
-        }
-    }
-    const buffer_box = lu.Element{
-        .size = .{ .w = 160, .h = 80 },
-        .pos = .{ .x = 340, .y = 80 },
-        .border_radius = .all(8),
-        .background = lu.Background.buffer(.{
-            .pixels = &pixel_data,
-            .width = 160,
-            .height = 80,
-        }),
-        .layout = &box_layout,
-        .events = events,
-    };
-
-    try widget.label(&root_layout, "Hello, World!", .{ .x = 80, .y = 220 }, .{}, .{
+    _ = try widget.label(&root, "Hello, World!", .{
+        .pos = .{ .x = 60, .y = 220 },
         .border_radius = .all(4),
         .background = .{ .base = .{ .solid = .red }, .effects = &.{} },
-    });
-    try widget.label(&root_layout, "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} \u{0628}\u{0627}\u{0644}\u{0639}\u{0627}\u{0644}\u{0645}", .{ .x = 500, .y = 220 }, .{
-        .direction = .rtl,
-        .font_idx = 1,
-    }, .{
-        .border_radius = .all(4),
-    });
+    }, .{ .size = 28, .color = .white });
+    _ = try widget.label(&root, "\u{645}\u{631}\u{62D}\u{628}\u{627} \u{628}\u{627}\u{644}\u{639}\u{627}\u{644}\u{645}", .{
+        .pos = .{ .x = 300, .y = 220 },
+    }, .{ .font_idx = 1, .direction = .rtl, .size = 28 });
 
-    root_layout.request(.{ .w = 200, .h = 120 }, null, .{ .x = 80, .y = 80 }, null);
-    root_layout.addElement(image_box);
-    root_layout.request(.{ .w = 260, .h = 180 }, null, .{ .x = 480, .y = 350 }, null);
-    root_layout.addElement(blur_box);
-    root_layout.request(.{ .w = 220, .h = 140 }, null, .{ .x = 60, .y = 380 }, null);
-    root_layout.addElement(gradient_box);
-    root_layout.request(.{ .w = 160, .h = 80 }, null, .{ .x = 340, .y = 80 }, null);
-    root_layout.addElement(buffer_box);
+    _ = try widget.button(&root, "Click me", .{
+        .pos = .{ .x = 60, .y = 320 },
+        .border = .all(2),
+        .border_color = .{ .color = .white },
+    }, .{ .color = lu.Color.fromU32(0x2255AAFF) });
+
+    _ = widget.checkbox(&root, true, .{ .pos = .{ .x = 60, .y = 380 } }, .{});
+    _ = widget.checkbox(&root, false, .{ .pos = .{ .x = 100, .y = 380 } }, .{});
+
+    _ = widget.progress_bar(&root, 0.4, .{ .pos = .{ .x = 60, .y = 430 } }, .{});
+    _ = widget.slider(&root, 0.66, .{ .pos = .{ .x = 60, .y = 480 } }, .{});
+
+    // SVG image: decoded once and cached; rasterized at 160x160.
+    const svg_src =
+        "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200' viewBox='0 0 200 200'>" ++
+        "<circle cx='100' cy='100' r='90' fill='#ffcc00'/>" ++
+        "<rect x='60' y='60' width='80' height='80' rx='12' fill='#2222ff'/>" ++
+        "</svg>";
+    _ = try widget.image(&root, .{ .svg = svg_src }, .{
+        .pos = .{ .x = 500, .y = 60 },
+        .border = .all(4),
+        .border_color = .{ .color = .white },
+    }, .{ .svg_width = 160, .svg_height = 160 });
+
+    // PNG image decoded from embedded bytes (cached after the first call).
+    _ = try widget.image(&root, .{ .png = @embedFile("test.png") }, .{
+        .pos = .{ .x = 500, .y = 260 },
+        .border_radius = .all(8),
+    }, .{ .fit = .contain, .filter = .nearest });
 
     var event: sdl.SDL_Event = undefined;
     while (true) {
@@ -186,15 +139,15 @@ pub fn main() !void {
         _ = sdl.setRenderDrawColor(window.renderer, 70, 120, 240, 255);
         _ = sdl.renderFillRect(window.renderer, &.{ .x = 200, .y = 380, .w = 320, .h = 120 });
 
-        const root = lu.Element{
+        const root2 = lu.Element{
             .size = .{ .w = 800, .h = 600 },
             .pos = .{ .x = 0, .y = 0 },
             .background = lu.Background.solid(lu.Color.fromU32(0x00000000)),
             .layout = &root_layout,
-            .events = events,
+            .events = lu.Widget.noEvents,
         };
 
-        window.render(root);
+        window.render(root2);
         _ = sdl.renderPresent(window.renderer);
     }
 }
