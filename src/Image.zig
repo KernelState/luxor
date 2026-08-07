@@ -33,14 +33,13 @@ pub const DecodeOpts = struct {
 
 const hash_seed = 0x6a17e93e;
 
-pub const Cache = struct {
-    pub const Node = struct {
-        key: u64,
-        decoded: Decoded,
-        next: ?*Node,
-    };
+/// A fixed-buffer-backed hash map keyed by the *input* (source bytes + raster
+/// settings), never by the pixel bytes themselves. Values are `Decoded` slices
+/// owned by the caller's long-lived arena, so they stay valid across frames.
+const Map = lu.Cache.Cache(u64, Decoded, 65536);
 
-    first: ?*Node = null,
+pub const Cache = struct {
+    map: Map = .{},
 
     /// Returns the decoded image for `src`, decoding (and caching) it on a
     /// miss. `buffer` sources bypass the cache entirely: the caller already
@@ -50,33 +49,19 @@ pub const Cache = struct {
             .buffer => |pb| return .{ .pixels = pb.pixels, .width = pb.width, .height = pb.height },
             .png, .jpeg, .webp => |bytes| {
                 const key = rasterKey(src, bytes);
-                if (self.lookup(key)) |d| return d;
+                if (self.map.get(key)) |d| return d;
                 const d = try decodeRaster(alloc, src, bytes);
-                try self.store(alloc, key, d);
+                self.map.put(key, d);
                 return d;
             },
             .svg => |text| {
                 const key = svgKey(text, opts);
-                if (self.lookup(key)) |d| return d;
+                if (self.map.get(key)) |d| return d;
                 const d = try decodeSVG(alloc, text, opts);
-                try self.store(alloc, key, d);
+                self.map.put(key, d);
                 return d;
             },
         }
-    }
-
-    fn lookup(self: *Cache, key: u64) ?Decoded {
-        var cur = self.first;
-        while (cur) |node| : (cur = node.next) {
-            if (node.key == key) return node.decoded;
-        }
-        return null;
-    }
-
-    fn store(self: *Cache, alloc: std.mem.Allocator, key: u64, decoded: Decoded) !void {
-        const node = try alloc.create(Node);
-        node.* = .{ .key = key, .decoded = decoded, .next = self.first };
-        self.first = node;
     }
 };
 

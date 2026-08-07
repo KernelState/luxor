@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     const widgets = b.option(
         bool,
         "widgets",
-        "enable Widget.zig, disabling this removes the dependency on harfbuzz and freetype2",
+        "enable Context.zig, disabling this removes the dependency on harfbuzz and freetype2",
     ) orelse true;
     const images = b.option(
         bool,
@@ -82,6 +82,18 @@ pub fn build(b: *std.Build) void {
 
     const exe_install = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&exe_install.step);
+
+    const hr = b.addExecutable(.{
+        .name = "harness",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/harness.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "luxor", .module = lib.root_module }},
+        }),
+        .use_llvm = true,
+    });
+    b.installArtifact(hr);
 
     const lib_tests = b.addTest(.{
         .root_module = lib.root_module,

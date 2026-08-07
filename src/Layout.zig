@@ -11,6 +11,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const lu = @import("luxor.zig");
 
+/// The number of requests/children a single layout can hold (the per-layout
+/// static arrays). Elements are referenced by pointer (into the widget's
+/// element pool), never by value, so `Element` can embed a `Layout` by value
+/// without a size-recursion loop.
+pub const Inner = 200;
+/// Size of working scratch buffers used while laying out a container. Content
+/// with more children than this cannot be laid out.
 pub const Max = 1000;
 
 pub const Layout = struct {
@@ -31,14 +38,15 @@ pub const Layout = struct {
     /// argument.
     element: ?*lu.Element = null,
     /// The laid-out children, filled by `lay`. Each child's `.size` and `.pos`
-    /// are final (world space). The window walks this list to draw.
-    children: [Max]lu.Element = undefined,
+    /// are final (world space). The window walks this list to draw. Children
+    /// are pointers into the widget's element pool, never stored by value.
+    children: [Inner]*lu.Element = undefined,
     /// Number of laid-out children.
     cindex: usize = 0,
     /// The box this layout lays its children into, set by `lay`.
     container: lu.Rect = .{ .w = 0, .h = 0 },
     /// The saved requests from the build phase (`request` + `addElement`).
-    requests: [Max]Request = undefined,
+    requests: [Inner]Request = undefined,
     /// Next free slot in `requests`.
     rindex: usize = 0,
 
@@ -139,7 +147,9 @@ pub const Layout = struct {
     /// A request from an element to get some space from the parent. The element
     /// is null until `addElement` is called with this request's id.
     pub const Request = struct {
-        element: ?lu.Element = null,
+        /// The requesting element, a pointer into the widget's element pool.
+        /// `addElement` fills this in.
+        element: ?*lu.Element = null,
         /// The base size the layout tries to give the element; also the floor
         /// when there is room.
         min_size: lu.Rect,
@@ -175,8 +185,8 @@ pub const Layout = struct {
         const el = self.element orelse {
             @panic("layout.start() called before the layout was wired to an element (set layout.element or add the element to a parent first)");
         };
-        const w = el.widget orelse {
-            @panic("layout.start(): the element has no widget pointer");
+        const w = el.ctx orelse {
+            @panic("layout.start(): the element has no context pointer");
         };
         w.current = self;
     }
@@ -187,7 +197,7 @@ pub const Layout = struct {
     /// with `lay`.
     pub fn end(self: *Layout) void {
         const el = self.element orelse return;
-        if (el.widget) |w| w.current = self.parent;
+        if (el.ctx) |w| w.current = self.parent;
     }
 
     /// Request space from the layout, returning the id assigned to this
@@ -210,15 +220,16 @@ pub const Layout = struct {
     }
 
     /// Assign the element that made request `id` to its request slot, and wire
-    /// the element's layout back to the stored copy so `start`/`end` can reach
-    /// the element (and its widget) and `lay` can read its size.
-    pub fn addElement(self: *Layout, id: u32, element: lu.Element) void {
+    /// the element's layout back to the element pointed at so `start`/`end` can
+    /// reach the element (and its widget) and `lay` can read its size. `element`
+    /// is a pointer into the widget's element pool; the caller keeps it alive.
+    pub fn addElement(self: *Layout, id: u32, element: *lu.Element) void {
         const idx: usize = id;
         if (idx >= self.rindex) {
             @panic("layout.addElement called with an invalid request id; request() assigns one first");
         }
         self.requests[idx].element = element;
-        self.requests[idx].element.?.layout.element = &self.requests[idx].element.?;
+        if (self.requests[idx].element.?.layout) |*l| l.element = self.requests[idx].element;
     }
 
     /// Lay out this layout's children, top-down. The window sets the root
@@ -226,7 +237,7 @@ pub const Layout = struct {
     /// layout's `lay`; each layout sizes its own children, writes their final
     /// `.size`/`.pos` onto the child elements, and lays out the children that
     /// are containers themselves. Returns the laid-out children.
-    pub fn lay(self: *Layout) []lu.Element {
+    pub fn lay(self: *Layout) []*lu.Element {
         const el = self.element orelse return self.children[0..0];
         const pad = self.padding;
         self.container = .{
@@ -236,11 +247,13 @@ pub const Layout = struct {
         self.cindex = 0;
         self.vtable.lay(self);
         for (0..self.cindex) |i| {
-            self.children[i].pos.x += el.pos.x + pad.left;
-            self.children[i].pos.y += el.pos.y + pad.top;
-            const cl = self.children[i].layout;
-            cl.element = &self.children[i];
-            _ = cl.lay();
+            const child = self.children[i];
+            child.pos.x += el.pos.x + pad.left;
+            child.pos.y += el.pos.y + pad.top;
+            if (child.layout) |*cl| {
+                cl.element = child;
+                _ = cl.lay();
+            }
         }
         return self.children[0..self.cindex];
     }
@@ -296,8 +309,8 @@ fn absoluteLay(layout: *Layout) void {
         const req = &layout.requests[id];
         const el = req.element orelse continue;
         layout.children[layout.cindex] = el;
-        layout.children[layout.cindex].pos = req.pos orelse .{ .x = 0, .y = 0 };
-        layout.children[layout.cindex].size = req.size orelse req.min_size;
+        el.pos = req.pos orelse .{ .x = 0, .y = 0 };
+        el.size = req.size orelse req.min_size;
         layout.cindex += 1;
     }
 }
@@ -311,11 +324,11 @@ fn monoLay(layout: *Layout) void {
     const el = req.element orelse return;
     const child = req.size orelse req.min_size;
     layout.children[0] = el;
-    layout.children[0].pos = .{
+    el.pos = .{
         .x = @divTrunc(layout.container.w -| child.w, 2),
         .y = @divTrunc(layout.container.h -| child.h, 2),
     };
-    layout.children[0].size = child;
+    el.size = child;
     layout.cindex = 1;
 }
 
@@ -348,7 +361,7 @@ const Packed = struct {
     /// parent cannot crush a container below what it holds, which would make
     /// the container's children leak out over the following siblings.
     rigid: [Max]bool,
-    el: [Max]lu.Element,
+    el: [Max]*lu.Element,
 };
 
 /// Gather a flex container's children. Content-sized children report their
@@ -366,21 +379,22 @@ fn packFlex(layout: *Layout, cfg: *const Layout.FlexConfig, row: bool, pk: *Pack
         var oc: u32 = if (row) own.h else own.w;
         var sizes_cross: bool = false;
         pk.rigid[pk.n] = false;
-        const cl = req.element.?.layout;
-        if (cl.vtable.content) |content_fn| {
-            if (content_fn(cl, layout.container)) |p| {
-                const axes = Layout.contentAxes(cl);
-                if (axes.w) {
-                    if (row) b = p.w else oc = p.w;
-                }
-                if (axes.h) {
-                    if (row) oc = p.h else b = p.h;
-                }
-                sizes_cross = (axes.w and !row) or (axes.h and row);
-                // A content-sized main axis is rigid: the parent may lay it
-                // out at its content size but never crush it below that.
-                if ((axes.w and row) or (axes.h and !row)) {
-                    pk.rigid[pk.n] = true;
+        if (req.element.?.layout) |*cl| {
+            if (cl.vtable.content) |content_fn| {
+                if (content_fn(cl, layout.container)) |p| {
+                    const axes = Layout.contentAxes(cl);
+                    if (axes.w) {
+                        if (row) b = p.w else oc = p.w;
+                    }
+                    if (axes.h) {
+                        if (row) oc = p.h else b = p.h;
+                    }
+                    sizes_cross = (axes.w and !row) or (axes.h and row);
+                    // A content-sized main axis is rigid: the parent may lay it
+                    // out at its content size but never crush it below that.
+                    if ((axes.w and row) or (axes.h and !row)) {
+                        pk.rigid[pk.n] = true;
+                    }
                 }
             }
         }
@@ -738,7 +752,7 @@ fn flexLay(layout: *Layout) void {
             // axis to make room, instead of the element spilling onto them.
             var use_main: u32 = main[g];
             if (pk.overflow[g]) |ofn| {
-                if (ofn(&pk.el[g], .{ .w = main[g], .h = cross[g] })) |r| {
+                if (ofn(pk.el[g], .{ .w = main[g], .h = cross[g] })) |r| {
                     const claimed: u32 = if (row) r.w else r.h;
                     use_main = @max(use_main, claimed);
                 }
@@ -755,9 +769,10 @@ fn flexLay(layout: *Layout) void {
                 };
             }
             cursor += @as(i64, use_main) + @as(i64, space);
-            layout.children[layout.cindex] = pk.el[g];
-            layout.children[layout.cindex].pos = area.pos;
-            layout.children[layout.cindex].size = area.size;
+            const ce = pk.el[g];
+            layout.children[layout.cindex] = ce;
+            ce.pos = area.pos;
+            ce.size = area.size;
             layout.cindex += 1;
         }
         if (li + 1 < nl) cy += @as(i64, line_cross[li]) + cfg.gap;
@@ -780,11 +795,12 @@ fn gridExtents(layout: *Layout, cfg: *const Layout.GridConfig, max_w: *u32, max_
         const child = req.size orelse req.min_size;
         var w = child.w;
         var h = child.h;
-        const cl = req.element.?.layout;
-        if (cl.vtable.content) |content_fn| {
-            if (content_fn(cl, layout.container)) |p| {
-                w = p.w;
-                h = p.h;
+        if (req.element.?.layout) |*cl| {
+            if (cl.vtable.content) |content_fn| {
+                if (content_fn(cl, layout.container)) |p| {
+                    w = p.w;
+                    h = p.h;
+                }
             }
         }
         mw = @max(mw, w);
@@ -864,9 +880,10 @@ fn gridLay(layout: *Layout) void {
             area.size.w = @min(area.size.w, mx.w);
             area.size.h = @min(area.size.h, mx.h);
         }
-        layout.children[layout.cindex] = layout.requests[idx].element.?;
-        layout.children[layout.cindex].pos = area.pos;
-        layout.children[layout.cindex].size = area.size;
+        const ce = layout.requests[idx].element.?;
+        layout.children[layout.cindex] = ce;
+        ce.pos = area.pos;
+        ce.size = area.size;
         layout.cindex += 1;
         i += 1;
     }
@@ -876,19 +893,26 @@ fn gridLay(layout: *Layout) void {
 // Tests
 // ---------------------------------------------------------------------------
 
-// A leaf layout shared by test leaves. Pointing leaves at a content-flexible
-// parent would make it re-measure itself forever.
-var leaf_layout: Layout = .{
+// A leaf layout embedded by value into every test leaf. Sharing a copy keeps
+// leaves outside of the (container) recursion so they are never re-measured.
+const leaf_layout: Layout = .{
     .vtable = &Layout.leaf,
     .parent = null,
 };
 
-fn mkElement(w: u32, h: u32) lu.Element {
-    return .{
+// Test elements live in a static pool, mirroring the widget pool: layouts hold
+// element *pointers*, so the elements they point at must outlive the layout.
+var test_elems: [4096]lu.Element = undefined;
+var next_elem: usize = 0;
+
+fn mkElement(w: u32, h: u32) *lu.Element {
+    const e = &test_elems[next_elem];
+    next_elem += 1;
+    e.* = .{
         .size = .{ .w = w, .h = h },
         .pos = .{ .x = 0, .y = 0 },
         .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 255 }),
-        .layout = &leaf_layout,
+        .layout = leaf_layout,
         .events = .{
             .hover = .{ .handle = null },
             .click = .{ .handle = null },
@@ -900,6 +924,7 @@ fn mkElement(w: u32, h: u32) lu.Element {
         },
         .focusable = false,
     };
+    return e;
 }
 
 fn mkLayout() Layout {
@@ -918,8 +943,8 @@ test "flex row lays children in order with gap" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .row, .gap = 4 };
     layout.data = &cfg;
-    var root = mkElement(100, 40);
-    mkRoot(&layout, &root);
+    const root = mkElement(100, 40);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 10, .h = 20 } }), mkElement(10, 20));
     layout.addElement(layout.request(.{ .min_size = .{ .w = 30, .h = 20 } }), mkElement(30, 20));
@@ -938,8 +963,8 @@ test "flex row grow fills free space" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .row };
     layout.data = &cfg;
-    var root = mkElement(100, 10);
-    mkRoot(&layout, &root);
+    const root = mkElement(100, 10);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 0, .h = 10 }, .grow = 1 }), mkElement(0, 10));
     layout.addElement(layout.request(.{ .min_size = .{ .w = 0, .h = 10 }, .grow = 3 }), mkElement(0, 10));
@@ -953,8 +978,8 @@ test "flex column justify flex_end" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .column, .justify = .flex_end };
     layout.data = &cfg;
-    var root = mkElement(20, 100);
-    mkRoot(&layout, &root);
+    const root = mkElement(20, 100);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 10, .h = 10 } }), mkElement(10, 10));
 
@@ -967,8 +992,8 @@ test "grid places children into cells" {
     layout.vtable = &Layout.grid;
     var cfg = Layout.GridConfig{ .columns = 2, .gap = 0 };
     layout.data = &cfg;
-    var root = mkElement(100, 100);
-    mkRoot(&layout, &root);
+    const root = mkElement(100, 100);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 5, .h = 5 } }), mkElement(5, 5));
     layout.addElement(layout.request(.{ .min_size = .{ .w = 5, .h = 5 } }), mkElement(5, 5));
@@ -985,8 +1010,8 @@ test "flex wrap creates a new line" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .row, .gap = 2, .wrap = true };
     layout.data = &cfg;
-    var root = mkElement(90, 100);
-    mkRoot(&layout, &root);
+    const root = mkElement(90, 100);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 40, .h = 20 } }), mkElement(40, 20));
     layout.addElement(layout.request(.{ .min_size = .{ .w = 40, .h = 20 } }), mkElement(40, 20));
@@ -1003,8 +1028,8 @@ test "wrapped lines are content-sized on the cross axis" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .row, .gap = 2, .wrap = true };
     layout.data = &cfg;
-    var root = mkElement(90, 100);
-    mkRoot(&layout, &root);
+    const root = mkElement(90, 100);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 40, .h = 20 } }), mkElement(40, 20));
     layout.addElement(layout.request(.{ .min_size = .{ .w = 40, .h = 30 } }), mkElement(40, 30));
@@ -1022,8 +1047,8 @@ test "squeeze shrinks to the min floor, only going below when the box is full" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .row, .overflow = .squeeze };
     layout.data = &cfg;
-    var root = mkElement(14, 10);
-    mkRoot(&layout, &root);
+    const root = mkElement(14, 10);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 10, .h = 10 } }), mkElement(10, 10));
     layout.addElement(layout.request(.{ .min_size = .{ .w = 10, .h = 10 } }), mkElement(10, 10));
@@ -1039,8 +1064,8 @@ test "squeeze stops at the min floor when the deficit fits within it" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .row, .overflow = .squeeze };
     layout.data = &cfg;
-    var root = mkElement(24, 10);
-    mkRoot(&layout, &root);
+    const root = mkElement(24, 10);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 10, .h = 10 }, .basis = 20 }), mkElement(20, 10));
     layout.addElement(layout.request(.{ .min_size = .{ .w = 10, .h = 10 }, .basis = 20 }), mkElement(20, 10));
@@ -1056,8 +1081,8 @@ test "squeeze redistributes a floor-limited share over the other children" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .row, .overflow = .squeeze };
     layout.data = &cfg;
-    var root = mkElement(24, 10);
-    mkRoot(&layout, &root);
+    const root = mkElement(24, 10);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 19, .h = 10 }, .basis = 20 }), mkElement(20, 10));
     layout.addElement(layout.request(.{ .min_size = .{ .w = 0, .h = 10 }, .basis = 20 }), mkElement(20, 10));
@@ -1073,8 +1098,8 @@ test "squeeze is the default overflow for flex boxes" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .row }; // overflow left at default
     layout.data = &cfg;
-    var root = mkElement(14, 10);
-    mkRoot(&layout, &root);
+    const root = mkElement(14, 10);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 10, .h = 10 } }), mkElement(10, 10));
     layout.addElement(layout.request(.{ .min_size = .{ .w = 10, .h = 10 } }), mkElement(10, 10));
@@ -1092,8 +1117,8 @@ test "overflow fn pushes the siblings down on the main axis" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .column, .gap = 0 };
     layout.data = &cfg;
-    var root = mkElement(100, 100);
-    mkRoot(&layout, &root);
+    const root = mkElement(100, 100);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 20, .h = 20 }, .overflow = overflowFn }), mkElement(20, 20));
     layout.addElement(layout.request(.{ .min_size = .{ .w = 20, .h = 20 } }), mkElement(20, 20));
@@ -1113,8 +1138,8 @@ test "overflow fn cross is clipped to the reserved box" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .row, .align_items = .flex_start };
     layout.data = &cfg;
-    var root = mkElement(100, 100);
-    mkRoot(&layout, &root);
+    const root = mkElement(100, 100);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 10, .h = 10 }, .overflow = overflowCrossFn }), mkElement(10, 10));
     layout.addElement(layout.request(.{ .min_size = .{ .w = 10, .h = 10 } }), mkElement(10, 10));
@@ -1130,8 +1155,8 @@ test "flex content sizing measures preferred size" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .row, .gap = 4, .sizing = .{ .main = .content, .cross = .content } };
     layout.data = &cfg;
-    var root = mkElement(500, 500);
-    mkRoot(&layout, &root);
+    const root = mkElement(500, 500);
+    mkRoot(&layout, root);
 
     layout.addElement(layout.request(.{ .min_size = .{ .w = 10, .h = 20 } }), mkElement(10, 20));
     layout.addElement(layout.request(.{ .min_size = .{ .w = 30, .h = 20 } }), mkElement(30, 20));
@@ -1146,8 +1171,8 @@ test "content reports a wrap row's content height from its own requests" {
     var layout = mkLayout();
     var cfg = Layout.FlexConfig{ .direction = .row, .gap = 8, .wrap = true, .sizing = .{ .main = .fixed, .cross = .content } };
     layout.data = &cfg;
-    var root = mkElement(800, 600);
-    mkRoot(&layout, &root);
+    const root = mkElement(800, 600);
+    mkRoot(&layout, root);
 
     for (0..3) |_| {
         layout.addElement(layout.request(.{ .min_size = .{ .w = 400, .h = 40 } }), mkElement(400, 40));
@@ -1163,18 +1188,17 @@ test "column parent gives a wrap child its fixed width and content height" {
     var parent = mkLayout();
     var pcfg = Layout.FlexConfig{ .direction = .column, .align_items = .flex_start };
     parent.data = &pcfg;
-    var root = mkElement(800, 600);
-    mkRoot(&parent, &root);
+    const root = mkElement(800, 600);
+    mkRoot(&parent, root);
 
-    var child = mkLayout();
+    const ce = mkElement(800, 0);
+    ce.layout = .{ .vtable = &Layout.flex, .parent = null };
     var ccfg = Layout.FlexConfig{ .direction = .row, .gap = 8, .wrap = true, .sizing = .{ .main = .fixed, .cross = .content } };
-    child.data = &ccfg;
-    var ce = mkElement(800, 0);
-    ce.layout = &child;
+    ce.layout.?.data = &ccfg;
     parent.addElement(parent.request(.{ .min_size = .{ .w = 800, .h = 0 }, .size = .{ .w = 800, .h = 0 } }), ce);
 
     for (0..3) |_| {
-        child.addElement(child.request(.{ .min_size = .{ .w = 400, .h = 40 } }), mkElement(400, 40));
+        ce.layout.?.addElement(ce.layout.?.request(.{ .min_size = .{ .w = 400, .h = 40 } }), mkElement(400, 40));
     }
 
     const children = parent.lay();
@@ -1182,7 +1206,7 @@ test "column parent gives a wrap child its fixed width and content height" {
     try std.testing.expectEqual(@as(u32, 800), children[0].size.w);
     try std.testing.expectEqual(@as(u32, 136), children[0].size.h);
     // the child's own buttons were laid out into its content height
-    try std.testing.expectEqual(@as(usize, 3), child.cindex);
+    try std.testing.expectEqual(@as(usize, 3), ce.layout.?.cindex);
 }
 
 // A stand-in text layout: a single line of 1170px, which word-wraps to the
@@ -1201,11 +1225,11 @@ test "a wrapping content child shrinks to the parent's width" {
     var parent = mkLayout();
     var pcfg = Layout.FlexConfig{ .direction = .column, .align_items = .flex_start };
     parent.data = &pcfg;
-    var root = mkElement(100, 200);
-    mkRoot(&parent, &root);
+    const root = mkElement(100, 200);
+    mkRoot(&parent, root);
 
-    var ce = mkElement(1170, 30);
-    ce.layout = &wrap_line_layout;
+    const ce = mkElement(1170, 30);
+    ce.layout = wrap_line_layout;
     parent.addElement(parent.request(.{ .min_size = .{ .w = 1170, .h = 30 } }), ce);
 
     const children = parent.lay();
@@ -1219,11 +1243,11 @@ test "a fitting content child keeps its natural single-line size" {
     var parent = mkLayout();
     var pcfg = Layout.FlexConfig{ .direction = .column, .align_items = .flex_start };
     parent.data = &pcfg;
-    var root = mkElement(2000, 200);
-    mkRoot(&parent, &root);
+    const root = mkElement(2000, 200);
+    mkRoot(&parent, root);
 
-    var ce = mkElement(1170, 30);
-    ce.layout = &wrap_line_layout;
+    const ce = mkElement(1170, 30);
+    ce.layout = wrap_line_layout;
     parent.addElement(parent.request(.{ .min_size = .{ .w = 1170, .h = 30 } }), ce);
 
     const children = parent.lay();

@@ -3,22 +3,14 @@ const lu = @import("luxor");
 const sdl = @import("sdl");
 
 // Root column fills the window and lays everything top to bottom. It has no
-// parent, so it is the root of the tree.
+// parent, so it is the root of the tree. Layouts are now embedded by value in
+// the element that owns them, so the config is shared but each container gets
+// its own layout instance.
 var root_cfg = lu.Layout.FlexConfig{ .direction = .column, .gap = 12, .align_items = .flex_start };
-var root_layout = lu.Layout{
-    .vtable = &lu.Layout.flex,
-    .parent = null,
-    .data = &root_cfg,
-};
 
 // A wrap row that fills the parent's width (main = fixed) and takes its height
 // from the wrapped content (cross = content).
 var toolbar_cfg = lu.Layout.FlexConfig{ .direction = .row, .gap = 8, .wrap = true, .sizing = .{ .main = .fixed, .cross = .content } };
-var toolbar_layout = lu.Layout{
-    .vtable = &lu.Layout.flex,
-    .parent = &root_layout,
-    .data = &toolbar_cfg,
-};
 
 // A long list of buttons wrapped into rows. Like the toolbar it fills the
 // window width and takes its height from the wrapped rows, but every button has
@@ -27,47 +19,37 @@ var toolbar_layout = lu.Layout{
 // `grow` buttons only up to their `max_size`, and wrapping grows this row's
 // height to fit the rows instead of letting them spill.
 var button_field_cfg = lu.Layout.FlexConfig{ .direction = .row, .gap = 8, .wrap = true, .sizing = .{ .main = .fixed, .cross = .content } };
-var button_field_layout = lu.Layout{
-    .vtable = &lu.Layout.flex,
-    .parent = &root_layout,
-    .data = &button_field_cfg,
-};
 
 // Sizes itself to its children's cells.
 var grid_cfg = lu.Layout.GridConfig{ .columns = 4, .gap = 8, .sizing = .{ .main = .content, .cross = .content } };
-var grid_layout = lu.Layout{
-    .vtable = &lu.Layout.grid,
-    .parent = &root_layout,
-    .data = &grid_cfg,
-};
 
 var slider_row_cfg = lu.Layout.FlexConfig{ .direction = .row, .gap = 16, .sizing = .{ .main = .content, .cross = .content } };
-var slider_row_layout = lu.Layout{
-    .vtable = &lu.Layout.flex,
-    .parent = &root_layout,
-    .data = &slider_row_cfg,
-};
+
+const toolbar_colors = [_]u32{ 0xFF5555FF, 0xFF55AAFF, 0xFF55FFAA, 0xFFAACCFF, 0xFFCCAAFF, 0xFFAA55FF, 0xFF55FFFF, 0xFFFFAA55 };
+const tile_colors = [_]u32{ 0xEE3344, 0xEE8855, 0xEECC33, 0x66CC55, 0x3399EE, 0x7744CC, 0xCC3388, 0x4488AA };
 
 pub fn main() !void {
-    var widget = lu.Widget{
+    var ctx = lu.Context{
         .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-        .freetype = try lu.Widget.Freetype.init(),
+        .frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        .freetype = try lu.Context.Freetype.init(),
     };
-    defer widget.freetype.deinit();
-    defer widget.arena.deinit();
+    defer ctx.freetype.deinit();
+    defer ctx.arena.deinit();
+    defer ctx.frame_arena.deinit();
 
-    widget.fonts[0] = try widget.freetype.createFont(
+    ctx.fonts[0] = try ctx.freetype.createFont(
         "/usr/share/fonts/TTF/IBMPlexSans-Regular.ttf",
         32,
     );
-    widget.fonts[1] = try widget.freetype.createFont(
+    ctx.fonts[1] = try ctx.freetype.createFont(
         "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
         32,
     );
-    widget.font_count = 2;
+    ctx.font_count = 2;
     defer {
-        for (0..widget.font_count) |i| {
-            widget.fonts[i].deinit();
+        for (0..ctx.font_count) |i| {
+            ctx.fonts[i].deinit();
         }
     }
 
@@ -82,111 +64,20 @@ pub fn main() !void {
         .decorated = true,
     });
     defer window.deinit();
+    window.plugCache(&ctx);
 
-    var root = lu.Element{
-        .size = .{ .w = 800, .h = 600 },
-        .pos = .{ .x = 0, .y = 0 },
-        .background = lu.Background.solid(lu.Color.fromU32(0x00000000)),
-        .layout = &root_layout,
-        .widget = &widget,
-        .events = lu.Widget.noEvents,
-    };
-
-    // Start with the root as the current parent. Nested containers push the
-    // widget onto their own layout with `start` and restore it with `end`.
-    root_layout.element = &root;
-    root_layout.start();
-
-    _ = try widget.label("Hello, World! adflahflajhlfhjkhdalvjnzn.dv,mneafhdpoapohzl;dfjkhalejkhlajkdhapdoifehwa---", .{
-        .border_radius = .all(4),
-        .background = .{ .base = .{ .solid = .red }, .effects = &.{} },
-    }, .{ .size = 28, .color = .white });
-    _ = try widget.label("\u{645}\u{631}\u{62D}\u{628}\u{627} \u{628}\u{644}\u{639}\u{627}\u{644}\u{645}", .{}, .{
-        .font_idx = 1,
-        .direction = .rtl,
-        .size = 28,
-    });
-
-    // Toolbar: a flexbox wrap row. It is a child of the root, so it is
-    // published while the root is the current parent; its buttons are built
-    // against `toolbar_layout`, and `end` restores the root as current.
-    var toolbar = lu.Element{
-        .size = .{ .w = 0, .h = 0 },
-        .pos = .{ .x = 0, .y = 0 },
-        .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
-        .layout = &toolbar_layout,
-        .widget = &widget,
-        .events = lu.Widget.noEvents,
-    };
-    // Stretch the toolbar across the window width (main is fixed), wrap the
-    // buttons, and let its height come from the wrapped content.
-    _ = widget.publishRequest(&toolbar, .{ .min_size = .{ .w = 0, .h = 0 }, .align_self = .stretch });
-    toolbar_layout.start();
-    const colors = [_]u32{ 0xFF5555FF, 0xFF55AAFF, 0xFF55FFAA, 0xFFAACCFF, 0xFFCCAAFF, 0xFFAA55FF, 0xFF55FFFF, 0xFFFFAA55 };
-    for (colors, 0..) |col, i| {
-        _ = try widget.button(
-            std.fmt.allocPrint(widget.arena.allocator(), "Button {d}", .{i + 1}) catch "Button",
-            .{},
-            .{ .color = lu.Color.fromU32(col) },
-        );
+    // Button labels are rebuilt every frame, so format them once into buffers
+    // that live for the whole app instead of leaking into the arena per frame.
+    var toolbar_labels: [toolbar_colors.len][32]u8 = undefined;
+    var toolbar_slices: [toolbar_colors.len][]const u8 = undefined;
+    for (0..toolbar_colors.len) |i| {
+        toolbar_slices[i] = try std.fmt.bufPrint(&toolbar_labels[i], "Button {d}", .{i + 1});
     }
-    toolbar_layout.end();
-
-    var button_field = lu.Element{
-        .size = .{ .w = 0, .h = 0 },
-        .pos = .{ .x = 0, .y = 0 },
-        .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
-        .layout = &button_field_layout,
-        .widget = &widget,
-        .events = lu.Widget.noEvents,
-    };
-    // Stretch across the window; each row fills the width, and the field's own
-    // height comes from however many rows the buttons wrap into.
-    _ = widget.publishRequest(&button_field, .{ .min_size = .{ .w = 0, .h = 0 }, .align_self = .stretch });
-    button_field_layout.start();
+    var item_labels: [32][16]u8 = undefined;
+    var item_slices: [32][]const u8 = undefined;
     for (0..32) |i| {
-        _ = try widget.button(
-            std.fmt.allocPrint(widget.arena.allocator(), "Item {d}", .{i + 1}) catch "Item",
-            .{},
-            .{
-                .min_size = .{ .w = 96, .h = 40 },
-                .max_size = .{ .w = 168, .h = 40 },
-                .grow = 1,
-                .color = lu.Color.fromU32(0x8844CCFF),
-            },
-        );
+        item_slices[i] = try std.fmt.bufPrint(&item_labels[i], "Item {d}", .{i + 1});
     }
-    button_field_layout.end();
-
-    // A content-sized grid of boxes nested inside the root.
-    _ = widget.box(.{ .w = 0, .h = 0 }, .{ .layout = &grid_layout });
-    grid_layout.start();
-    const tile_colors = [_]u32{ 0xEE3344, 0xEE8855, 0xEECC33, 0x66CC55, 0x3399EE, 0x7744CC, 0xCC3388, 0x4488AA };
-    for (tile_colors) |col| {
-        _ = widget.box(.{ .w = 40, .h = 40 }, .{
-            .background = .{ .base = .{ .solid = lu.Color.fromU32(col) }, .effects = &.{} },
-            .border_radius = .all(6),
-        });
-    }
-    grid_layout.end();
-
-    var slider_row = lu.Element{
-        .size = .{ .w = 0, .h = 0 },
-        .pos = .{ .x = 0, .y = 0 },
-        .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
-        .layout = &slider_row_layout,
-        .widget = &widget,
-        .events = lu.Widget.noEvents,
-    };
-    _ = widget.publishRequest(&slider_row, .{ .min_size = .{ .w = 0, .h = 0 } });
-    slider_row_layout.start();
-    _ = widget.checkbox(true, .{}, .{});
-    _ = widget.progress_bar(0.4, .{}, .{});
-    _ = widget.slider(0.66, .{}, .{});
-    slider_row_layout.end();
-
-    // Nothing is building any more; the window lays the tree out on render.
-    root_layout.end();
 
     var event: sdl.SDL_Event = undefined;
     while (true) {
@@ -199,6 +90,108 @@ pub fn main() !void {
                 else => {},
             }
         }
+
+        // Immediate mode: reclaim the element pool, rebuild the tree, render.
+        ctx.clear();
+
+        var root = lu.Element{
+            .size = .{ .w = 800, .h = 600 },
+            .pos = .{ .x = 0, .y = 0 },
+            .background = lu.Background.solid(lu.Color.fromU32(0x00000000)),
+            .layout = .{ .vtable = &lu.Layout.flex, .parent = null, .data = &root_cfg },
+            .ctx = &ctx,
+            .events = lu.Context.noEvents,
+        };
+
+        // Start with the root as the current parent. Nested containers push the
+        // widget onto their own layout with `start` and restore it with `end`.
+        root.layout.?.element = &root;
+        root.layout.?.start();
+
+        _ = try ctx.label("Hello, World! adflahflajhlfhjkhdalvjnzn.dv,mneafhdpoapohz;dfjkhalejkhlajkdhapdoifehwa---", .{
+            .border_radius = .all(4),
+            .background = .{ .base = .{ .solid = .red }, .effects = &.{} },
+        }, .{ .size = 28, .color = .white }, @src());
+        _ = try ctx.label("\u{645}\u{631}\u{62D}\u{628}\u{627} \u{628}\u{644}\u{639}\u{627}\u{644}\u{645}", .{}, .{
+            .font_idx = 1,
+            .direction = .rtl,
+            .size = 28,
+        }, @src());
+
+        // Toolbar: a flexbox wrap row. It is a child of the root, so it is
+        // published while the root is the current parent; its buttons are built
+        // against its own embedded layout, and `end` restores the root as current.
+        var toolbar = lu.Element{
+            .size = .{ .w = 0, .h = 0 },
+            .pos = .{ .x = 0, .y = 0 },
+            .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
+            .layout = .{ .vtable = &lu.Layout.flex, .parent = &root.layout.?, .data = &toolbar_cfg },
+            .ctx = &ctx,
+            .events = lu.Context.noEvents,
+        };
+        // Stretch the toolbar across the window width (main is fixed), wrap the
+        // buttons, and let its height come from the wrapped content.
+        _ = ctx.publishRequest(&toolbar, .{ .min_size = .{ .w = 0, .h = 0 }, .align_self = .stretch });
+        toolbar.layout.?.start();
+        for (toolbar_colors, 0..) |col, i| {
+            _ = try ctx.button(toolbar_slices[i], .{ .id_extra = i }, .{ .color = lu.Color.fromU32(col) }, @src());
+        }
+        toolbar.layout.?.end();
+
+        var button_field = lu.Element{
+            .size = .{ .w = 0, .h = 0 },
+            .pos = .{ .x = 0, .y = 0 },
+            .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
+            .layout = .{ .vtable = &lu.Layout.flex, .parent = &root.layout.?, .data = &button_field_cfg },
+            .ctx = &ctx,
+            .events = lu.Context.noEvents,
+        };
+        // Stretch across the window; each row fills the width, and the field's own
+        // height comes from however many rows the buttons wrap into.
+        _ = ctx.publishRequest(&button_field, .{ .min_size = .{ .w = 0, .h = 0 }, .align_self = .stretch });
+        button_field.layout.?.start();
+        for (item_slices, 0..) |label, i| {
+            _ = try ctx.button(label, .{ .id_extra = i }, .{
+                .min_size = .{ .w = 96, .h = 40 },
+                .max_size = .{ .w = 168, .h = 40 },
+                .grow = 1,
+                .color = lu.Color.fromU32(0x8844CCFF),
+            }, @src());
+        }
+        button_field.layout.?.end();
+
+        // A content-sized grid of boxes nested inside the root. The grid container
+        // is created through the widget pool so its embedded layout is stable.
+        const grid = ctx.box(.{ .w = 0, .h = 0 }, .{
+            .layout = .{ .vtable = &lu.Layout.grid, .parent = &root.layout.?, .data = &grid_cfg },
+        }, @src());
+        grid.layout.?.start();
+        for (tile_colors, 0..) |col, i| {
+            _ = ctx.box(.{ .w = 40, .h = 40 }, .{
+                .id_extra = i,
+                .background = .{ .base = .{ .solid = lu.Color.fromU32(col) }, .effects = &.{} },
+                .border_radius = .all(6),
+            }, @src());
+        }
+        grid.layout.?.end();
+
+        var slider_row = lu.Element{
+            .size = .{ .w = 0, .h = 0 },
+            .pos = .{ .x = 0, .y = 0 },
+            .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
+            .layout = .{ .vtable = &lu.Layout.flex, .parent = &root.layout.?, .data = &slider_row_cfg },
+            .ctx = &ctx,
+            .events = lu.Context.noEvents,
+        };
+        _ = ctx.publishRequest(&slider_row, .{ .min_size = .{ .w = 0, .h = 0 } });
+        slider_row.layout.?.start();
+        _ = ctx.checkbox(true, .{}, .{}, @src());
+        _ = ctx.progress_bar(0.4, .{}, .{}, @src());
+        _ = ctx.slider(0.66, .{}, .{}, @src());
+        slider_row.layout.?.end();
+
+        // Nothing is building any more; the window lays the tree out on render.
+        root.layout.?.end();
 
         _ = sdl.renderClear(window.renderer);
 

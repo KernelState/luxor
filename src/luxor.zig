@@ -8,10 +8,13 @@ pub const Window = if (options.sdl)
     @import("Window.zig")
 else
     @compileError("Window.zig does not exist");
-pub const Widget = if (options.widgets)
-    @import("Widget.zig")
+pub const Context = if (options.widgets)
+    @import("Context.zig")
 else
-    @compileError("widgets.zig does not exist");
+    @compileError("Context.zig does not exist");
+/// A fixed-buffer hash-map cache for memoizing expensive work (rasterized text,
+/// decoded images) keyed by a hash of its input.
+pub const Cache = @import("Cache.zig");
 /// Image decoding + caching (PNG/JPEG/WebP/SVG). `images` is the decode module;
 /// `Image` is the registered-texture reference type.
 pub const images = if (options.images)
@@ -227,6 +230,14 @@ pub const Background = struct {
         solid: Color,
         buffer: PixelBuffer,
         image_buffer: Buffer8,
+        /// A texture that the host Window owns and persists across frames, looked
+        /// up by the element's stable id. Avoids re-uploading (and for text,
+        /// re-rasterizing) the same element every frame.
+        cached: Cached,
+    };
+
+    pub const Cached = struct {
+        key: u64,
     };
 
     pub fn solid(c: Color) Background {
@@ -248,26 +259,48 @@ pub const Background = struct {
     pub fn imageBuffer(img: Buffer8) Background {
         return .{ .base = .{ .image_buffer = img }, .effects = &.{} };
     }
+
+    pub fn cached(key: u64) Background {
+        return .{ .base = .{ .cached = .{ .key = key } }, .effects = &.{} };
+    }
 };
 
 pub fn Hook(comptime T: type) type {
     return struct {
-        handle: ?Handle,
+        handle: ?Handle = null,
+        active: bool = false,
+
         const Self = @This();
         pub const Handle = union(enum) {
             fptrs: []Fn,
             pub const Fn = struct {
                 data: *anyopaque,
-                func: *const fn (*anyopaque, T) void,
+                func: *const fn (*anyopaque, T, bool) void,
             };
         };
-        pub fn run(self: *Self, data: T) void {
-            switch (self.handle) {
-                .fptrs => |ps| {
-                    for (ps) |p| p.func(p.data, data);
-                },
+
+        pub fn activate(self: *Self, data: T) void {
+            self.active = true;
+            if (self.handle) |h| {
+                switch (h) {
+                    .fptrs => |ps| {
+                        for (ps) |p| p.func(p.data, data, true);
+                    },
+                }
             }
         }
+
+        pub fn deactivate(self: *Self, data: T) void {
+            self.active = false;
+            if (self.handle) |h| {
+                switch (h) {
+                    .fptrs => |ps| {
+                        for (ps) |p| p.func(p.data, data, false);
+                    },
+                }
+            }
+        }
+
         pub fn isEnabled(self: *Self) bool {
             return blk: switch (self.handle) {
                 .fptrs => |ps| break :blk ps.len != 0,

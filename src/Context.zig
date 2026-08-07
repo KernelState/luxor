@@ -5,6 +5,7 @@
 /// just a simple collection of data that the widgets will use, you need only
 /// one of these per application, it's more like a piece of context.
 const std = @import("std");
+const builtin = @import("builtin");
 const lu = @import("luxor.zig");
 const c = @cImport({
     @cInclude("freetype2/freetype/freetype.h");
@@ -14,6 +15,12 @@ const c = @cImport({
 });
 
 arena: std.heap.ArenaAllocator,
+/// Per-frame scratch: text pixel buffers, shaping glyph arrays, and `TextConfig`
+/// structs created while the tree is rebuilt every frame. Reset to its base at
+/// the top of each frame (see `clear`), so a frame reuses the same backing
+/// memory instead of allocating fresh heaps forever. `arena` alone would grow
+/// without bound because the tree (and every label/button) is rebuilt each frame.
+frame_arena: std.heap.ArenaAllocator,
 freetype: Freetype,
 fonts: [10]Font = undefined,
 font_count: u8 = 0,
@@ -25,8 +32,62 @@ current: ?*lu.Layout = null,
 leaf_layout: lu.Layout = .{ .vtable = &lu.Layout.leaf, .parent = null },
 /// Memoizes decoded images across frames; buffers live in `arena`.
 image_cache: lu.images.Cache = .{},
+/// Memoizes rasterized label/button text across frames. Keyed by the element's
+/// stable id (call-site position + loop `id_extra`), never by the pixel bytes.
+/// A `TextEntry` stores the input fingerprint next to the buffer so a changed
+/// label re-rasterizes but a repeated one is reused. Buffers live in `arena`.
+text_cache: lu.Cache.Cache(u64, TextEntry, 65536) = .{},
+/// Optional GPU-side cache plugged in by a host Window (see
+/// `Window.plugCache`). When present, rasterized text and images are uploaded
+/// once to a persistent texture keyed by element id and never touch the CPU
+/// `text_cache`/`image_cache`. When null, Context caches CPU pixel buffers.
+gpu_cache: ?GpuCache = null,
 
-const Widget = @This();
+/// Static pool of `Element`s the builds allocate from. Layouts reference their
+/// children by pointer into this pool (never by value), so `Element` can embed
+/// a `Layout` by value without a size-recursion loop, and no element is ever
+/// heap-allocated. Reset by calling `clear()` at the top of each frame.
+pool: [PoolN]lu.Element = undefined,
+/// Next free slot in `pool`. Grows until `clear()` resets it.
+plen: usize = 0,
+
+/// Maximum elements a widget can build before the pool must be cleared. The
+/// example's screen (dozens of boxes, buttons and labels) fits comfortably.
+pub const PoolN = 512;
+
+/// A Window-provided uploader for persistent per-element textures. The cache
+/// is looked up *before* Context decides to cache on CPU: if `lookup` returns a
+/// key the pixels are already on the GPU for that fingerprint, so nothing is
+/// re-rasterized; if not, `upload` receives freshly rasterized pixels and the
+/// Window stores them under the returned key.
+pub const GpuCache = struct {
+    ptr: *anyopaque,
+    /// Returns the cached texture key if `key`'s pixels match `fingerprint`.
+    lookup: *const fn (ptr: *anyopaque, key: u64, fingerprint: u64) ?u64,
+    /// Uploads `buf` for `key`/`fingerprint`, returning the key to reference.
+    upload: *const fn (ptr: *anyopaque, key: u64, fingerprint: u64, buf: lu.PixelBuffer) ?u64,
+};
+
+const Context = @This();
+
+/// Returns the next free element slot. Elements live in the pool so their
+/// addresses stay stable while layouts hold pointers to them. Raise `PoolN` if
+/// a frame ever needs more elements than the pool holds.
+pub fn allocElement(self: *Context) *lu.Element {
+    if (self.plen == self.pool.len) {
+        @panic("element pool full: call Context.clear() between frames or raise PoolN");
+    }
+    const e = &self.pool[self.plen];
+    self.plen += 1;
+    return e;
+}
+
+/// Reset the element pool and frame scratch for a fresh frame. Old element
+/// pointers must not be used afterwards; layouts are rebuilt every frame anyway.
+pub fn clear(self: *Context) void {
+    self.plen = 0;
+    _ = self.frame_arena.reset(.retain_capacity);
+}
 
 /// A fully-wired, inert set of events used by every generated element. Widgets
 /// are immediate mode: the caller receives the element and can attach hooks.
@@ -43,15 +104,15 @@ pub const noEvents = lu.Element.Events{
 /// The bare element every widget starts from: transparent background, leaf
 /// layout, no events, not focusable. Widgets build on top of this, set their
 /// contents, then apply the user's `Overrides` last.
-fn base(self: *Widget, size: lu.Rect) lu.Element {
+fn base(self: *Context, size: lu.Rect) lu.Element {
     return .{
         .size = size,
         .pos = .{ .x = 0, .y = 0 },
         .border_radius = .all(0),
         .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
-        .layout = &self.leaf_layout,
+        .layout = self.leaf_layout,
         .events = noEvents,
-        .widget = self,
+        .ctx = self,
         .focusable = false,
     };
 }
@@ -60,29 +121,30 @@ fn base(self: *Widget, size: lu.Rect) lu.Element {
 /// layout's `start`) and places `e` there. Returns the request id the element
 /// got, or null when there is no current parent. This is the only place a
 /// widget talks to a layout.
-fn publish(self: *Widget, e: *const lu.Element) ?u32 {
+fn publish(self: *Context, e: *lu.Element) ?u32 {
     return self.publishRequest(e, .{ .min_size = e.size, .pos = e.pos, .margin = e.margin });
 }
 
 /// Like `publish`, but with a hand-written `Request` so callers control
-/// `min_size`/`max_size`, growth and alignment for the element.
-pub fn publishRequest(self: *Widget, e: *const lu.Element, req: lu.Layout.Request) ?u32 {
+/// `min_size`/`max_size`, growth and alignment for the element. `e` must live
+/// in the element pool so the parent's request can hold a stable pointer.
+pub fn publishRequest(self: *Context, e: *lu.Element, req: lu.Layout.Request) ?u32 {
     const parent = self.current orelse return null;
     const id = parent.request(req);
-    parent.addElement(id, e.*);
+    parent.addElement(id, e);
     return id;
 }
 
-fn makeAbsolute(self: *Widget) *lu.Layout {
-    const layout = self.arena.allocator().create(lu.Layout) catch unreachable;
-    layout.* = .{ .vtable = &lu.Layout.absolute, .parent = self.current };
-    return layout;
+/// An absolute layout value for a child that composes its own children
+/// (progress bar fill, slider fill/knob). Embedded by value in the element's
+/// `.layout`; `parent` is the current parent so `end` restores it.
+fn makeAbsolute(self: *Context) lu.Layout {
+    return .{ .vtable = &lu.Layout.absolute, .parent = self.current };
 }
 
-fn makeMono(self: *Widget, pad: lu.Sides) *lu.Layout {
-    const layout = self.arena.allocator().create(lu.Layout) catch unreachable;
-    layout.* = .{ .vtable = &lu.Layout.mono, .parent = self.current, .padding = pad };
-    return layout;
+/// A mono layout value for centering a single child (button label).
+fn makeMono(self: *Context, pad: lu.Sides) lu.Layout {
+    return .{ .vtable = &lu.Layout.mono, .parent = self.current, .padding = pad };
 }
 
 pub const Freetype = struct {
@@ -369,8 +431,7 @@ pub const Font = struct {
 /// Configuration for a `text` layout. Holds the font, the string and how to
 /// draw it; the layout reads it during `lay`, so rendering is deferred until
 /// the label has been given its box.
-pub const TextConfig = struct {
-    font: *Font,
+pub const TextConfig = struct {    font: *Font,
     text: []const u8,
     /// Pixel size of the font.
     size: u32 = 24,
@@ -394,6 +455,32 @@ pub const TextConfig = struct {
 /// lines), then sets the element's `.background` to that bitmap. This is like
 /// `mono` but defers rendering until layout time, so the text can adapt.
 pub const textVTable = lu.Layout.VTable{ .lay = textLay, .content = textContent };
+
+/// A cached text fragment: the input fingerprint (hash of the string + every
+/// setting that changes the raster) plus the resulting pixel buffer. The
+/// fingerprint is compared on a cache hit so a changed label is re-rasterized.
+pub const TextEntry = struct {
+    fingerprint: u64,
+    buffer: lu.PixelBuffer,
+};
+
+/// A stable id derived from a call site's `@src()` (file:line:column). The tree
+/// is rebuilt every frame, so the same source position yields the same id;
+/// caches key on this instead of re-hashing each frame.
+pub fn idOf(comptime src: std.builtin.SourceLocation) u64 {
+    var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
+    h.update(src.file);
+    h.update(std.mem.asBytes(&src.line));
+    h.update(std.mem.asBytes(&src.column));
+    return h.final();
+}
+
+/// The combined cache key for an element: its source-id plus the loop
+/// `id_extra`. Two wrappers in the same loop body share the same `id` but have
+/// different id_extra, so each distinct instance gets its own cache entry.
+pub fn cacheKey(id: u64, extra: u64) u64 {
+    return id ^ (extra *% 0x9e3779b97f4a7c15);
+}
 
 fn textCfg(layout: *const lu.Layout) ?*const TextConfig {
     return @ptrCast(@alignCast(layout.data orelse return null));
@@ -450,8 +537,8 @@ fn wrapLines(
 /// height the wrapped lines need (the expansion axis).
 fn textContent(layout: *const lu.Layout, avail: lu.Rect) ?lu.Rect {
     const cfg = textCfg(layout) orelse return null;
-    const widget = (layout.element orelse return null).widget orelse return null;
-    const alloc = widget.arena.allocator();
+    const ctx = (layout.element orelse return null).ctx orelse return null;
+    const alloc = ctx.frame_arena.allocator();
     const natural = cfg.font.textSize(alloc, cfg.text, cfg.size, cfg.direction, cfg.weight) catch return null;
     if (!cfg.wrap) return natural;
     if (avail.w == 0 or natural.w <= avail.w) return natural;
@@ -460,27 +547,109 @@ fn textContent(layout: *const lu.Layout, avail: lu.Rect) ?lu.Rect {
     return .{ .w = avail.w, .h = lines * line_h };
 }
 
+/// Rasterizes `text` and returns the element's background for it. It looks for
+/// a plugged-in GPU cache *first*: if the Window can serve (or upload) the
+/// pixels under the element's id, the result is a persistent `Background.cached`
+/// texture and no CPU buffer survives the frame. Only when no GPU cache is
+/// plugged (or it declines) does the CPU `text_cache` store the pixel buffer.
+fn renderTextCached(self: *Context, fnSelf: *Font, text: []const u8, area: lu.Rect, spacing: lu.Rect, size: u32, direction: Font.Direction, color: lu.Color, render: Font.RenderOpts, wrap: ?u32, weight: u16, eid: u64, extra: u64) !lu.Background {
+    const key = cacheKey(eid, extra);
+    const fingerprint = textLayKey(fnSelf, text, area, spacing, size, direction, color, render, wrap, weight);
+    if (self.gpu_cache) |gc| {
+        if (gc.lookup(gc.ptr, key, fingerprint) != null)
+            return lu.Background.cached(key);
+        // Miss on the GPU: rasterize transiently and let the Window upload.
+        const buf = try fnSelf.renderText(
+            self.frame_arena.allocator(),
+            text,
+            area,
+            spacing,
+            size,
+            direction,
+            color,
+            render,
+            .{ .x = 0, .y = 0 },
+            wrap,
+            weight,
+        );
+        if (gc.upload(gc.ptr, key, fingerprint, buf) != null)
+            return lu.Background.cached(key);
+        // The Window declined the upload; fall through to CPU.
+    }
+    if (self.text_cache.get(key)) |entry| {
+        if (entry.fingerprint == fingerprint) return lu.Background.buffer(entry.buffer);
+    }
+    const buf = try fnSelf.renderText(
+        self.arena.allocator(),
+        text,
+        area,
+        spacing,
+        size,
+        direction,
+        color,
+        render,
+        .{ .x = 0, .y = 0 },
+        wrap,
+        weight,
+    );
+    self.text_cache.put(key, .{ .fingerprint = fingerprint, .buffer = buf });
+    return lu.Background.buffer(buf);
+}
+
+/// Hash of every input that changes the raster of `renderText`. The text bytes
+/// and the compact settings — never pixel data.
+fn textLayKey(
+    font: *Font,
+    text: []const u8,
+    area: lu.Rect,
+    spacing: lu.Rect,
+    size: u32,
+    direction: Font.Direction,
+    color: lu.Color,
+    render: Font.RenderOpts,
+    wrap: ?u32,
+    weight: u16,
+) u64 {
+    var h = std.hash.Wyhash.init(0x51a7e15);
+    h.update(std.mem.asBytes(&@intFromPtr(font)));
+    h.update(text);
+    h.update(std.mem.asBytes(&area.w));
+    h.update(std.mem.asBytes(&area.h));
+    h.update(std.mem.asBytes(&spacing.w));
+    h.update(std.mem.asBytes(&spacing.h));
+    h.update(std.mem.asBytes(&size));
+    h.update(std.mem.asBytes(&direction));
+    h.update(std.mem.asBytes(&color));
+    h.update(std.mem.asBytes(&render.overflow_w));
+    h.update(std.mem.asBytes(&render.overflow_h));
+    const w: u32 = wrap orelse 0;
+    h.update(std.mem.asBytes(&w));
+    h.update(std.mem.asBytes(&weight));
+    return h.final();
+}
+
 /// Renders the text into a bitmap child element and centers it in the box the
 /// element was given (mono behavior). The element itself keeps its own
 /// `background`/`border`/settings; only the child carries the text image.
 /// This is where the string is actually turned into a bitmap.
 fn textLay(layout: *lu.Layout) void {
     const el = layout.element orelse return;
-    const widget = el.widget orelse return;
+    const ctx = el.ctx orelse return;
     const cfg = textCfg(layout) orelse return;
-    const alloc = widget.arena.allocator();
+    const alloc = ctx.frame_arena.allocator();
     const box_w = layout.container.w;
     const box_h = layout.container.h;
 
     const nat = cfg.font.textSize(alloc, cfg.text, cfg.size, cfg.direction, cfg.weight) catch return;
     var block_h: u32 = nat.h;
+    const wrap_w: ?u32 = if (cfg.wrap and box_w > 0) box_w else null;
     if (cfg.wrap and box_w > 0 and nat.w > box_w) {
         const lines = wrapLines(cfg.font, alloc, cfg.text, cfg.size, cfg.direction, cfg.spacing, box_w, cfg.weight) catch block_h;
         const line_h: u32 = cfg.font.pixel_size + cfg.spacing.h;
         block_h = lines * line_h;
     }
-    const buf = cfg.font.renderText(
-        alloc,
+    const bg = ctx.renderTextCached(
+        cfg.font,
         cfg.text,
         .{ .w = box_w, .h = block_h },
         cfg.spacing,
@@ -488,22 +657,26 @@ fn textLay(layout: *lu.Layout) void {
         cfg.direction,
         cfg.color,
         cfg.render,
-        .{ .x = 0, .y = 0 },
-        if (cfg.wrap and box_w > 0) box_w else null,
+        wrap_w,
         cfg.weight,
+        el.id,
+        el.id_extra,
     ) catch return;
 
-    const child = lu.Element{
+    const child = ctx.allocElement();
+    child.* = .{
         .size = .{ .w = box_w, .h = block_h },
         .pos = .{
             .x = 0,
             .y = @divTrunc(box_h -| block_h, 2),
         },
-        .background = lu.Background.buffer(buf),
-        .layout = &widget.leaf_layout,
-        .widget = widget,
+        .background = bg,
+        .layout = ctx.leaf_layout,
+        .ctx = ctx,
         .events = noEvents,
         .focusable = false,
+        .id = el.id,
+        .id_extra = el.id_extra,
     };
     layout.children[0] = child;
     layout.cindex = 1;
@@ -512,8 +685,8 @@ fn textLay(layout: *lu.Layout) void {
 /// A box of text, padded and centered inside its own box. The text is not
 /// rasterized here: the `text` layout renders it when the box is laid out,
 /// so it can wrap to the width it is actually given.
-pub fn label(self: *Widget, text: []const u8, overrides: lu.Element.Overrides, opts: LabelOpts) !lu.Element {
-    const cfg = self.arena.allocator().create(TextConfig) catch unreachable;
+pub fn label(self: *Context, text: []const u8, overrides: lu.Element.Overrides, opts: LabelOpts, comptime src: std.builtin.SourceLocation) !*lu.Element {
+    const cfg = self.frame_arena.allocator().create(TextConfig) catch unreachable;
     cfg.* = .{
         .font = &self.fonts[opts.font_idx],
         .text = text,
@@ -525,8 +698,10 @@ pub fn label(self: *Widget, text: []const u8, overrides: lu.Element.Overrides, o
         .wrap = opts.wrap,
         .weight = opts.weight,
     };
-    const natural = try self.fonts[opts.font_idx].textSize(self.arena.allocator(), text, opts.size, opts.direction, opts.weight);
-    var e = self.base(.{ .w = 0, .h = 0 });
+    const natural = try self.fonts[opts.font_idx].textSize(self.frame_arena.allocator(), text, opts.size, opts.direction, opts.weight);
+    const e = self.allocElement();
+    e.* = self.base(.{ .w = 0, .h = 0 });
+    e.id = idOf(src);
     e.override(overrides);
     const border = e.border;
     const pad = opts.padding;
@@ -534,10 +709,8 @@ pub fn label(self: *Widget, text: []const u8, overrides: lu.Element.Overrides, o
         .w = natural.w + pad.left + pad.right + border.left + border.right,
         .h = natural.h + pad.top + pad.bottom + border.top + border.bottom,
     };
-    const layout = self.arena.allocator().create(lu.Layout) catch unreachable;
-    layout.* = .{ .vtable = &textVTable, .parent = self.current, .padding = pad, .data = @ptrCast(cfg) };
-    e.layout = layout;
-    _ = self.publish(&e);
+    e.layout = .{ .vtable = &textVTable, .parent = self.current, .padding = pad, .data = @ptrCast(cfg) };
+    _ = self.publish(e);
     return e;
 }
 
@@ -549,11 +722,14 @@ pub fn label(self: *Widget, text: []const u8, overrides: lu.Element.Overrides, o
 /// Nothing holds state: the caller owns the returned element and re-creates it
 /// every time the tree is rebuilt.
 /// The simplest widget: requests `size` from the current parent's layout,
-/// applies `overrides`, and returns a plain element. No contents, no opts.
-pub fn box(self: *Widget, size: lu.Rect, overrides: lu.Element.Overrides) lu.Element {
-    var e = self.base(size);
+/// applies `overrides`, and returns a plain element. No contents, no opts. The
+/// element is owned by the widget's pool (stable address, no heap).
+pub fn box(self: *Context, size: lu.Rect, overrides: lu.Element.Overrides, comptime src: std.builtin.SourceLocation) *lu.Element {
+    const e = self.allocElement();
+    e.* = self.base(size);
+    e.id = idOf(src);
     e.override(overrides);
-    _ = self.publish(&e);
+    _ = self.publish(e);
     return e;
 }
 
@@ -584,12 +760,14 @@ pub const LabelOpts = struct {
 };
 
 /// Renders `text` into a leaf element (a pixel-buffer background). Used by
-/// `label` and reused by anything that puts text in a box (`button`).
-fn textElement(self: *Widget, text: []const u8, opts: LabelOpts) !lu.Element {
+/// `label` and reused by anything that puts text in a box (`button`). The leaf
+/// reuses the parent element's id so its cached texture keys match the element
+/// that owns the text.
+fn textElement(self: *Context, text: []const u8, opts: LabelOpts, eid: u64, extra: u64) !*lu.Element {
     const font = &self.fonts[opts.font_idx];
-    const text_size = try font.textSize(self.arena.allocator(), text, opts.size, opts.direction, opts.weight);
-    const pixel_buf = try font.renderText(
-        self.arena.allocator(),
+    const text_size = try font.textSize(self.frame_arena.allocator(), text, opts.size, opts.direction, opts.weight);
+    const bg = try self.renderTextCached(
+        font,
         text,
         text_size,
         opts.spacing,
@@ -597,19 +775,24 @@ fn textElement(self: *Widget, text: []const u8, opts: LabelOpts) !lu.Element {
         opts.direction,
         opts.color,
         opts.render,
-        .{ .x = 0, .y = 0 },
         null,
         opts.weight,
+        eid,
+        extra,
     );
-    return .{
+    const e = self.allocElement();
+    e.* = .{
         .size = text_size,
         .pos = .{ .x = 0, .y = 0 },
-        .background = lu.Background.buffer(pixel_buf),
-        .layout = &self.leaf_layout,
+        .background = bg,
+        .layout = self.leaf_layout,
         .focusable = false,
-        .widget = self,
+        .ctx = self,
         .events = noEvents,
+        .id = eid,
+        .id_extra = extra,
     };
+    return e;
 }
 
 /// Fine-tunable knobs for buttons.
@@ -627,10 +810,13 @@ pub const ButtonOpts = struct {
 };
 
 /// A tappable box with a centered label.
-pub fn button(self: *Widget, text: []const u8, overrides: lu.Element.Overrides, opts: ButtonOpts) !lu.Element {
-    const inner = try self.textElement(text, opts.label);
+pub fn button(self: *Context, text: []const u8, overrides: lu.Element.Overrides, opts: ButtonOpts, comptime src: std.builtin.SourceLocation) !*lu.Element {
+    const eid = idOf(src);
+    const inner = try self.textElement(text, opts.label, eid, overrides.id_extra orelse 0);
     const pad = opts.padding;
-    var e = self.base(.{ .w = 0, .h = 0 });
+    const e = self.allocElement();
+    e.* = self.base(.{ .w = 0, .h = 0 });
+    e.id = eid;
     e.background = lu.Background.solid(opts.color);
     e.border_radius = opts.radius;
     e.override(overrides);
@@ -640,9 +826,9 @@ pub fn button(self: *Widget, text: []const u8, overrides: lu.Element.Overrides, 
         .h = inner.size.h + pad.top + pad.bottom + border.top + border.bottom,
     };
     e.layout = self.makeMono(pad);
-    const inner_id = e.layout.request(.{ .min_size = inner.size, .pos = .{ .x = 0, .y = 0 } });
-    e.layout.addElement(inner_id, inner);
-    _ = self.publishRequest(&e, .{
+    const inner_id = e.layout.?.request(.{ .min_size = inner.size, .pos = .{ .x = 0, .y = 0 } });
+    e.layout.?.addElement(inner_id, inner);
+    _ = self.publishRequest(e, .{
         .min_size = opts.min_size orelse e.size,
         .pos = e.pos,
         .margin = e.margin,
@@ -665,14 +851,16 @@ pub const CheckboxOpts = struct {
 
 /// A box that reports whether it is checked. Immediate mode: the caller owns
 /// the boolean and rebuilds the widget when it changes.
-pub fn checkbox(self: *Widget, checked: bool, overrides: lu.Element.Overrides, opts: CheckboxOpts) lu.Element {
-    var e = self.base(opts.size);
+pub fn checkbox(self: *Context, checked: bool, overrides: lu.Element.Overrides, opts: CheckboxOpts, comptime src: std.builtin.SourceLocation) *lu.Element {
+    const e = self.allocElement();
+    e.* = self.base(opts.size);
+    e.id = idOf(src);
     e.border = opts.border;
     e.border_color = .{ .color = opts.border_color };
     e.border_radius = opts.radius;
     if (checked) e.background = lu.Background.solid(opts.checked_color);
     e.override(overrides);
-    _ = self.publish(&e);
+    _ = self.publish(e);
     return e;
 }
 
@@ -687,28 +875,31 @@ pub const ProgressBarOpts = struct {
 /// A track with a fill that reflects `value` (clamped to 0.0-1.0). The fill is
 /// a child element sized `value` wide, so rounding/effects on the fill remain
 /// independent from the track.
-pub fn progress_bar(self: *Widget, value: f32, overrides: lu.Element.Overrides, opts: ProgressBarOpts) lu.Element {
+pub fn progress_bar(self: *Context, value: f32, overrides: lu.Element.Overrides, opts: ProgressBarOpts, comptime src: std.builtin.SourceLocation) *lu.Element {
     const v = std.math.clamp(value, 0.0, 1.0);
-    var e = self.base(opts.size);
+    const e = self.allocElement();
+    e.* = self.base(opts.size);
+    e.id = idOf(src);
     e.background = lu.Background.solid(opts.track_color);
     e.border_radius = opts.radius;
     e.layout = self.makeAbsolute();
 
     const fill_w: u32 = @intFromFloat(@as(f32, @floatFromInt(opts.size.w)) * v);
     if (fill_w > 0) {
-        var fill = self.base(.{ .w = fill_w, .h = opts.size.h });
+        const fill = self.allocElement();
+        fill.* = self.base(.{ .w = fill_w, .h = opts.size.h });
         fill.background = lu.Background.solid(opts.fill_color);
         const r = opts.radius;
         fill.border_radius = if (fill_w >= opts.size.w)
             r
         else
             .{ .top_left = r.top_left, .bottom_left = r.bottom_left, .top_right = 0, .bottom_right = 0 };
-        const fill_id = e.layout.request(.{ .min_size = fill.size, .pos = .{ .x = 0, .y = 0 } });
-        e.layout.addElement(fill_id, fill);
+        const fill_id = e.layout.?.request(.{ .min_size = fill.size, .pos = .{ .x = 0, .y = 0 } });
+        e.layout.?.addElement(fill_id, fill);
     }
 
     e.override(overrides);
-    _ = self.publish(&e);
+    _ = self.publish(e);
     return e;
 }
 
@@ -726,38 +917,42 @@ pub const SliderOpts = struct {
 /// A track + fill + knob that reflect `value` (clamped to 0.0-1.0). The knob
 /// travels the width of the track; keep `knob_size` <= the track height so it
 /// is not clipped to the track's box.
-pub fn slider(self: *Widget, value: f32, overrides: lu.Element.Overrides, opts: SliderOpts) lu.Element {
+pub fn slider(self: *Context, value: f32, overrides: lu.Element.Overrides, opts: SliderOpts, comptime src: std.builtin.SourceLocation) *lu.Element {
     const v = std.math.clamp(value, 0.0, 1.0);
-    var e = self.base(opts.size);
+    const e = self.allocElement();
+    e.* = self.base(opts.size);
+    e.id = idOf(src);
     e.background = lu.Background.solid(opts.track_color);
     e.border_radius = opts.radius;
     e.layout = self.makeAbsolute();
 
     const fill_w: u32 = @intFromFloat(@as(f32, @floatFromInt(opts.size.w)) * v);
     if (fill_w > 0) {
-        var fill = self.base(.{ .w = fill_w, .h = opts.size.h });
+        const fill = self.allocElement();
+        fill.* = self.base(.{ .w = fill_w, .h = opts.size.h });
         fill.background = lu.Background.solid(opts.fill_color);
         const r = opts.radius;
         fill.border_radius = if (fill_w >= opts.size.w)
             r
         else
             .{ .top_left = r.top_left, .bottom_left = r.bottom_left, .top_right = 0, .bottom_right = 0 };
-        const fill_id = e.layout.request(.{ .min_size = fill.size, .pos = .{ .x = 0, .y = 0 } });
-        e.layout.addElement(fill_id, fill);
+        const fill_id = e.layout.?.request(.{ .min_size = fill.size, .pos = .{ .x = 0, .y = 0 } });
+        e.layout.?.addElement(fill_id, fill);
     }
 
     const knob_size = if (opts.knob_size == 0) opts.size.h else opts.knob_size;
     const travel = opts.size.w -| knob_size;
     const kx: u32 = @intFromFloat(@as(f32, @floatFromInt(travel)) * v);
     const ky = (opts.size.h -| knob_size) / 2;
-    var knob = self.base(.{ .w = knob_size, .h = knob_size });
+    const knob = self.allocElement();
+    knob.* = self.base(.{ .w = knob_size, .h = knob_size });
     knob.background = lu.Background.solid(opts.knob_color);
     knob.border_radius = .all(knob_size / 2);
-    const knob_id = e.layout.request(.{ .min_size = knob.size, .pos = .{ .x = kx, .y = ky } });
-    e.layout.addElement(knob_id, knob);
+    const knob_id = e.layout.?.request(.{ .min_size = knob.size, .pos = .{ .x = kx, .y = ky } });
+    e.layout.?.addElement(knob_id, knob);
 
     e.override(overrides);
-    _ = self.publish(&e);
+    _ = self.publish(e);
     return e;
 }
 
@@ -778,14 +973,16 @@ pub const ImageOpts = struct {
 /// Decodes `source` (once, cached) and shows it in a box the size of the
 /// decoded image (or the `overrides.size`). SVG is rasterized at the size
 /// requested through `opts`.
-pub fn image(self: *Widget, source: lu.ImageSource, overrides: lu.Element.Overrides, opts: ImageOpts) !lu.Element {
+pub fn image(self: *Context, source: lu.ImageSource, overrides: lu.Element.Overrides, opts: ImageOpts, comptime src: std.builtin.SourceLocation) !*lu.Element {
     const decoded = try self.image_cache.decode(self.arena.allocator(), source, .{
         .svg_width = opts.svg_width,
         .svg_height = opts.svg_height,
         .scale = opts.svg_scale,
     });
     const natural = lu.Rect{ .w = decoded.width, .h = decoded.height };
-    var e = self.base(natural);
+    const e = self.allocElement();
+    e.* = self.base(natural);
+    e.id = idOf(src);
     e.background = lu.Background.imageBuffer(.{
         .buffer = .{
             .pixels = decoded.pixels,
@@ -796,6 +993,6 @@ pub fn image(self: *Widget, source: lu.ImageSource, overrides: lu.Element.Overri
         .filter = opts.filter,
     });
     e.override(overrides);
-    _ = self.publish(&e);
+    _ = self.publish(e);
     return e;
 }

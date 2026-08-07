@@ -15,6 +15,11 @@ clip_stack: [max_clips]lu.Area = undefined,
 tindex: usize = 0,
 /// Current index in `clip_stack`
 cindex: usize = 0,
+/// Persistent per-element-id textures (created/uploaded via `plugCache`). The
+/// Window owns these and destroys them in `deinit`. Falls back to CPU
+/// rasterized `Background.buffer` in Context when a draw needs a texture that
+/// is not here.
+gpu_cache: lu.Cache.Cache(u64, GpuEntry, 65536) = .{},
 
 const max_textures = 1024;
 const max_clips = 64;
@@ -85,6 +90,14 @@ pub const Texture = struct {
     };
 };
 
+/// An entry in the Window's persistent per-element texture cache.
+const GpuEntry = struct {
+    texture: *sdl.SDL_Texture,
+    /// Hash of the input that produced `texture`; a match means the texture is
+    /// still current and no re-upload (or re-rasterize) is needed.
+    fingerprint: u64,
+};
+
 pub fn init(config: Config) !Window {
     var flags: u32 = 0;
     if (config.resizable)
@@ -122,6 +135,10 @@ pub fn deinit(self: *Window) void {
     for (self.textures[0..self.tindex]) |t| {
         sdl.destroyTexture(t.texture);
     }
+    var it = self.gpu_cache.iterator();
+    while (it.next()) |entry| {
+        sdl.destroyTexture(entry.value_ptr.texture);
+    }
     sdl.destroyRenderer(self.renderer);
     sdl.destroyWindow(self.window);
 }
@@ -145,6 +162,41 @@ pub fn addTexture(self: *Window, tex: *sdl.SDL_Texture) !usize {
 pub fn texture(self: *Window, id: usize) ?*sdl.SDL_Texture {
     if (id >= self.tindex) return null;
     return self.textures[id].texture;
+}
+
+/// Hands this Window's persistent texture cache to `ctx`, so rasterized text
+/// and images upload once per element id instead of on every frame. Call once
+/// after the Window (and the Context) exist, before building widgets.
+pub fn plugCache(self: *Window, ctx: *lu.Context) void {
+    ctx.gpu_cache = .{
+        .ptr = self,
+        .lookup = &lookupCached,
+        .upload = &uploadCached,
+    };
+}
+
+fn lookupCached(ptr: *anyopaque, key: u64, fingerprint: u64) ?u64 {
+    const self: *Window = @ptrCast(@alignCast(ptr));
+    const entry = self.gpu_cache.get(key) orelse return null;
+    if (entry.fingerprint != fingerprint) return null;
+    return key;
+}
+
+fn uploadCached(ptr: *anyopaque, key: u64, fingerprint: u64, pb: lu.PixelBuffer) ?u64 {
+    const self: *Window = @ptrCast(@alignCast(ptr));
+    if (pb.pixels.len == 0 or pb.width == 0 or pb.height == 0) return null;
+    const tex = sdl.createTexture(
+        self.renderer,
+        sdl.pixels.SDL_PIXELFORMAT_ABGR8888,
+        sdl.SDL_TEXTUREACCESS_STREAMING,
+        @intCast(pb.width),
+        @intCast(pb.height),
+    ) orelse return null;
+    _ = sdl.setTextureBlendMode(tex, sdl.SDL_BLENDMODE_BLEND);
+    _ = sdl.updateTexture(tex, null, @ptrCast(pb.pixels.ptr), @intCast(pb.width * 4));
+    if (self.gpu_cache.get(key)) |old| sdl.destroyTexture(old.texture);
+    self.gpu_cache.put(key, .{ .texture = tex, .fingerprint = fingerprint });
+    return key;
 }
 
 pub fn pushClip(self: *Window, area: lu.Area) void {
@@ -187,9 +239,10 @@ pub fn render(self: *Window, root: *lu.Element) void {
     // and let the layout tree size and position every descendant.
     root.size = self.size;
     root.pos = .{ .x = 0, .y = 0 };
-    root.layout.element = root;
-    _ = root.layout.lay();
-    self.drawElement(root.*, .{ .pos = root.pos, .size = root.size });
+    const root_layout = &(root.layout orelse return);
+    root_layout.element = root;
+    _ = root_layout.lay();
+    self.drawElement(root, .{ .pos = root.pos, .size = root.size });
 }
 
 /// The current window state as `Overrides`, so a rebuilt root element tracks
@@ -205,7 +258,7 @@ pub fn overrides(self: *Window) lu.Element.Overrides {
     return .{ .size = self.size };
 }
 
-fn drawElement(self: *Window, e: lu.Element, area: lu.Area) void {
+fn drawElement(self: *Window, e: *lu.Element, area: lu.Area) void {
     self.pushClip(area);
     defer self.popClip();
 
@@ -218,7 +271,8 @@ fn drawElement(self: *Window, e: lu.Element, area: lu.Area) void {
 
     // Children were sized and positioned by the top-down `lay` pass; their
     // `.pos`/`.size` are already final (world space), so draw them as-is.
-    const layout = e.layout;
+    const layout = &(e.layout orelse return);
+    if (layout.cindex == 0) return;
     for (0..layout.cindex) |i| {
         const child = layout.children[i];
         self.drawElement(child, .{ .pos = child.pos, .size = child.size });
@@ -226,7 +280,7 @@ fn drawElement(self: *Window, e: lu.Element, area: lu.Area) void {
 }
 
 /// The usable box of an element after removing its border and padding.
-fn contentArea(e: lu.Element, area: lu.Area) lu.Area {
+fn contentArea(e: *const lu.Element, area: lu.Area) lu.Area {
     const b = e.border;
     const p = e.padding;
     return .{
@@ -241,7 +295,7 @@ fn contentArea(e: lu.Element, area: lu.Area) lu.Area {
     };
 }
 
-fn drawBackground(self: *Window, e: lu.Element, area: lu.Area) void {
+fn drawBackground(self: *Window, e: *lu.Element, area: lu.Area) void {
     const alpha = totalOpacity(e.effects) * totalOpacity(e.background.effects);
     if (hasBlur(e.background.effects))
         self.drawBlurBackdrop(area, e.border_radius, alpha, e.background.effects);
@@ -253,10 +307,23 @@ fn drawBackground(self: *Window, e: lu.Element, area: lu.Area) void {
         .gradient => |g| self.drawGradientBackground(g, area, e.border_radius, alpha),
         .buffer => |pb| self.drawBufferBackground(pb, area, e.border_radius, alpha),
         .image_buffer => |b| self.drawBufferFitBackground(b, area, e.border_radius, alpha),
+        .cached => |c| self.drawCachedBackground(c.key, area, e.border_radius, alpha),
     }
 }
 
-fn drawBorder(self: *Window, e: lu.Element, area: lu.Area) void {
+/// Draws a persistent per-element texture, uploading it from CPU pixels the
+/// first time it is seen (the element's first frame) and reusing the texture
+/// every frame after.
+fn drawCachedBackground(self: *Window, key: u64, area: lu.Area, radius: lu.Corners, alpha: f32) void {
+    const entry = self.gpu_cache.get(key) orelse return;
+    var tex_w: f32 = 0;
+    var tex_h: f32 = 0;
+    _ = sdl.textureSize(entry.texture, &tex_w, &tex_h);
+    const src = sdl.SDL_FRect{ .x = 0, .y = 0, .w = tex_w, .h = tex_h };
+    self.renderMasked(area, radius, entry.texture, src, null, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = alpha });
+}
+
+fn drawBorder(self: *Window, e: *lu.Element, area: lu.Area) void {
     const b = e.border;
     if (b.top == 0 and b.bottom == 0 and b.left == 0 and b.right == 0)
         return;
@@ -293,7 +360,7 @@ fn drawBorder(self: *Window, e: lu.Element, area: lu.Area) void {
                     self.fillRoundedRect(area, e.border_radius, color);
                     self.fillRoundedRect(inner, e.border_radius, tint(tint(bg, e.effects), e.background.effects));
                 },
-                .image, .gradient, .buffer, .image_buffer => {
+                .image, .gradient, .buffer, .image_buffer, .cached => {
                     for (bars) |bar| self.fillRect(bar, color);
                 },
             }
