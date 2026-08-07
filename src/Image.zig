@@ -45,20 +45,35 @@ pub const Cache = struct {
     /// miss. `buffer` sources bypass the cache entirely: the caller already
     /// owns those pixels.
     pub fn decode(self: *Cache, alloc: std.mem.Allocator, src: lu.ImageSource, opts: DecodeOpts) !Decoded {
+        return self.decodeInto(alloc, src, opts, true);
+    }
+
+    /// Same as `decode` but never reads or writes the cache: every call
+    /// re-decodes from scratch. Lets an app measure the real decode cost and
+    /// lets a `Context.Flags` switch turn image caching off.
+    pub fn decodeNoCache(self: *Cache, alloc: std.mem.Allocator, src: lu.ImageSource, opts: DecodeOpts) !Decoded {
+        return self.decodeInto(alloc, src, opts, false);
+    }
+
+    fn decodeInto(self: *Cache, alloc: std.mem.Allocator, src: lu.ImageSource, opts: DecodeOpts, use_cache: bool) !Decoded {
         switch (src) {
             .buffer => |pb| return .{ .pixels = pb.pixels, .width = pb.width, .height = pb.height },
             .png, .jpeg, .webp => |bytes| {
                 const key = rasterKey(src, bytes);
-                if (self.map.get(key)) |d| return d;
+                if (use_cache) {
+                    if (self.map.get(key)) |d| return d;
+                }
                 const d = try decodeRaster(alloc, src, bytes);
-                self.map.put(key, d);
+                if (use_cache) self.map.put(key, d);
                 return d;
             },
             .svg => |text| {
                 const key = svgKey(text, opts);
-                if (self.map.get(key)) |d| return d;
+                if (use_cache) {
+                    if (self.map.get(key)) |d| return d;
+                }
                 const d = try decodeSVG(alloc, text, opts);
-                self.map.put(key, d);
+                if (use_cache) self.map.put(key, d);
                 return d;
             },
         }

@@ -20,6 +20,12 @@ cindex: usize = 0,
 /// rasterized `Background.buffer` in Context when a draw needs a texture that
 /// is not here.
 gpu_cache: lu.Cache.Cache(u64, GpuEntry, 65536) = .{},
+/// Frame profiler, reference-counted. Null when no debug watcher is alive;
+/// `debug()` re-inits it on demand, and the last `debugRelease()` deinits it.
+debug_info: ?lu.Debug.DebugInfo = null,
+/// Live debug watchers. Zero means measuring is fully off (render does a null
+/// check per section instead of reading the clock).
+debug_refs: u32 = 0,
 
 const max_textures = 1024;
 const max_clips = 64;
@@ -235,6 +241,7 @@ pub fn render(self: *Window, root: *lu.Element) void {
         @ptrCast(&self.size.w),
         @ptrCast(&self.size.h),
     );
+    if (self.debug_info) |*d| d.begin(.layout);
     // Top-down layout: size the root from the window, wire it to its layout,
     // and let the layout tree size and position every descendant.
     root.size = self.size;
@@ -242,7 +249,10 @@ pub fn render(self: *Window, root: *lu.Element) void {
     const root_layout = &(root.layout orelse return);
     root_layout.element = root;
     _ = root_layout.lay();
+    if (self.debug_info) |*d| d.end(.layout);
+    if (self.debug_info) |*d| d.begin(.draw);
     self.drawElement(root, .{ .pos = root.pos, .size = root.size });
+    if (self.debug_info) |*d| d.end(.draw);
 }
 
 /// The current window state as `Overrides`, so a rebuilt root element tracks
@@ -256,6 +266,28 @@ pub fn render(self: *Window, root: *lu.Element) void {
 /// ```
 pub fn overrides(self: *Window) lu.Element.Overrides {
     return .{ .size = self.size };
+}
+
+/// Enables frame profiling and returns the shared `DebugInfo` (re-inited fresh
+/// if it was released). Every call to `debug()` must be matched by a
+/// `debugRelease()`; the actual profiler object is torn down when the last
+/// watcher releases, so timing overhead is zero when nobody is looking.
+pub fn debug(self: *Window) *lu.Debug.DebugInfo {
+    if (self.debug_info == null)
+        self.debug_info = lu.Debug.DebugInfo.init();
+    self.debug_refs += 1;
+    return &self.debug_info.?;
+}
+
+/// Releases one `debug()` reference (idempotent). When the last watcher
+/// releases, the profiler object is deinited; a later `debug()` re-inits it.
+pub fn debugRelease(self: *Window) void {
+    if (self.debug_refs == 0) return;
+    self.debug_refs -= 1;
+    if (self.debug_refs == 0) {
+        self.debug_info.?.deinit();
+        self.debug_info = null;
+    }
 }
 
 fn drawElement(self: *Window, e: *lu.Element, area: lu.Area) void {

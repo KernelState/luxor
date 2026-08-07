@@ -57,6 +57,10 @@ pub fn main() !void {
         return error.SDLInitFailed;
     defer sdl.quit();
 
+    // Toggle caches via environment so the profiler can compare their cost.
+    // `LUXOR_NO_GPU_CACHE=1`, `LUXOR_NO_TEXT_CACHE=1`, `LUXOR_NO_IMAGE_CACHE=1`.
+    applyFlags(&ctx);
+
     var window = try lu.Window.init(.{
         .min_size = .{ .w = 800, .h = 600 },
         .title = "luxor example",
@@ -80,7 +84,12 @@ pub fn main() !void {
     }
 
     var event: sdl.SDL_Event = undefined;
+    var dbg = window.debug();
+    defer window.debugRelease();
+    var frame: u64 = 0;
     while (true) {
+        dbg.begin(.frame);
+        dbg.begin(.events);
         while (sdl.pollEvent(&event)) {
             switch (event.type) {
                 sdl.SDL_EVENT_QUIT, sdl.SDL_EVENT_WINDOW_CLOSE_REQUESTED => return,
@@ -90,8 +99,10 @@ pub fn main() !void {
                 else => {},
             }
         }
+        dbg.end(.events);
 
         // Immediate mode: reclaim the element pool, rebuild the tree, render.
+        dbg.begin(.build);
         ctx.clear();
 
         var root = lu.Element{
@@ -192,12 +203,40 @@ pub fn main() !void {
 
         // Nothing is building any more; the window lays the tree out on render.
         root.layout.?.end();
+        dbg.end(.build);
 
         _ = sdl.renderClear(window.renderer);
 
         // React to the live window size: override the root, then render.
         root.override(window.overrides());
         window.render(&root);
+        dbg.begin(.present);
         _ = sdl.renderPresent(window.renderer);
+        dbg.end(.present);
+        dbg.end(.frame);
+
+        // Print a report every full 200-frame window: it averages those exact
+        // frames, so each line is directly comparable to the next.
+        frame += 1;
+        if (frame % lu.Debug.DebugInfo.HistoryWindow == 0) {
+            dbg.print();
+        }
     }
+}
+
+/// Parses `--no-{gpu,text,image}-cache` from argv and disables the matching
+/// `Context` cache so the profiler can measure the real rasterization/decode
+/// cost (an anomaly report will reflect it).
+/// Turns the matching `Context` caches off when the `LUXOR_NO_{GPU,TEXT,IMAGE}_
+/// CACHE` env vars are set (any non-empty value), so the profiler can measure
+/// the real rasterization/decode cost.
+fn applyFlags(ctx: *lu.Context) void {
+    if (envSet("LUXOR_NO_GPU_CACHE")) ctx.flags.gpu_cache = false;
+    if (envSet("LUXOR_NO_TEXT_CACHE")) ctx.flags.text_cache = false;
+    if (envSet("LUXOR_NO_IMAGE_CACHE")) ctx.flags.image_cache = false;
+}
+
+fn envSet(name: [*:0]const u8) bool {
+    const v = std.c.getenv(name) orelse return false;
+    return v[0] != 0;
 }

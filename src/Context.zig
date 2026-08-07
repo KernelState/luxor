@@ -37,11 +37,11 @@ image_cache: lu.images.Cache = .{},
 /// A `TextEntry` stores the input fingerprint next to the buffer so a changed
 /// label re-rasterizes but a repeated one is reused. Buffers live in `arena`.
 text_cache: lu.Cache.Cache(u64, TextEntry, 65536) = .{},
-/// Optional GPU-side cache plugged in by a host Window (see
-/// `Window.plugCache`). When present, rasterized text and images are uploaded
-/// once to a persistent texture keyed by element id and never touch the CPU
-/// `text_cache`/`image_cache`. When null, Context caches CPU pixel buffers.
 gpu_cache: ?GpuCache = null,
+/// Runtime switches that turn caching on or off. Setting a cache flag `false`
+/// makes that cache a no-op: the rasterization/decode runs fresh every frame,
+/// so you can measure the real cost of text/images side by side. Default all-on.
+flags: Flags = .{},
 
 /// Static pool of `Element`s the builds allocate from. Layouts reference their
 /// children by pointer into this pool (never by value), so `Element` can embed
@@ -66,6 +66,18 @@ pub const GpuCache = struct {
     lookup: *const fn (ptr: *anyopaque, key: u64, fingerprint: u64) ?u64,
     /// Uploads `buf` for `key`/`fingerprint`, returning the key to reference.
     upload: *const fn (ptr: *anyopaque, key: u64, fingerprint: u64, buf: lu.PixelBuffer) ?u64,
+};
+
+/// Runtime switches that turn the Context's caches on or off. Set a flag to
+/// `false` to make that cache a no-op (fresh rasterization/decode every frame)
+/// so the profiler can measure the real cost of text and images.
+pub const Flags = struct {
+    /// Use the per-element GPU texture cache (`Window.plugCache`).
+    gpu_cache: bool = true,
+    /// Use the CPU `text_cache` of rasterized label/button pixel buffers.
+    text_cache: bool = true,
+    /// Use the `image_cache` that memoizes decoded images.
+    image_cache: bool = true,
 };
 
 const Context = @This();
@@ -555,29 +567,33 @@ fn textContent(layout: *const lu.Layout, avail: lu.Rect) ?lu.Rect {
 fn renderTextCached(self: *Context, fnSelf: *Font, text: []const u8, area: lu.Rect, spacing: lu.Rect, size: u32, direction: Font.Direction, color: lu.Color, render: Font.RenderOpts, wrap: ?u32, weight: u16, eid: u64, extra: u64) !lu.Background {
     const key = cacheKey(eid, extra);
     const fingerprint = textLayKey(fnSelf, text, area, spacing, size, direction, color, render, wrap, weight);
-    if (self.gpu_cache) |gc| {
-        if (gc.lookup(gc.ptr, key, fingerprint) != null)
-            return lu.Background.cached(key);
-        // Miss on the GPU: rasterize transiently and let the Window upload.
-        const buf = try fnSelf.renderText(
-            self.frame_arena.allocator(),
-            text,
-            area,
-            spacing,
-            size,
-            direction,
-            color,
-            render,
-            .{ .x = 0, .y = 0 },
-            wrap,
-            weight,
-        );
-        if (gc.upload(gc.ptr, key, fingerprint, buf) != null)
-            return lu.Background.cached(key);
-        // The Window declined the upload; fall through to CPU.
+    if (self.flags.gpu_cache) {
+        if (self.gpu_cache) |gc| {
+            if (gc.lookup(gc.ptr, key, fingerprint) != null)
+                return lu.Background.cached(key);
+            // Miss on the GPU: rasterize transiently and let the Window upload.
+            const buf = try fnSelf.renderText(
+                self.frame_arena.allocator(),
+                text,
+                area,
+                spacing,
+                size,
+                direction,
+                color,
+                render,
+                .{ .x = 0, .y = 0 },
+                wrap,
+                weight,
+            );
+            if (gc.upload(gc.ptr, key, fingerprint, buf) != null)
+                return lu.Background.cached(key);
+            // The Window declined the upload; fall through to CPU.
+        }
     }
-    if (self.text_cache.get(key)) |entry| {
-        if (entry.fingerprint == fingerprint) return lu.Background.buffer(entry.buffer);
+    if (self.flags.text_cache) {
+        if (self.text_cache.get(key)) |entry| {
+            if (entry.fingerprint == fingerprint) return lu.Background.buffer(entry.buffer);
+        }
     }
     const buf = try fnSelf.renderText(
         self.arena.allocator(),
@@ -592,7 +608,8 @@ fn renderTextCached(self: *Context, fnSelf: *Font, text: []const u8, area: lu.Re
         wrap,
         weight,
     );
-    self.text_cache.put(key, .{ .fingerprint = fingerprint, .buffer = buf });
+    if (self.flags.text_cache)
+        self.text_cache.put(key, .{ .fingerprint = fingerprint, .buffer = buf });
     return lu.Background.buffer(buf);
 }
 
@@ -974,11 +991,18 @@ pub const ImageOpts = struct {
 /// decoded image (or the `overrides.size`). SVG is rasterized at the size
 /// requested through `opts`.
 pub fn image(self: *Context, source: lu.ImageSource, overrides: lu.Element.Overrides, opts: ImageOpts, comptime src: std.builtin.SourceLocation) !*lu.Element {
-    const decoded = try self.image_cache.decode(self.arena.allocator(), source, .{
-        .svg_width = opts.svg_width,
-        .svg_height = opts.svg_height,
-        .scale = opts.svg_scale,
-    });
+    const decoded = if (self.flags.image_cache)
+        try self.image_cache.decode(self.arena.allocator(), source, .{
+            .svg_width = opts.svg_width,
+            .svg_height = opts.svg_height,
+            .scale = opts.svg_scale,
+        })
+    else
+        try self.image_cache.decodeNoCache(self.arena.allocator(), source, .{
+            .svg_width = opts.svg_width,
+            .svg_height = opts.svg_height,
+            .scale = opts.svg_scale,
+        });
     const natural = lu.Rect{ .w = decoded.width, .h = decoded.height };
     const e = self.allocElement();
     e.* = self.base(natural);

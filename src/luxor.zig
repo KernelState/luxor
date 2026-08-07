@@ -15,6 +15,9 @@ else
 /// A fixed-buffer hash-map cache for memoizing expensive work (rasterized text,
 /// decoded images) keyed by a hash of its input.
 pub const Cache = @import("Cache.zig");
+/// A self-contained frame profiler (FPS + per-phase timings). The Window owns
+/// one of these via `Window.debug` and reference-counts it.
+pub const Debug = @import("Debug.zig");
 /// Image decoding + caching (PNG/JPEG/WebP/SVG). `images` is the decode module;
 /// `Image` is the registered-texture reference type.
 pub const images = if (options.images)
