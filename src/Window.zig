@@ -291,11 +291,19 @@ pub fn debugRelease(self: *Window) void {
 }
 
 fn drawElement(self: *Window, e: *lu.Element, area: lu.Area) void {
+    // Drop shadows extend outside the element's own box, so draw them before
+    // pushing the element clip (they still get clipped by the parent's content
+    // box, which matches CSS `overflow` semantics).
+    self.drawShadows(e, area, .out);
+
     self.pushClip(area);
     defer self.popClip();
 
     self.drawBackground(e, area);
     self.drawBorder(e, area);
+
+    // Inner shadows sit on top of the background, inside the element's box.
+    self.drawShadows(e, area, .in);
 
     const content = contentArea(e, area);
     self.pushClip(content);
@@ -308,6 +316,227 @@ fn drawElement(self: *Window, e: *lu.Element, area: lu.Area) void {
     for (0..layout.cindex) |i| {
         const child = layout.children[i];
         self.drawElement(child, .{ .pos = child.pos, .size = child.size });
+    }
+}
+
+/// Draws every `shadow` effect in `e.effects` whose mask matches `mask`.
+fn drawShadows(self: *Window, e: *lu.Element, area: lu.Area, mask: lu.Effect.Shadow.ShadowMask) void {
+    const effects = e.effects orelse return;
+    for (effects) |effect| {
+        switch (effect) {
+            .shadow => |sh| if (sh.mask == mask) self.drawShadow(e, area, sh),
+            else => {},
+        }
+    }
+}
+
+/// Upper bound on a shadow raster's width or height in pixels. Shadows larger
+/// than this (a huge element with a huge blur) are skipped to keep the CPU
+/// raster bounded; the example's shadows are well below this.
+const max_shadow_edge = 1024;
+const max_shadow_pixels = 1 << 20;
+
+/// Rasterizes a single box shadow on the CPU and draws it as a texture.
+///
+/// The shadow is the element's rounded rect, shifted by `x_offset`/`y_offset`
+/// and grown by `spread`, filled with the shadow color, then blurred. For
+/// `mask = out` the element's own box is punched out (a strict drop shadow:
+/// the shadow never shows over the element, even with a translucent
+/// background). For `mask = in` only the inside of the element's box is kept,
+/// which produces the inner-glow look.
+fn drawShadow(self: *Window, e: *lu.Element, area: lu.Area, sh: lu.Effect.Shadow) void {
+    if (area.size.w == 0 or area.size.h == 0) return;
+    const ox: i32 = @intFromFloat(@round(sh.x_offset));
+    const oy: i32 = @intFromFloat(@round(sh.y_offset));
+    const spr: i32 = @intFromFloat(@round(sh.spread));
+    const blur: i32 = @intFromFloat(@round(@max(0.0, sh.blur)));
+    const color = tint(sh.color, e.effects);
+
+    // The shadow's base shape: the element box grown by `spread`, then shifted.
+    const ix0: i32 = @as(i32, @intCast(area.pos.x)) + ox - spr;
+    const iy0: i32 = @as(i32, @intCast(area.pos.y)) + oy - spr;
+    const iw: i32 = @as(i32, @intCast(area.size.w)) + 2 * spr;
+    const ih: i32 = @as(i32, @intCast(area.size.h)) + 2 * spr;
+    if (iw <= 0 or ih <= 0) return;
+
+    // Region around the shape that the blur kernel reaches into.
+    const margin: i32 = 2 * blur + 2;
+    var rx: i32 = ix0 - margin;
+    var ry: i32 = iy0 - margin;
+    var rw: i32 = iw + 2 * margin;
+    var rh: i32 = ih + 2 * margin;
+
+    // Clamp the raster to the window so the CPU buffer stays bounded.
+    const win_w: i32 = @intCast(self.size.w);
+    const win_h: i32 = @intCast(self.size.h);
+    rx = @max(rx, 0);
+    ry = @max(ry, 0);
+    rw = @min(rw, win_w - rx);
+    rh = @min(rh, win_h - ry);
+    if (rw <= 0 or rh <= 0) return;
+    if (rw > max_shadow_edge or rh > max_shadow_edge) return;
+    const n: usize = @as(usize, @intCast(rw)) * @as(usize, @intCast(rh));
+    if (n > max_shadow_pixels) return;
+
+    const cov = std.heap.page_allocator.alloc(f32, n) catch return;
+    defer std.heap.page_allocator.free(cov);
+    const scratch = std.heap.page_allocator.alloc(f32, n) catch return;
+    defer std.heap.page_allocator.free(scratch);
+
+    // Shape rect in local raster coords.
+    const sx: i32 = ix0 - rx;
+    const sy: i32 = iy0 - ry;
+    const rr = clampRadius(e.border_radius, iw, ih);
+    for (0..@as(usize, @intCast(rh))) |y| {
+        for (0..@as(usize, @intCast(rw))) |x| {
+            const px: i32 = @intCast(x);
+            const py: i32 = @intCast(y);
+            cov[y * @as(usize, @intCast(rw)) + x] =
+                if (inRoundedRect(sx, sy, iw, ih, rr, px, py)) 1.0 else 0.0;
+        }
+    }
+
+    // Blur the coverage plane (separable box blur, two iterations) to get a
+    // smooth gaussian-like falloff.
+    if (blur > 0) {
+        boxBlur(cov, scratch, @intCast(rw), @intCast(rh), blur);
+        boxBlur(scratch, cov, @intCast(rw), @intCast(rh), blur);
+    }
+
+    const pixels = std.heap.page_allocator.alloc(u8, n * 4) catch return;
+    defer std.heap.page_allocator.free(pixels);
+
+    // Element box in local raster coords, for punching / clipping.
+    const ex: i32 = @as(i32, @intCast(area.pos.x)) - rx;
+    const ey: i32 = @as(i32, @intCast(area.pos.y)) - ry;
+    const e_w: i32 = @intCast(area.size.w);
+    const e_h: i32 = @intCast(area.size.h);
+
+    const shadow_a: f32 = @as(f32, @floatFromInt(color.a)) / 255.0;
+    for (0..@as(usize, @intCast(rh))) |y| {
+        for (0..@as(usize, @intCast(rw))) |x| {
+            const px: i32 = @intCast(x);
+            const py: i32 = @intCast(y);
+            const inside_elem = px >= ex and py >= ey and px < ex + e_w and py < ey + e_h;
+            var a = cov[y * @as(usize, @intCast(rw)) + x] * shadow_a;
+            if (sh.mask == .out) {
+                if (inside_elem) a = 0;
+            } else {
+                if (!inside_elem) a = 0;
+            }
+            const idx = (y * @as(usize, @intCast(rw)) + x) * 4;
+            pixels[idx] = color.r;
+            pixels[idx + 1] = color.g;
+            pixels[idx + 2] = color.b;
+            pixels[idx + 3] = @intFromFloat(@min(a * 255.0, 255.0));
+        }
+    }
+
+    const tex = sdl.createTexture(
+        self.renderer,
+        sdl.pixels.SDL_PIXELFORMAT_ABGR8888,
+        sdl.SDL_TEXTUREACCESS_STREAMING,
+        @intCast(rw),
+        @intCast(rh),
+    ) orelse return;
+    defer sdl.destroyTexture(tex);
+    _ = sdl.setTextureBlendMode(tex, sdl.SDL_BLENDMODE_BLEND);
+    _ = sdl.updateTexture(tex, null, @ptrCast(pixels.ptr), @intCast(rw * 4));
+
+    const src = sdl.SDL_FRect{ .x = 0, .y = 0, .w = @floatFromInt(rw), .h = @floatFromInt(rh) };
+    const dst = sdl.SDL_FRect{
+        .x = @floatFromInt(rx),
+        .y = @floatFromInt(ry),
+        .w = @floatFromInt(rw),
+        .h = @floatFromInt(rh),
+    };
+    _ = sdl.renderTexture(self.renderer, tex, &src, &dst);
+}
+
+/// The border radius for a shadow shape, clamped so the corners never exceed
+/// half the smaller dimension.
+fn clampRadius(corners: lu.Corners, w: i32, h: i32) i32 {
+    const max_r: i32 = @divTrunc(@min(w, h), 2);
+    var out: i32 = 0;
+    const vals = [4]i32{
+        @intCast(corners.top_left),
+        @intCast(corners.top_right),
+        @intCast(corners.bottom_left),
+        @intCast(corners.bottom_right),
+    };
+    for (vals) |v| out = @max(out, @min(v, max_r));
+    return out;
+}
+
+/// True when `(px, py)` lies inside the axis-aligned rounded rect with origin
+/// `(x, y)`, size `w` x `h` and corner radius `r`.
+fn inRoundedRect(x: i32, y: i32, w: i32, h: i32, r: i32, px: i32, py: i32) bool {
+    if (px < x or py < y or px >= x + w or py >= y + h) return false;
+    const rr: i32 = @min(r, @divTrunc(@min(w, h), 2));
+    if (rr <= 0) return true;
+    // In the middle band, definitely inside.
+    if (px >= x + rr and px < x + w - rr) return true;
+    if (py >= y + rr and py < y + h - rr) return true;
+    // Otherwise check the nearest corner.
+    const corners = [4][2]i32{
+        .{ x + rr, y + rr },
+        .{ x + w - rr - 1, y + rr },
+        .{ x + rr, y + h - rr - 1 },
+        .{ x + w - rr - 1, y + h - rr - 1 },
+    };
+    var best: f32 = 1e9;
+    for (corners) |c| {
+        const dx = @as(f32, @floatFromInt(px - c[0]));
+        const dy = @as(f32, @floatFromInt(py - c[1]));
+        const d = @sqrt(dx * dx + dy * dy);
+        best = @min(best, d);
+    }
+    return best <= @as(f32, @floatFromInt(rr));
+}
+
+/// Separable box blur of `src` into `dst`, both `w` x `h` planes. Each row and
+/// column is averaged over a window of `2*radius+1` pixels (clamped at the
+/// edges).
+fn boxBlur(src: []const f32, dst: []f32, w: usize, h: usize, radius: i32) void {
+    const r = @min(@as(i32, @intCast(@max(w, h))), @max(radius, 1));
+    const row = std.heap.page_allocator.alloc(f32, w) catch return;
+    defer std.heap.page_allocator.free(row);
+
+    // Horizontal pass.
+    for (0..h) |y| {
+        for (0..w) |x| {
+            const lo: i32 = @intCast(x);
+            const lo_r = @max(0, lo - r);
+            const hi_r = @min(@as(i32, @intCast(w)) - 1, lo + r);
+            var sum: f32 = 0;
+            var count: f32 = 0;
+            var k = lo_r;
+            while (k <= hi_r) : (k += 1) {
+                sum += src[y * w + @as(usize, @intCast(k))];
+                count += 1;
+            }
+            row[x] = sum / count;
+        }
+        for (0..w) |x| dst[y * w + x] = row[x];
+    }
+
+    // Vertical pass over the horizontally-blurred `dst`.
+    const col = std.heap.page_allocator.alloc(f32, h) catch return;
+    defer std.heap.page_allocator.free(col);
+    for (0..w) |x| {
+        for (0..h) |y| {
+            const lo_r = @max(0, @as(i32, @intCast(y)) - r);
+            const hi_r = @min(@as(i32, @intCast(h)) - 1, @as(i32, @intCast(y)) + r);
+            var sum: f32 = 0;
+            var count: f32 = 0;
+            var k = lo_r;
+            while (k <= hi_r) : (k += 1) {
+                sum += dst[@as(usize, @intCast(k)) * w + x];
+                count += 1;
+            }
+            col[@intCast(y)] = sum / count;
+        }
+        for (0..h) |y| dst[y * w + x] = col[y];
     }
 }
 
@@ -414,14 +643,17 @@ fn drawBorder(self: *Window, e: *lu.Element, area: lu.Area) void {
 /// edge differs (there is no content beyond it).
 fn drawBlurBackdrop(self: *Window, area: lu.Area, radius: lu.Corners, alpha: f32, effects: ?[]const lu.Effect) void {
     var blur_radius: u32 = 8;
+    var saturation: f32 = 1.0;
     var found = false;
     for (effects orelse &.{}) |effect| {
         switch (effect) {
             .blur => |b| {
                 blur_radius = b.radius;
+                saturation = b.saturation;
                 found = true;
             },
             .opacity => {},
+            .shadow => {},
         }
     }
     if (!found) return;
@@ -442,6 +674,8 @@ fn drawBlurBackdrop(self: *Window, area: lu.Area, radius: lu.Corners, alpha: f32
     // clipped by a window edge.
     const surface = SDL_RenderReadPixels(self.renderer, null) orelse return;
     defer sdl.surface.destroySurface(surface);
+    if (saturation != 1.0)
+        self.saturateSurface(surface, @min(px, self.size.w -| 1), @min(py, self.size.h -| 1), @min(pw, self.size.w -| px), @min(ph, self.size.h -| py), saturation);
     // Premultiply the alpha into the colors so that downsampling interpolates
     // the colors (bright content bleeds outward) instead of blending them
     // toward the transparent black backdrop.
@@ -785,6 +1019,7 @@ fn tint(color: lu.Color, effects: ?[]const lu.Effect) lu.Color {
                 out.a = @intFromFloat(@min(@as(f64, @floatFromInt(out.a)) * o, 255.0));
             },
             .blur => {},
+            .shadow => {},
         }
     }
     return out;
@@ -797,6 +1032,7 @@ fn totalOpacity(effects: ?[]const lu.Effect) f32 {
         switch (effect) {
             .opacity => |o| out *= @floatCast(o),
             .blur => {},
+            .shadow => {},
         }
     }
     return out;
@@ -807,6 +1043,7 @@ fn hasBlur(effects: ?[]const lu.Effect) bool {
         switch (effect) {
             .blur => return true,
             .opacity => {},
+            .shadow => {},
         }
     }
     return false;
@@ -818,6 +1055,35 @@ fn blurFactor(radius: u32) u32 {
     var r = @max(radius, 1);
     while (r > 1 and level + 1 < max_blur_levels) : (r >>= 1) level += 1;
     return @as(u32, 1) << @intCast(level);
+}
+
+/// Adjusts the saturation of `surface`'s pixels inside the given region (in
+/// surface coordinates). `saturation` follows CSS `saturate()`: 1.0 is
+/// unchanged, 0.0 is grayscale, above 1.0 boosts the color.
+fn saturateSurface(self: *Window, surface: *Surface, x: u32, y: u32, w: u32, h: u32, saturation: f32) void {
+    if (w == 0 or h == 0) return;
+    const win_w: c_int = @intCast(self.size.w);
+    const win_h: c_int = @intCast(self.size.h);
+    const surf_w = @min(win_w, surface.w);
+    const surf_h = @min(win_h, surface.h);
+    for (0..h) |oy| {
+        const sy: c_int = @intCast(@min(y + oy, @as(u32, @intCast(win_h -| 1))));
+        if (sy >= surf_h) break;
+        for (0..w) |ox| {
+            const sx: c_int = @intCast(@min(x + ox, @as(u32, @intCast(win_w -| 1))));
+            if (sx >= surf_w) continue;
+            var r: f32 = 0;
+            var g: f32 = 0;
+            var b: f32 = 0;
+            var a: f32 = 0;
+            if (!sdl.surface.readSurfacePixelFloat(surface, sx, sy, &r, &g, &b, &a)) continue;
+            const luma = r * 0.2126 + g * 0.7152 + b * 0.0722;
+            r = luma + (r - luma) * saturation;
+            g = luma + (g - luma) * saturation;
+            b = luma + (b - luma) * saturation;
+            _ = sdl.surface.writeSurfacePixelFloat(surface, sx, sy, r, g, b, a);
+        }
+    }
 }
 
 fn fillRect(self: *Window, area: lu.Area, color: lu.Color) void {

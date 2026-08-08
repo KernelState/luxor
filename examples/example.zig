@@ -26,7 +26,7 @@ var grid_cfg = lu.Layout.GridConfig{ .columns = 4, .gap = 8, .sizing = .{ .main 
 var slider_row_cfg = lu.Layout.FlexConfig{ .direction = .row, .gap = 16, .sizing = .{ .main = .content, .cross = .content } };
 
 const toolbar_colors = [_]u32{ 0xFF5555FF, 0xFF55AAFF, 0xFF55FFAA, 0xFFAACCFF, 0xFFCCAAFF, 0xFFAA55FF, 0xFF55FFFF, 0xFFFFAA55 };
-const tile_colors = [_]u32{ 0xEE3344, 0xEE8855, 0xEECC33, 0x66CC55, 0x3399EE, 0x7744CC, 0xCC3388, 0x4488AA };
+const tile_colors = [_]u32{ 0xEE3344FF, 0xEE8855FF, 0xEECC33FF, 0x66CC55FF, 0x3399EEFF, 0x7744CCFF, 0xCC3388FF, 0x4488AAFF };
 
 pub fn main() !void {
     var ctx = lu.Context{
@@ -105,10 +105,11 @@ pub fn main() !void {
         dbg.begin(.build);
         ctx.clear();
 
+        // A light canvas so the black drop shadows stay visible.
         var root = lu.Element{
             .size = .{ .w = 800, .h = 600 },
             .pos = .{ .x = 0, .y = 0 },
-            .background = lu.Background.solid(lu.Color.fromU32(0x00000000)),
+            .background = lu.Background.solid(lu.Color{ .r = 0xDC, .g = 0xE4, .b = 0xF0, .a = 0xFF }),
             .layout = .{ .vtable = &lu.Layout.flex, .parent = null, .data = &root_cfg },
             .ctx = &ctx,
             .events = lu.Context.noEvents,
@@ -178,10 +179,29 @@ pub fn main() !void {
         }, @src());
         grid.layout.?.start();
         for (tile_colors, 0..) |col, i| {
+            // Exercise every shadow feature: offsets, blur, spread, negative
+            // offsets, the inset (`in`) mask, and stacked shadows.
+            const effects = switch (i % 4) {
+                0 => &[_]lu.Effect{
+                    .{ .shadow = .{ .mask = .out, .color = .{ .r = 0, .g = 0, .b = 0, .a = 160 }, .x_offset = 3, .y_offset = 3, .blur = 6 } },
+                },
+                1 => &[_]lu.Effect{
+                    .{ .shadow = .{ .mask = .out, .color = .{ .r = 0, .g = 0, .b = 0, .a = 160 }, .x_offset = 0, .y_offset = 0, .spread = 4, .blur = 2 } },
+                },
+                2 => &[_]lu.Effect{
+                    .{ .shadow = .{ .mask = .in, .color = .{ .r = 0, .g = 0, .b = 0, .a = 120 }, .x_offset = -2, .y_offset = 2, .blur = 8 } },
+                },
+                else => &[_]lu.Effect{
+                    .{ .shadow = .{ .mask = .out, .color = .{ .r = 0, .g = 0, .b = 0, .a = 90 }, .x_offset = -3, .y_offset = -3, .blur = 4 } },
+                    .{ .shadow = .{ .mask = .out, .color = .{ .r = 0, .g = 0, .b = 0, .a = 90 }, .x_offset = 3, .y_offset = 3, .blur = 4 } },
+                },
+            };
             _ = ctx.box(.{ .w = 40, .h = 40 }, .{
                 .id_extra = i,
                 .background = .{ .base = .{ .solid = lu.Color.fromU32(col) }, .effects = &.{} },
                 .border_radius = .all(6),
+                .has_effects = true,
+                .effects = effects,
             }, @src());
         }
         grid.layout.?.end();

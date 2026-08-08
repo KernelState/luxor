@@ -15,7 +15,7 @@ id: u64 = 0,
 /// Disambiguator for elements created in a loop: the loop body is one source
 /// position, so every iteration shares the same `id`. Pass the loop index here.
 id_extra: u64 = 0,
-effects: ?[]lu.Effect = null,
+effects: ?[]const lu.Effect = null,
 /// The layout this element is attached to, embedded by value so layouts need
 /// no heap allocation. `Layout` breaks the size recursion by storing children
 /// and requests as element *pointers* (living in the widget's element pool)
@@ -50,7 +50,7 @@ pub const Overrides = struct {
     border_radius: ?lu.Corners = null,
     background: ?lu.Background = null,
     has_effects: bool = false,
-    effects: []lu.Effect = undefined,
+    effects: []const lu.Effect = undefined,
     layout: ?lu.Layout = null,
     padding: ?lu.Sides = null,
     margin: ?lu.Sides = null,

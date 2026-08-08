@@ -182,8 +182,40 @@ pub const Border = union(enum) {
 pub const Effect = union(enum) {
     blur: Blur,
     opacity: f64,
+    shadow: Shadow,
     pub const Blur = struct {
         radius: u32 = 8,
+        /// Like CSS `filter: saturate()`. `1.0` keeps colors unchanged, `0.0`
+        /// draws the backdrop in grayscale, values above `1.0` oversaturate.
+        saturation: f32 = 1.0,
+    };
+    /// A box shadow: a blurred silhouette of the element's box, drawn with
+    /// the given color either behind the element (`out`) or inside it (`in`).
+    pub const Shadow = struct {
+        /// Where the shadow sits relative to the element:
+        /// `out` drops it behind the element (a drop shadow),
+        /// `in` draws it on top of the element's background inside its box
+        /// (an inner glow / inset shadow).
+        mask: ShadowMask = .out,
+        /// The color the shadow is painted with. Defaults to black at 50%
+        /// opacity.
+        color: Color = .{ .r = 0, .g = 0, .b = 0, .a = 128 },
+        /// Horizontal shift, in screen pixels, from the element's top-left
+        /// corner.
+        x_offset: f32 = 0,
+        /// Vertical shift, in screen pixels, from the element's top-left
+        /// corner.
+        y_offset: f32 = 0,
+        /// How much the shadow shape is enlarged (positive) or shrunk
+        /// (negative) relative to the element's own box.
+        spread: f32 = 0,
+        /// Blur strength in pixels.
+        blur: f32 = 8,
+
+        pub const ShadowMask = enum {
+            in,
+            out,
+        };
     };
 };
 
