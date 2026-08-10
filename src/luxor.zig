@@ -116,6 +116,23 @@ pub const Corners = struct {
     }
 };
 
+/// The draw-time shape of an element: world position, size and border radius.
+/// Per-element caches (shadow rasters, blur backdrops, baked gradient textures)
+/// hash the fields that determine the pixels, so a rebuilt element that lands
+/// on the same shape reuses the previous frame's texture instead of re-rasterizing
+/// and re-uploading. Shadow pixels do not depend on the position (the raster is
+/// drawn as-is and SDL clips it), so shadow keys drop `pos`; blur backdrops key
+/// on it because their content is anchored to the element's screen location.
+pub const Geometry = struct {
+    pos: Pos,
+    size: Rect,
+    radius: Corners,
+
+    pub fn fromElement(e: *const Element, area: Area) Geometry {
+        return .{ .pos = area.pos, .size = area.size, .radius = e.border_radius };
+    }
+};
+
 pub const Color = struct {
     r: u8,
     g: u8,

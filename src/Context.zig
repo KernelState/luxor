@@ -37,7 +37,22 @@ image_cache: lu.images.Cache = .{},
 /// A `TextEntry` stores the input fingerprint next to the buffer so a changed
 /// label re-rasterizes but a repeated one is reused. Buffers live in `arena`.
 text_cache: lu.Cache.Cache(u64, TextEntry, 65536) = .{},
+/// Memoizes `Font.textSize` for stable strings. Every label/button re-measures
+/// its text every frame with identical inputs; the HarfBuzz shaping that powers
+/// that measurement is the hottest per-frame cost outside the GPU. Keyed by the
+/// shaping inputs (font, text slice, size, direction, weight), values are just a
+/// measured rect, and the table intentionally survives `clear()` so the build
+/// and layout phases skip shaping entirely on repeat frames.
+textsize_memo: TextSizeMemo = .{},
+wrap_memo: WrapMemo = .{},
 gpu_cache: ?GpuCache = null,
+/// A Window-provided layout-results cache (installed by `Window.plugCache`).
+/// `Layout.lay` consults it for elements with a stable id: when the same
+/// container is laid out into the same box, the cached child positions/sizes
+/// are replayed onto the freshly rebuilt children and the layout math (including
+/// every child's text measurement) is skipped. Containers without a stable id
+/// skip the cache entirely.
+layout_cache: ?LayoutCacheSink = null,
 /// Runtime switches that turn caching on or off. Setting a cache flag `false`
 /// makes that cache a no-op: the rasterization/decode runs fresh every frame,
 /// so you can measure the real cost of text/images side by side. Default all-on.
@@ -78,6 +93,144 @@ pub const Flags = struct {
     text_cache: bool = true,
     /// Use the `image_cache` that memoizes decoded images.
     image_cache: bool = true,
+};
+
+/// Cached result of laying out a container: the box it was laid into plus one
+/// `Child` per laid-out child (world position and size, plus the child's stable
+/// id so a changed tree shape is detected and the cache is dropped). Values own
+/// no textures, so eviction just drops them.
+pub const LayoutEntry = struct {
+    /// The content box the layout laid its children into. A different box (the
+    /// window resized and reallocated the container) is a miss, not a stale hit.
+    container: lu.Rect,
+    n: usize,
+    kids: [200]Child,
+    /// Last frame this layout was consulted or stored; idle entries are evicted.
+    last_seen: u64,
+
+    pub const Child = struct {
+        id: u64,
+        extra: u64,
+        pos: lu.Pos,
+        size: lu.Rect,
+    };
+};
+
+/// A Window-provided hook so `Layout.lay` can reach the layout-results cache
+/// without importing SDL. `Layout.lay` calls `consult` for an element with a
+/// stable id before running the layout math and `store` after computing it; the
+/// Window reads/writes `lu.Layout` fields through the pointer.
+pub const LayoutCacheSink = struct {
+    ptr: *anyopaque,
+    consult: *const fn (ptr: *anyopaque, key: u64) ?*LayoutEntry,
+    store: *const fn (ptr: *anyopaque, key: u64, layout: *lu.Layout) void,
+};
+
+/// A small direct-map memo of `Font.textSize` results, keyed by the shaping
+/// inputs. Full-directory (the example has ~40 stable text widgets) the table
+/// stops growing and just never hits for a brand-new string.
+const TextSizeMemo = struct {
+    const N = 96;
+    keys: [N]Key = undefined,
+    vals: [N]lu.Rect = undefined,
+    count: usize = 0,
+
+    const Key = struct {
+        font: usize,
+        text: [*]const u8,
+        len: usize,
+        size: u32,
+        direction: Font.Direction,
+        weight: u16,
+    };
+
+    fn get(m: *TextSizeMemo, font: *Font, text: []const u8, size: u32, direction: Font.Direction, weight: u16) ?lu.Rect {
+        for (0..m.count) |i| {
+            const k = m.keys[i];
+            if (k.font == @intFromPtr(font) and
+                k.len == text.len and
+                k.size == size and
+                k.weight == weight and
+                k.direction == direction and
+                k.text == text.ptr)
+            {
+                return m.vals[i];
+            }
+        }
+        return null;
+    }
+
+    fn put(m: *TextSizeMemo, font: *Font, text: []const u8, size: u32, direction: Font.Direction, weight: u16, r: lu.Rect) void {
+        if (m.count >= m.keys.len) return;
+        m.keys[m.count] = .{
+            .font = @intFromPtr(font),
+            .text = text.ptr,
+            .len = text.len,
+            .size = size,
+            .direction = direction,
+            .weight = weight,
+        };
+        m.vals[m.count] = r;
+        m.count += 1;
+    }
+};
+
+/// Memoizes `wrapLines`, the word-wrap line count of a wrapped label. The
+/// example's long English label re-measures its wrap every frame during the
+/// layout phase; stable inputs make that shaping skippable after frame one.
+const WrapMemo = struct {
+    const N = 48;
+    keys: [N]Key = undefined,
+    vals: [N]u32 = undefined,
+    count: usize = 0,
+
+    const Key = struct {
+        font: usize,
+        text: [*]const u8,
+        len: usize,
+        size: u32,
+        direction: Font.Direction,
+        spacing_w: u32,
+        spacing_h: u32,
+        wrap_w: u32,
+        weight: u16,
+    };
+
+    fn get(m: *WrapMemo, font: *Font, text: []const u8, size: u32, direction: Font.Direction, spacing: lu.Rect, wrap_w: u32, weight: u16) ?u32 {
+        for (0..m.count) |i| {
+            const k = m.keys[i];
+            if (k.font == @intFromPtr(font) and
+                k.len == text.len and
+                k.size == size and
+                k.weight == weight and
+                k.direction == direction and
+                k.spacing_w == spacing.w and
+                k.spacing_h == spacing.h and
+                k.wrap_w == wrap_w and
+                k.text == text.ptr)
+            {
+                return m.vals[i];
+            }
+        }
+        return null;
+    }
+
+    fn put(m: *WrapMemo, font: *Font, text: []const u8, size: u32, direction: Font.Direction, spacing: lu.Rect, wrap_w: u32, weight: u16, lines: u32) void {
+        if (m.count >= m.keys.len) return;
+        m.keys[m.count] = .{
+            .font = @intFromPtr(font),
+            .text = text.ptr,
+            .len = text.len,
+            .size = size,
+            .direction = direction,
+            .spacing_w = spacing.w,
+            .spacing_h = spacing.h,
+            .wrap_w = wrap_w,
+            .weight = weight,
+        };
+        m.vals[m.count] = lines;
+        m.count += 1;
+    }
 };
 
 const Context = @This();
@@ -440,6 +593,20 @@ pub const Font = struct {
     }
 };
 
+/// Measure a string's natural size, memoizing by shaping inputs so stable
+/// label/button strings skip HarfBuzz entirely after their first frame.
+fn textSizeCached(self: *Context, font: *Font, text: []const u8, size: u32, direction: Font.Direction, weight: u16) !lu.Rect {
+    // Keep the face's live pixel size in sync even on a memo hit: the shared
+    // face is reused at several sizes, and `wrapLines`/line-height math reads
+    // `font.pixel_size` after measuring. `setCharSize` no-ops when unchanged.
+    try font.setCharSize(size);
+    if (self.textsize_memo.get(font, text, size, direction, weight)) |r|
+        return r;
+    const r = try font.textSize(self.frame_arena.allocator(), text, size, direction, weight);
+    self.textsize_memo.put(font, text, size, direction, weight, r);
+    return r;
+}
+
 /// Configuration for a `text` layout. Holds the font, the string and how to
 /// draw it; the layout reads it during `lay`, so rendering is deferred until
 /// the label has been given its box.
@@ -550,12 +717,11 @@ fn wrapLines(
 fn textContent(layout: *const lu.Layout, avail: lu.Rect) ?lu.Rect {
     const cfg = textCfg(layout) orelse return null;
     const ctx = (layout.element orelse return null).ctx orelse return null;
-    const alloc = ctx.frame_arena.allocator();
-    const natural = cfg.font.textSize(alloc, cfg.text, cfg.size, cfg.direction, cfg.weight) catch return null;
+    const natural = ctx.textSizeCached(cfg.font, cfg.text, cfg.size, cfg.direction, cfg.weight) catch return null;
     if (!cfg.wrap) return natural;
     if (avail.w == 0 or natural.w <= avail.w) return natural;
     const line_h: u32 = cfg.font.pixel_size + cfg.spacing.h;
-    const lines = wrapLines(cfg.font, alloc, cfg.text, cfg.size, cfg.direction, cfg.spacing, avail.w, cfg.weight) catch return natural;
+    const lines = ctx.wrapLinesCached(cfg.font, cfg.text, cfg.size, cfg.direction, cfg.spacing, avail.w, cfg.weight) catch return natural;
     return .{ .w = avail.w, .h = lines * line_h };
 }
 
@@ -653,15 +819,14 @@ fn textLay(layout: *lu.Layout) void {
     const el = layout.element orelse return;
     const ctx = el.ctx orelse return;
     const cfg = textCfg(layout) orelse return;
-    const alloc = ctx.frame_arena.allocator();
     const box_w = layout.container.w;
     const box_h = layout.container.h;
 
-    const nat = cfg.font.textSize(alloc, cfg.text, cfg.size, cfg.direction, cfg.weight) catch return;
+    const nat = ctx.textSizeCached(cfg.font, cfg.text, cfg.size, cfg.direction, cfg.weight) catch return;
     var block_h: u32 = nat.h;
     const wrap_w: ?u32 = if (cfg.wrap and box_w > 0) box_w else null;
     if (cfg.wrap and box_w > 0 and nat.w > box_w) {
-        const lines = wrapLines(cfg.font, alloc, cfg.text, cfg.size, cfg.direction, cfg.spacing, box_w, cfg.weight) catch block_h;
+        const lines = ctx.wrapLinesCached(cfg.font, cfg.text, cfg.size, cfg.direction, cfg.spacing, box_w, cfg.weight) catch block_h;
         const line_h: u32 = cfg.font.pixel_size + cfg.spacing.h;
         block_h = lines * line_h;
     }
@@ -699,6 +864,17 @@ fn textLay(layout: *lu.Layout) void {
     layout.cindex = 1;
 }
 
+/// How many lines a wrapped label occupies, memoized by wrap inputs so stable
+/// wrapped strings (the example's long label) skip shaping after frame one.
+fn wrapLinesCached(self: *Context, font: *Font, text: []const u8, size: u32, direction: Font.Direction, spacing: lu.Rect, wrap_w: u32, weight: u16) !u32 {
+    try font.setCharSize(size);
+    if (self.wrap_memo.get(font, text, size, direction, spacing, wrap_w, weight)) |lines|
+        return lines;
+    const lines = try wrapLines(font, self.frame_arena.allocator(), text, size, direction, spacing, wrap_w, weight);
+    self.wrap_memo.put(font, text, size, direction, spacing, wrap_w, weight, lines);
+    return lines;
+}
+
 /// A box of text, padded and centered inside its own box. The text is not
 /// rasterized here: the `text` layout renders it when the box is laid out,
 /// so it can wrap to the width it is actually given.
@@ -715,7 +891,7 @@ pub fn label(self: *Context, text: []const u8, overrides: lu.Element.Overrides, 
         .wrap = opts.wrap,
         .weight = opts.weight,
     };
-    const natural = try self.fonts[opts.font_idx].textSize(self.frame_arena.allocator(), text, opts.size, opts.direction, opts.weight);
+    const natural = try self.textSizeCached(&self.fonts[opts.font_idx], text, opts.size, opts.direction, opts.weight);
     const e = self.allocElement();
     e.* = self.base(.{ .w = 0, .h = 0 });
     e.id = idOf(src);
@@ -782,7 +958,7 @@ pub const LabelOpts = struct {
 /// that owns the text.
 fn textElement(self: *Context, text: []const u8, opts: LabelOpts, eid: u64, extra: u64) !*lu.Element {
     const font = &self.fonts[opts.font_idx];
-    const text_size = try font.textSize(self.frame_arena.allocator(), text, opts.size, opts.direction, opts.weight);
+    const text_size = try self.textSizeCached(font, text, opts.size, opts.direction, opts.weight);
     const bg = try self.renderTextCached(
         font,
         text,

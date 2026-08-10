@@ -37,6 +37,12 @@ pub const Section = enum {
     layout,
     draw,
     present,
+    /// Time spent consulting/retrieving/uploading the gpu, shadow, blur and
+    /// layout caches. This is a *sub*-phase: cache lookups happen inside
+    /// `build`/`layout`/`draw`, so its time also appears in those rows. It is
+    /// reported separately (and excluded from the `gap` reconciliation) so it
+    /// never overlaps a phase at the same nest depth.
+    cache,
 };
 
 /// The profiler object `Window.debug()` returns. Reference counting lives in
@@ -67,6 +73,12 @@ pub const DebugInfo = struct {
 
     // Per-section pending start stamps; -1 means "not currently being timed".
     start: [N]i128 = [_]i128{-1} ** N,
+    /// Open-nesting depth per section. `begin` on an already-open section just
+    /// bumps the depth; only the outermost `end` closes the span. Keeps a
+    /// sub-phase like `.cache` (lookups inside `build`/`layout`/`draw`) from
+    /// corrupting an enclosing phase's stamp, and merges nested cache consults
+    /// (e.g. a cached texture drawn while another consults) into one span.
+    depth: [N]u32 = [_]u32{0} ** N,
     /// Accumulated nanoseconds per section since the object was re-inited.
     acc_ns: [N]u64 = [_]u64{0} ** N,
     /// How many times each section has been ended since re-init.
@@ -99,13 +111,19 @@ pub const DebugInfo = struct {
     }
 
     pub fn begin(self: *DebugInfo, section: Section) void {
-        self.start[@intFromEnum(section)] = now();
+        const i = @intFromEnum(section);
+        if (self.depth[i] == 0) self.start[i] = now();
+        self.depth[i] += 1;
     }
 
     /// Closes `section`, folding its duration into the accumulators. Skips if
     /// `begin` was never called for it (e.g. a section the app does not use).
+    /// Nested `begin`s are folded by their outermost `end`.
     pub fn end(self: *DebugInfo, section: Section) void {
         const i = @intFromEnum(section);
+        if (self.depth[i] == 0) return;
+        self.depth[i] -= 1;
+        if (self.depth[i] != 0) return;
         const t0 = self.start[i];
         if (t0 < 0) return;
         self.start[i] = -1;
@@ -325,10 +343,25 @@ pub const DebugInfo = struct {
             }
         }
 
+        // Cache consulting/retrieval is a sub-phase: its lookups run *inside*
+        // the phases above, so it is printed as its own row but excluded from
+        // the `gap` reconciliation (otherwise the named phases would sum past
+        // the whole frame).
+        const cache_i = @intFromEnum(Section.cache);
+        if (section_counts[cache_i] != 0) {
+            const avg_ms = @as(f64, @floatFromInt(section_totals[cache_i])) / @as(f64, @floatFromInt(section_counts[cache_i])) / std.time.ns_per_ms;
+            const pct = if (avg_frame_ms > 0) 100.0 * avg_ms / avg_frame_ms else 0;
+            std.debug.print(
+                "  {s:<9} avg {d:8.3}ms  worst {d:8.3}ms  {d:5.1}%\n",
+                .{ "cache", avg_ms, self.ms(section_max[cache_i]), pct },
+            );
+        }
+
         // Unlabelled time inside the frame: everything between the named
         // sections (renderClear, override, getWindowSize, section overhead).
+        // `.cache` is intentionally left out: it already lives inside them.
         var sections_sum: u128 = 0;
-        for (section_totals) |t| sections_sum += t;
+        inline for (section_list) |tag_selected| sections_sum += section_totals[@intFromEnum(tag_selected)];
         const sections_avg_ms = if (n > 0)
             @as(f64, @floatFromInt(sections_sum)) / @as(f64, @floatFromInt(n)) / std.time.ns_per_ms
         else
@@ -366,6 +399,29 @@ test "ring keeps only the last HistoryWindow frames" {
     }
     try std.testing.expect(info.scount == DebugInfo.HistoryWindow);
     try std.testing.expect(info.count[@intFromEnum(Section.frame)] == 250);
+}
+
+test "nested sections fold into one span and keep the parent's stamp" {
+    var info = DebugInfo.init();
+    info.begin(.frame);
+    info.begin(.draw);
+    // Two nested cache consults (a cached texture drawn during a shadow lookup
+    // must not corrupt the enclosing `.draw` stamp nor double-count).
+    info.begin(.cache);
+    info.begin(.cache);
+    info.end(.cache);
+    info.begin(.cache);
+    info.end(.cache);
+    info.end(.cache);
+    info.end(.draw);
+    info.end(.frame);
+    try std.testing.expect(info.count[@intFromEnum(Section.cache)] == 1);
+    try std.testing.expect(info.count[@intFromEnum(Section.draw)] == 1);
+    try std.testing.expect(info.count[@intFromEnum(Section.frame)] == 1);
+    // `.cache` time is strictly inside `.draw`, so it can never exceed it.
+    try std.testing.expect(info.acc_ns[@intFromEnum(Section.cache)] <= info.acc_ns[@intFromEnum(Section.draw)]);
+    try std.testing.expect(info.depth[@intFromEnum(Section.cache)] == 0);
+    try std.testing.expect(info.depth[@intFromEnum(Section.draw)] == 0);
 }
 
 test "spike reviews are triggered and include sections" {

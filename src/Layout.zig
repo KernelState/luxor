@@ -200,6 +200,14 @@ pub const Layout = struct {
         if (el.ctx) |w| w.current = self.parent;
     }
 
+    /// Discards the saved requests from the previous build phase so the layout
+    /// starts from an empty request list. Widgets create their containers fresh
+    /// every frame (so `rindex` starts at zero anyway); this is for layouts that
+    /// live across frames and re-register their children each build.
+    pub fn reset(self: *Layout) void {
+        self.rindex = 0;
+    }
+
     /// Request space from the layout, returning the id assigned to this
     /// request. Call `addElement(id, element)` to attach the requesting
     /// element; the parent reads `getSize` style information from the element
@@ -236,7 +244,10 @@ pub const Layout = struct {
     /// element's size and position, wires `element` to it, then calls the root
     /// layout's `lay`; each layout sizes its own children, writes their final
     /// `.size`/`.pos` onto the child elements, and lays out the children that
-    /// are containers themselves. Returns the laid-out children.
+    /// are containers themselves. When the element carries a stable id and its
+    /// layout was computed into the same box on an earlier frame, the cached
+    /// child results are replayed instead of re-running the layout math. Returns
+    /// the laid-out children.
     pub fn lay(self: *Layout) []*lu.Element {
         const el = self.element orelse return self.children[0..0];
         const pad = self.padding;
@@ -245,7 +256,7 @@ pub const Layout = struct {
             .h = el.size.h -| (pad.top + pad.bottom),
         };
         self.cindex = 0;
-        self.vtable.lay(self);
+        self.gather();
         for (0..self.cindex) |i| {
             const child = self.children[i];
             child.pos.x += el.pos.x + pad.left;
@@ -256,6 +267,64 @@ pub const Layout = struct {
             }
         }
         return self.children[0..self.cindex];
+    }
+
+    /// Computes `layout.children` and each child's relative `.pos`/`.size`,
+    /// either from the cached results of a previous `lay` (when the element has
+    /// a stable id, the container is the same size and the children still have
+    /// the same ids) or by running `vtable.lay`. Writes and reads the cache
+    /// through `element.ctx.layout_cache`; elements with `id == 0` (containers
+    /// rebuilt as raw structs) never consult it. Child positions are relative to
+    /// the container's content origin; `lay` adds the container's own position
+    /// afterwards, so cached and freshly computed children behave identically.
+    fn gather(self: *Layout) void {
+        const el = self.element orelse return;
+        // Leaf layouts have no children to cache: a leaf's `store` would write
+        // an `n == 0` entry under its key, and since leaves reuse their parent
+        // element's id (text glyphs share the owning element's cache key), that
+        // empty entry would clobber the parent's cached child results and the
+        // parent would silently replay an empty layout. Leaves always lay.
+        if (self.vtable == &leaf or el.id == 0) {
+            self.vtable.lay(self);
+            return;
+        }
+        if (el.ctx) |ctx| {
+            if (ctx.layout_cache) |sink| {
+                const key = lu.Context.cacheKey(el.id, el.id_extra);
+                if (sink.consult(sink.ptr, key)) |entry| {
+                    if (entry.container.w == self.container.w and entry.container.h == self.container.h and self.replay(entry))
+                        return;
+                }
+                self.vtable.lay(self);
+                sink.store(sink.ptr, key, self);
+                return;
+            }
+        }
+        self.vtable.lay(self);
+    }
+
+    /// Replays a cached layout onto the freshly rebuilt children: each child's
+    /// cached relative position/size is written onto the matching current
+    /// request element, in request order. Returns false when the cached tree
+    /// does not match the current one (a different number of children, or a
+    /// child whose stable id moved), which forces a real `lay`.
+    fn replay(self: *Layout, entry: *const lu.Context.LayoutEntry) bool {
+        if (entry.n > self.rindex) return false;
+        var idx: usize = 0;
+        for (0..self.rindex) |i| {
+            const req = &self.requests[i];
+            const ce = req.element orelse continue;
+            if (idx >= entry.n) return false;
+            const kid = entry.kids[idx];
+            if (ce.id != kid.id or ce.id_extra != kid.extra) return false;
+            ce.pos = kid.pos;
+            ce.size = kid.size;
+            self.children[idx] = ce;
+            idx += 1;
+        }
+        if (idx != entry.n) return false;
+        self.cindex = idx;
+        return true;
     }
 
     /// The typed config for a flex layout, or null when this is not a flex

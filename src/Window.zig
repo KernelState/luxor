@@ -20,6 +20,36 @@ cindex: usize = 0,
 /// rasterized `Background.buffer` in Context when a draw needs a texture that
 /// is not here.
 gpu_cache: lu.Cache.Cache(u64, GpuEntry, 65536) = .{},
+/// Persistent per-shadow-texture cache (see `drawShadow`). This Window owns the
+/// textures; they are destroyed in `deinit` and when the cache fills up or an
+/// entry goes stale.
+shadow_cache: lu.Cache.Cache(u64, ShadowEntry, 65536) = .{},
+/// Persistent backdrop-blur textures (see `drawBlurBackdrop`), keyed by the
+/// element's geometry plus the blur settings. This Window owns the textures;
+/// they are destroyed in `deinit` and when an entry goes stale.
+blur_cache: lu.Cache.Cache(u64, BlurEntry, 65536) = .{},
+/// Persistent laid-out layout results (see `Layout.lay`), keyed by the
+/// container element's stable id. Owns no textures; stale entries are dropped.
+layout_cache: lu.Cache.Cache(u64, lu.Context.LayoutEntry, 65536) = .{},
+/// Frame counter, incremented at the top of every `render`. Caches stamp each
+/// entry with the last frame it was used and evict entries idle for more than
+/// `eviction_frames`, so a disappearing element's textures are torn down.
+frame: u64 = 0,
+/// Per-frame scratch memory for transient working buffers (shadow coverage
+/// planes, blur row/column buffers, eviction key lists). Allocated on the heap
+/// in `init` (a multi-megabyte inline array would overflow the caller's stack);
+/// reset to its base at the top of every `render`, and allocations that
+/// overflow it fall back to the page allocator.
+scratch: []u8 = &.{},
+scratch_fba: std.heap.FixedBufferAllocator = undefined,
+scratch_ready: bool = false,
+/// Primitives queued during the tree walk and flushed (grouped by texture and
+/// clip) once per frame, instead of issuing one SDL draw call per primitive.
+batch: Batch = .{},
+/// Transient textures (fresh gradient bakes that were not cached) referenced by
+/// queued batch primitives; destroyed after the batch is flushed.
+pending: [max_pending]?*sdl.SDL_Texture = undefined,
+pn: usize = 0,
 /// Frame profiler, reference-counted. Null when no debug watcher is alive;
 /// `debug()` re-inits it on demand, and the last `debugRelease()` deinits it.
 debug_info: ?lu.Debug.DebugInfo = null,
@@ -32,6 +62,12 @@ const max_clips = 64;
 /// Max blur downsample exponent: blur factor is `2^level`, `level` capped here.
 const max_blur_levels = 5;
 
+/// A cache entry is evicted when it has not been used for this many frames.
+const eviction_frames: u64 = 5;
+/// Per-frame scratch pool size. Working buffers above this size (large blur
+/// planes, huge shadow rasters) are served by the page allocator instead.
+const scratch_pool_bytes = 1 << 20;
+
 const mask_segs = 8;
 const mask_verts = mask_segs * 4 + 1;
 const mask_indices = mask_segs * 4 * 3;
@@ -43,6 +79,48 @@ const gradient_indices_max = gradient_cells_max * gradient_cells_max * 6;
 /// Gradients are baked into a texture capped at this resolution per side
 /// and stretched to the drawing area.
 const max_gradient_size: f32 = 512.0;
+
+/// Frame buffer sizes for the batched primitive queue. The scene is small
+/// (hundreds of rounded-rect fans and textured quads); when the buffers fill
+/// mid-frame the queued primitives are flushed early and the queue reopens.
+const max_batch_verts = 16384;
+const max_batch_idx = 65536;
+const max_batch_prims = 4096;
+/// Transient textures awaiting destruction after the next batch flush.
+const max_pending = 128;
+
+/// One queued draw primitive: vertices/indices sliced into the batch arrays,
+/// the texture they sample (null = flat vertex color), and the clip rect active
+/// when it was queued. Consecutive primitives with the same texture and clip
+/// share one primitive and are drawn with a single `SDL_RenderGeometry` call.
+const BatchPrim = struct {
+    tex: ?*sdl.SDL_Texture,
+    clip: ClipRec,
+    vstart: usize,
+    vlen: usize,
+    istart: usize,
+    ilen: usize,
+};
+
+/// The clip rect in effect when a primitive was queued; `active = false` means
+/// no clip (the render target's own bounds clip it).
+const ClipRec = struct {
+    active: bool,
+    area: lu.Area = undefined,
+};
+
+const Batch = struct {
+    prims: []BatchPrim = &.{},
+    verts: []sdl.SDL_Vertex = &.{},
+    idx: []c_int = &.{},
+    nprims: usize = 0,
+    nverts: usize = 0,
+    nidx: usize = 0,
+    /// The texture and clip of the currently open primitive run, for merging.
+    open: bool = false,
+    cur_tex: ?*sdl.SDL_Texture = undefined,
+    cur_clip: ClipRec = undefined,
+};
 
 const Surface = sdl.surface.SDL_Surface;
 
@@ -102,6 +180,19 @@ const GpuEntry = struct {
     /// Hash of the input that produced `texture`; a match means the texture is
     /// still current and no re-upload (or re-rasterize) is needed.
     fingerprint: u64,
+    /// Last frame this entry was used; idle entries are evicted.
+    last_seen: u64,
+};
+
+/// A cached backdrop-blur texture.
+const BlurEntry = struct {
+    texture: *sdl.SDL_Texture,
+    /// Size of the (possibly downsampled) blur texture, in texels; the drawing
+    /// code derives the source rectangle from the element geometry and these.
+    w: u32,
+    h: u32,
+    /// Last frame this entry was used; idle entries are evicted.
+    last_seen: u64,
 };
 
 pub fn init(config: Config) !Window {
@@ -119,6 +210,12 @@ pub fn init(config: Config) !Window {
         .size = undefined,
         .title = config.title,
     };
+    // The per-frame scratch pool and batch buffers are the bulk of the struct's
+    // memory; keep them on the heap so `Window` stays a small stack value.
+    self.scratch = try std.heap.page_allocator.alloc(u8, scratch_pool_bytes);
+    self.batch.prims = try std.heap.page_allocator.alloc(BatchPrim, max_batch_prims);
+    self.batch.verts = try std.heap.page_allocator.alloc(sdl.SDL_Vertex, max_batch_verts);
+    self.batch.idx = try std.heap.page_allocator.alloc(c_int, max_batch_idx);
     if (!sdl.createWindowAndRenderer(
         config.title,
         @intCast(config.min_size.w),
@@ -145,6 +242,18 @@ pub fn deinit(self: *Window) void {
     while (it.next()) |entry| {
         sdl.destroyTexture(entry.value_ptr.texture);
     }
+    var sit = self.shadow_cache.iterator();
+    while (sit.next()) |entry| {
+        sdl.destroyTexture(entry.value_ptr.texture);
+    }
+    var bit = self.blur_cache.iterator();
+    while (bit.next()) |entry| {
+        sdl.destroyTexture(entry.value_ptr.texture);
+    }
+    std.heap.page_allocator.free(self.scratch);
+    std.heap.page_allocator.free(self.batch.prims);
+    std.heap.page_allocator.free(self.batch.verts);
+    std.heap.page_allocator.free(self.batch.idx);
     sdl.destroyRenderer(self.renderer);
     sdl.destroyWindow(self.window);
 }
@@ -170,21 +279,44 @@ pub fn texture(self: *Window, id: usize) ?*sdl.SDL_Texture {
     return self.textures[id].texture;
 }
 
-/// Hands this Window's persistent texture cache to `ctx`, so rasterized text
-/// and images upload once per element id instead of on every frame. Call once
-/// after the Window (and the Context) exist, before building widgets.
+/// Hands this Window's persistent texture cache and layout-results cache to
+/// `ctx`, so rasterized text and images upload once per element id instead of
+/// on every frame, and containers with a stable id reuse their laid-out
+/// positions. Call once after the Window (and the Context) exist, before
+/// building widgets.
 pub fn plugCache(self: *Window, ctx: *lu.Context) void {
     ctx.gpu_cache = .{
         .ptr = self,
         .lookup = &lookupCached,
         .upload = &uploadCached,
     };
+    ctx.layout_cache = .{
+        .ptr = self,
+        .consult = &consultLayout,
+        .store = &storeLayout,
+    };
+}
+
+/// Brackets one cache consult/retrieve/upload under the `.cache` profiler
+/// section. The section is nesting-aware, so a cache call that happens while
+/// another is open (a cached texture drawn from inside a shadow lookup) still
+/// folds into a single timing span without corrupting the enclosing phase.
+/// Mirrors `if (self.debug_info) |*d| ...` used for the other phases.
+fn cacheBegin(self: *Window) void {
+    if (self.debug_info) |*d| d.begin(.cache);
+}
+
+fn cacheEnd(self: *Window) void {
+    if (self.debug_info) |*d| d.end(.cache);
 }
 
 fn lookupCached(ptr: *anyopaque, key: u64, fingerprint: u64) ?u64 {
     const self: *Window = @ptrCast(@alignCast(ptr));
-    const entry = self.gpu_cache.get(key) orelse return null;
+    self.cacheBegin();
+    defer self.cacheEnd();
+    const entry = self.gpu_cache.getMutable(key) orelse return null;
     if (entry.fingerprint != fingerprint) return null;
+    entry.last_seen = self.frame;
     return key;
 }
 
@@ -200,9 +332,45 @@ fn uploadCached(ptr: *anyopaque, key: u64, fingerprint: u64, pb: lu.PixelBuffer)
     ) orelse return null;
     _ = sdl.setTextureBlendMode(tex, sdl.SDL_BLENDMODE_BLEND);
     _ = sdl.updateTexture(tex, null, @ptrCast(pb.pixels.ptr), @intCast(pb.width * 4));
+    self.cacheBegin();
+    defer self.cacheEnd();
     if (self.gpu_cache.get(key)) |old| sdl.destroyTexture(old.texture);
-    self.gpu_cache.put(key, .{ .texture = tex, .fingerprint = fingerprint });
+    self.gpu_cache.put(key, .{ .texture = tex, .fingerprint = fingerprint, .last_seen = self.frame });
     return key;
+}
+
+/// Returns the cached layout for a container element's stable id, or null when
+/// there is no cached entry.
+fn consultLayout(ptr: *anyopaque, key: u64) ?*lu.Context.LayoutEntry {
+    const self: *Window = @ptrCast(@alignCast(ptr));
+    self.cacheBegin();
+    defer self.cacheEnd();
+    const entry = self.layout_cache.getMutable(key) orelse return null;
+    entry.last_seen = self.frame;
+    return entry;
+}
+
+/// Stores a freshly computed layout under the container element's stable id.
+fn storeLayout(ptr: *anyopaque, key: u64, layout: *lu.Layout) void {
+    const self: *Window = @ptrCast(@alignCast(ptr));
+    self.cacheBegin();
+    defer self.cacheEnd();
+    var entry = lu.Context.LayoutEntry{
+        .container = layout.container,
+        .n = layout.cindex,
+        .kids = undefined,
+        .last_seen = self.frame,
+    };
+    for (0..layout.cindex) |i| {
+        const c = layout.children[i];
+        entry.kids[i] = .{
+            .id = c.id,
+            .extra = c.id_extra,
+            .pos = c.pos,
+            .size = c.size,
+        };
+    }
+    self.layout_cache.put(key, entry);
 }
 
 pub fn pushClip(self: *Window, area: lu.Area) void {
@@ -241,6 +409,12 @@ pub fn render(self: *Window, root: *lu.Element) void {
         @ptrCast(&self.size.w),
         @ptrCast(&self.size.h),
     );
+    self.ensureScratch();
+    _ = self.scratch_fba.reset();
+    self.frame += 1;
+    self.evictStale();
+    self.batchReset();
+    self.pn = 0;
     if (self.debug_info) |*d| d.begin(.layout);
     // Top-down layout: size the root from the window, wire it to its layout,
     // and let the layout tree size and position every descendant.
@@ -252,6 +426,8 @@ pub fn render(self: *Window, root: *lu.Element) void {
     if (self.debug_info) |*d| d.end(.layout);
     if (self.debug_info) |*d| d.begin(.draw);
     self.drawElement(root, .{ .pos = root.pos, .size = root.size });
+    self.flushBatch();
+    self.drainPending();
     if (self.debug_info) |*d| d.end(.draw);
 }
 
@@ -288,6 +464,320 @@ pub fn debugRelease(self: *Window) void {
         self.debug_info.?.deinit();
         self.debug_info = null;
     }
+}
+
+fn ensureScratch(self: *Window) void {
+    if (self.scratch_ready) return;
+    self.scratch_fba = std.heap.FixedBufferAllocator.init(self.scratch);
+    self.scratch_ready = true;
+}
+
+/// Allocates `n` items from the per-frame scratch pool, falling back to the
+/// page allocator for allocations that overflow the pool. Pool memory is
+/// reclaimed wholesale at the next frame's `scratch_fba.reset()`.
+fn scratchAlloc(self: *Window, comptime T: type, n: usize) ![]T {
+    self.ensureScratch();
+    if (self.scratch_fba.allocator().alloc(T, n)) |m| return m else |_| {}
+    return std.heap.page_allocator.alloc(T, n);
+}
+
+/// Frees a scratch allocation. Pool-owned memory is a no-op (reclaimed on the
+/// next frame reset); page-backed overflow is returned to the allocator.
+fn scratchFree(self: *Window, comptime T: type, m: []T) void {
+    if (m.len == 0) return;
+    const lo: usize = @intFromPtr(self.scratch.ptr);
+    const hi: usize = lo + self.scratch.len;
+    const p: usize = @intFromPtr(m.ptr);
+    if (p >= lo and p < hi) return;
+    std.heap.page_allocator.free(m);
+}
+
+/// Frees every texture cached entry that has not been used in the last
+/// `eviction_frames` frames, across all caches. Runs once per frame at the top
+/// of `render`, so a texture whose element disappears (or stops being drawn)
+/// is torn down shortly after it goes idle.
+fn evictStale(self: *Window) void {
+    self.sweepCache(GpuEntry, &self.gpu_cache, true);
+    self.sweepCache(ShadowEntry, &self.shadow_cache, true);
+    self.sweepCache(BlurEntry, &self.blur_cache, true);
+    self.sweepCache(lu.Context.LayoutEntry, &self.layout_cache, false);
+}
+
+fn sweepCache(
+    self: *Window,
+    comptime V: type,
+    cache: *lu.Cache.Cache(u64, V, 65536),
+    comptime destroy_tex: bool,
+) void {
+    const n = cache.count();
+    if (n == 0) return;
+    const keys = self.scratchAlloc(u64, n) catch return;
+    defer self.scratchFree(u64, keys);
+    var kn: usize = 0;
+    var it = cache.iterator();
+    while (it.next()) |en| {
+        const e = &en.value_ptr.*;
+        if (self.frame -| e.last_seen > eviction_frames) {
+            keys[kn] = en.key_ptr.*;
+            kn += 1;
+        }
+    }
+    for (keys[0..kn]) |k| {
+        if (destroy_tex)
+            if (cache.get(k)) |en| sdl.destroyTexture(en.texture);
+        cache.remove(k);
+    }
+}
+
+fn batchReset(self: *Window) void {
+    self.batch.nprims = 0;
+    self.batch.nverts = 0;
+    self.batch.nidx = 0;
+    self.batch.open = false;
+}
+
+/// The clip rect in effect right now (the top of the clip stack), or no clip.
+fn currentClip(self: *const Window) ClipRec {
+    if (self.cindex == 0) return .{ .active = false };
+    return .{ .active = true, .area = self.clip_stack[self.cindex - 1] };
+}
+
+fn clipEq(a: ClipRec, b: ClipRec) bool {
+    if (a.active != b.active) return false;
+    if (!a.active) return true;
+    return a.area.pos.x == b.area.pos.x and a.area.pos.y == b.area.pos.y and
+        a.area.size.w == b.area.size.w and a.area.size.h == b.area.size.h;
+}
+
+/// Appends a primitive to the per-frame batch. Consecutive primitives with the
+/// same texture and clip are merged into a single `SDL_RenderGeometry` call at
+/// flush time (their vertices carry their own colors, so distinct colors can
+/// share a call); when a run breaks (texture or clip changes) the previous run
+/// is closed and a new one begins, preserving painter's order. If the batch
+/// buffers fill, everything queued so far is flushed early and the batch
+/// reopens for the remainder.
+fn emitPrim(self: *Window, tex: ?*sdl.SDL_Texture, clip: ClipRec, verts: []const sdl.SDL_Vertex, idx: []const c_int) void {
+    if (verts.len == 0 or idx.len == 0) return;
+    const b = &self.batch;
+    const same_run = b.open and b.cur_tex == tex and clipEq(b.cur_clip, clip);
+    if (!same_run) {
+        if (b.nprims >= b.prims.len) {
+            self.flushBatch();
+            return self.emitPrim(tex, clip, verts, idx);
+        }
+        b.open = true;
+        b.cur_tex = tex;
+        b.cur_clip = clip;
+        b.prims[b.nprims] = .{
+            .tex = tex,
+            .clip = clip,
+            .vstart = b.nverts,
+            .vlen = verts.len,
+            .istart = b.nidx,
+            .ilen = idx.len,
+        };
+        b.nprims += 1;
+    }
+    if (b.nverts + verts.len > b.verts.len or b.nidx + idx.len > b.idx.len) {
+        self.flushBatch();
+        return self.emitPrim(tex, clip, verts, idx);
+    }
+    const p = &b.prims[b.nprims - 1];
+    @memcpy(b.verts[b.nverts .. b.nverts + verts.len], verts);
+    @memcpy(b.idx[b.nidx .. b.nidx + idx.len], idx);
+    b.nverts += verts.len;
+    b.nidx += idx.len;
+    p.vlen = b.nverts - p.vstart;
+    p.ilen = b.nidx - p.istart;
+}
+
+/// Draws every queued primitive, setting the clip rect only when it changes
+/// between runs and issuing one `SDL_RenderGeometry` call per run. The batch is
+/// empty afterwards; `render` calls this once after the tree walk.
+fn flushBatch(self: *Window) void {
+    const b = &self.batch;
+    if (b.nprims == 0) return;
+    _ = sdl.setRenderDrawBlendMode(self.renderer, sdl.SDL_BLENDMODE_BLEND);
+    var cur = ClipRec{ .active = false };
+    for (b.prims[0..b.nprims]) |p| {
+        if (!clipEq(cur, p.clip)) {
+            cur = p.clip;
+            if (p.clip.active)
+                _ = sdl.setRenderClipRect(self.renderer, &p.clip.area.toSDL())
+            else
+                _ = sdl.setRenderClipRect(self.renderer, null);
+        }
+        _ = sdl.renderGeometry(
+            self.renderer,
+            p.tex,
+            b.verts[p.vstart..][0..p.vlen].ptr,
+            @intCast(p.vlen),
+            b.idx[p.istart..][0..p.ilen].ptr,
+            @intCast(p.ilen),
+        );
+    }
+    _ = sdl.setRenderClipRect(self.renderer, null);
+    self.batchReset();
+}
+
+/// Schedules a texture for destruction after the next batch flush. Transient
+/// textures (uncached gradient bakes) are still referenced by queued
+/// primitives, so they must outlive the flush that draws them.
+fn deferDestroy(self: *Window, tex: *sdl.SDL_Texture) void {
+    if (self.pn >= self.pending.len) {
+        self.flushBatch();
+        self.drainPending();
+    }
+    self.pending[self.pn] = tex;
+    self.pn += 1;
+}
+
+fn drainPending(self: *Window) void {
+    for (self.pending[0..self.pn]) |t| {
+        if (t) |tex| sdl.destroyTexture(tex);
+    }
+    self.pn = 0;
+}
+
+fn toFColor(c: lu.Color) sdl.SDL_FColor {
+    return .{
+        .r = @as(f32, @floatFromInt(c.r)) / 255.0,
+        .g = @as(f32, @floatFromInt(c.g)) / 255.0,
+        .b = @as(f32, @floatFromInt(c.b)) / 255.0,
+        .a = @as(f32, @floatFromInt(c.a)) / 255.0,
+    };
+}
+
+/// Draws an axis-aligned quad into the batch. `dst` is the target rect in world
+/// pixels; `src` is the sampled region of the texture in *texture pixels* and
+/// is normalized here, matching how textured masks map UVs.
+fn emitQuad(self: *Window, tex: ?*sdl.SDL_Texture, dst: sdl.SDL_FRect, src: ?sdl.SDL_FRect, color: sdl.SDL_FColor) void {
+    var tu0: f32 = 0;
+    var tv0: f32 = 0;
+    var tu1: f32 = 1;
+    var tv1: f32 = 1;
+    if (tex) |t| {
+        var tw: f32 = 1;
+        var th: f32 = 1;
+        _ = sdl.textureSize(t, &tw, &th);
+        const s = src orelse sdl.SDL_FRect{ .x = 0, .y = 0, .w = tw, .h = th };
+        tu0 = s.x / tw;
+        tv0 = s.y / th;
+        tu1 = (s.x + s.w) / tw;
+        tv1 = (s.y + s.h) / th;
+    }
+    var verts: [4]sdl.SDL_Vertex = undefined;
+    verts[0] = .{ .position = .{ .x = dst.x, .y = dst.y }, .color = color, .tex_coord = .{ .x = tu0, .y = tv0 } };
+    verts[1] = .{ .position = .{ .x = dst.x + dst.w, .y = dst.y }, .color = color, .tex_coord = .{ .x = tu1, .y = tv0 } };
+    verts[2] = .{ .position = .{ .x = dst.x, .y = dst.y + dst.h }, .color = color, .tex_coord = .{ .x = tu0, .y = tv1 } };
+    verts[3] = .{ .position = .{ .x = dst.x + dst.w, .y = dst.y + dst.h }, .color = color, .tex_coord = .{ .x = tu1, .y = tv1 } };
+    const indeces = [6]c_int{ 0, 1, 2, 2, 1, 3 };
+    self.emitPrim(tex, self.currentClip(), &verts, &indeces);
+}
+
+fn bufferFingerprint(pb: lu.PixelBuffer) u64 {
+    var h = std.hash.Wyhash.init(0xc0ffee);
+    h.update(std.mem.asBytes(&pb.width));
+    h.update(std.mem.asBytes(&pb.height));
+    h.update(pb.pixels);
+    return h.final();
+}
+
+fn bufferFitFingerprint(b: lu.Buffer8) u64 {
+    var h = std.hash.Wyhash.init(0xc0ffee);
+    h.update(std.mem.asBytes(&b.buffer.width));
+    h.update(std.mem.asBytes(&b.buffer.height));
+    h.update(b.buffer.pixels);
+    h.update(std.mem.asBytes(&b.fit));
+    h.update(std.mem.asBytes(&b.filter));
+    return h.final();
+}
+
+/// Hash of the element's geometry plus every gradient setting that changes the
+/// baked texture, so a cached gradient bake is reused only while the element
+/// keeps the same shape and gradient.
+fn gradientFingerprint(g: lu.Gradient, geom: lu.Geometry) u64 {
+    var h = std.hash.Wyhash.init(0xdecafbad);
+    h.update(std.mem.asBytes(&geom.pos.x));
+    h.update(std.mem.asBytes(&geom.pos.y));
+    h.update(std.mem.asBytes(&geom.size.w));
+    h.update(std.mem.asBytes(&geom.size.h));
+    h.update(std.mem.asBytes(&geom.radius.top_left));
+    h.update(std.mem.asBytes(&geom.radius.top_right));
+    h.update(std.mem.asBytes(&geom.radius.bottom_left));
+    h.update(std.mem.asBytes(&geom.radius.bottom_right));
+    h.update(std.mem.asBytes(&g.opacity));
+    for (g.points) |p| {
+        h.update(std.mem.asBytes(&p.x));
+        h.update(std.mem.asBytes(&p.y));
+        h.update(std.mem.asBytes(&p.color));
+    }
+    return h.final();
+}
+
+/// The texture for a CPU pixel buffer, served from the per-element cache: the
+/// first frame uploads the buffer under the element's stable id, later frames
+/// reuse the texture (no per-frame create/update/destroy). A changed fingerprint
+/// re-uploads. Elements without a stable id (raw container structs) fall back to
+/// a transient texture destroyed after the batch flush.
+fn elementBufferTexture(self: *Window, e: *lu.Element, pb: lu.PixelBuffer, filter: lu.Filter) ?*sdl.SDL_Texture {
+    if (pb.pixels.len == 0 or pb.width == 0 or pb.height == 0) return null;
+    const fp = bufferFingerprint(pb);
+    if (e.id == 0) {
+        const tex = self.uploadBuffer(pb, filter) orelse return null;
+        self.deferDestroy(tex);
+        return tex;
+    }
+    const key = lu.Context.cacheKey(e.id, e.id_extra);
+    if (self.gpu_cache.getMutable(key)) |entry| {
+        entry.last_seen = self.frame;
+        if (entry.fingerprint == fp) return entry.texture;
+    }
+    const tex = self.uploadBuffer(pb, filter) orelse return null;
+    if (self.gpu_cache.get(key)) |old| sdl.destroyTexture(old.texture);
+    self.gpu_cache.put(key, .{ .texture = tex, .fingerprint = fp, .last_seen = self.frame });
+    if (self.gpu_cache.get(key) == null) self.deferDestroy(tex);
+    return tex;
+}
+
+/// Creates and fills a streaming texture from a pixel buffer.
+fn uploadBuffer(self: *Window, pb: lu.PixelBuffer, filter: lu.Filter) ?*sdl.SDL_Texture {
+    const tex = sdl.createTexture(
+        self.renderer,
+        sdl.pixels.SDL_PIXELFORMAT_ABGR8888,
+        sdl.SDL_TEXTUREACCESS_STREAMING,
+        @intCast(pb.width),
+        @intCast(pb.height),
+    ) orelse return null;
+    _ = sdl.setTextureBlendMode(tex, sdl.SDL_BLENDMODE_BLEND);
+    if (filter == .linear)
+        _ = sdl.setTextureScaleMode(tex, .SDL_SCALEMODE_LINEAR)
+    else
+        _ = sdl.setTextureScaleMode(tex, .SDL_SCALEMODE_NEAREST);
+    _ = sdl.updateTexture(tex, null, @ptrCast(pb.pixels.ptr), @intCast(pb.width * 4));
+    return tex;
+}
+
+/// The baked gradient texture for an element, served from the per-element cache
+/// keyed by the element id, the gradient and the element's geometry. Like
+/// `elementBufferTexture`, elements without a stable id use a transient bake.
+fn elementGradientTexture(self: *Window, e: *lu.Element, g: lu.Gradient, geom: lu.Geometry) ?*sdl.SDL_Texture {
+    const fp = gradientFingerprint(g, geom);
+    if (e.id == 0) {
+        const tex = self.gradientTexture(g, geom.size.w, geom.size.h) orelse return null;
+        self.deferDestroy(tex);
+        return tex;
+    }
+    const key = lu.Context.cacheKey(e.id, e.id_extra);
+    if (self.gpu_cache.getMutable(key)) |entry| {
+        entry.last_seen = self.frame;
+        if (entry.fingerprint == fp) return entry.texture;
+    }
+    const tex = self.gradientTexture(g, geom.size.w, geom.size.h) orelse return null;
+    if (self.gpu_cache.get(key)) |old| sdl.destroyTexture(old.texture);
+    self.gpu_cache.put(key, .{ .texture = tex, .fingerprint = fp, .last_seen = self.frame });
+    if (self.gpu_cache.get(key) == null) self.deferDestroy(tex);
+    return tex;
 }
 
 fn drawElement(self: *Window, e: *lu.Element, area: lu.Area) void {
@@ -335,15 +825,37 @@ fn drawShadows(self: *Window, e: *lu.Element, area: lu.Area, mask: lu.Effect.Sha
 /// raster bounded; the example's shadows are well below this.
 const max_shadow_edge = 1024;
 const max_shadow_pixels = 1 << 20;
+/// Cap on distinct box-shadow rasters kept alive at once. Shadows are cheap to
+/// re-rasterize, so when this fills we just drop everything and start over.
+const max_shadow_cache = 64;
+
+/// One rasterized box shadow in the persistent `shadow_cache`. Shadows are
+/// keyed by the shape parameters that determine the pixels, not by the element,
+/// so an unchanged shadow (same box, radius, spread, offset, blur, color and
+/// mask) is drawn from the cache instead of being re-rasterized and re-uploaded
+/// every frame.
+const ShadowEntry = struct {
+    texture: *sdl.SDL_Texture,
+    w: i32,
+    h: i32,
+    /// Last frame this entry was used; idle entries are evicted.
+    last_seen: u64,
+};
 
 /// Rasterizes a single box shadow on the CPU and draws it as a texture.
 ///
 /// The shadow is the element's rounded rect, shifted by `x_offset`/`y_offset`
 /// and grown by `spread`, filled with the shadow color, then blurred. For
-/// `mask = out` the element's own box is punched out (a strict drop shadow:
-/// the shadow never shows over the element, even with a translucent
-/// background). For `mask = in` only the inside of the element's box is kept,
-/// which produces the inner-glow look.
+/// `mask = out` the element's own rounded shape is punched out (a strict drop
+/// shadow: the shadow never shows over the element, even with a translucent
+/// background). For `mask = in` only the inside of the element's rounded shape
+/// is kept, which produces the inner-glow look.
+///
+/// The raster spans the full shape plus the blur margin, so the pixels depend
+/// only on the shape and the shadow settings — never on where the element sits.
+/// Every shadow is cached (even ones whose blur region reaches a window edge;
+/// SDL clips the drawn quad to the render target), keyed by the element's id,
+/// its size and border radius, and the shadow parameters.
 fn drawShadow(self: *Window, e: *lu.Element, area: lu.Area, sh: lu.Effect.Shadow) void {
     if (area.size.w == 0 or area.size.h == 0) return;
     const ox: i32 = @intFromFloat(@round(sh.x_offset));
@@ -352,41 +864,44 @@ fn drawShadow(self: *Window, e: *lu.Element, area: lu.Area, sh: lu.Effect.Shadow
     const blur: i32 = @intFromFloat(@round(@max(0.0, sh.blur)));
     const color = tint(sh.color, e.effects);
 
-    // The shadow's base shape: the element box grown by `spread`, then shifted.
-    const ix0: i32 = @as(i32, @intCast(area.pos.x)) + ox - spr;
-    const iy0: i32 = @as(i32, @intCast(area.pos.y)) + oy - spr;
     const iw: i32 = @as(i32, @intCast(area.size.w)) + 2 * spr;
     const ih: i32 = @as(i32, @intCast(area.size.h)) + 2 * spr;
     if (iw <= 0 or ih <= 0) return;
 
-    // Region around the shape that the blur kernel reaches into.
     const margin: i32 = 2 * blur + 2;
-    var rx: i32 = ix0 - margin;
-    var ry: i32 = iy0 - margin;
-    var rw: i32 = iw + 2 * margin;
-    var rh: i32 = ih + 2 * margin;
-
-    // Clamp the raster to the window so the CPU buffer stays bounded.
-    const win_w: i32 = @intCast(self.size.w);
-    const win_h: i32 = @intCast(self.size.h);
-    rx = @max(rx, 0);
-    ry = @max(ry, 0);
-    rw = @min(rw, win_w - rx);
-    rh = @min(rh, win_h - ry);
-    if (rw <= 0 or rh <= 0) return;
+    const rw: i32 = iw + 2 * margin;
+    const rh: i32 = ih + 2 * margin;
     if (rw > max_shadow_edge or rh > max_shadow_edge) return;
     const n: usize = @as(usize, @intCast(rw)) * @as(usize, @intCast(rh));
     if (n > max_shadow_pixels) return;
 
-    const cov = std.heap.page_allocator.alloc(f32, n) catch return;
-    defer std.heap.page_allocator.free(cov);
-    const scratch = std.heap.page_allocator.alloc(f32, n) catch return;
-    defer std.heap.page_allocator.free(scratch);
-
-    // Shape rect in local raster coords.
-    const sx: i32 = ix0 - rx;
-    const sy: i32 = iy0 - ry;
     const rr = clampRadius(e.border_radius, iw, ih);
+    const key = shadowKey(e, iw, ih, ox, oy, spr, blur, rr, color, sh.mask);
+    self.cacheBegin();
+    const shadow_entry = self.shadow_cache.getMutable(key);
+    if (shadow_entry) |entry| entry.last_seen = self.frame;
+    self.cacheEnd();
+    if (shadow_entry) |entry| {
+        self.drawShadowTexture(
+            entry.texture,
+            entry.w,
+            entry.h,
+            @as(i32, @intCast(area.pos.x)) + ox - spr - margin,
+            @as(i32, @intCast(area.pos.y)) + oy - spr - margin,
+        );
+        return;
+    }
+
+    const cov = self.scratchAlloc(f32, n) catch return;
+    defer self.scratchFree(f32, cov);
+    const scratch = self.scratchAlloc(f32, n) catch return;
+    defer self.scratchFree(f32, scratch);
+
+    // Shape rect in local raster coords: the raster starts at the top-left of
+    // the whole plane (shape minus the blur margin), so the shape sits at the
+    // margin inset.
+    const sx: i32 = margin;
+    const sy: i32 = margin;
     for (0..@as(usize, @intCast(rh))) |y| {
         for (0..@as(usize, @intCast(rw))) |x| {
             const px: i32 = @intCast(x);
@@ -403,12 +918,15 @@ fn drawShadow(self: *Window, e: *lu.Element, area: lu.Area, sh: lu.Effect.Shadow
         boxBlur(scratch, cov, @intCast(rw), @intCast(rh), blur);
     }
 
-    const pixels = std.heap.page_allocator.alloc(u8, n * 4) catch return;
-    defer std.heap.page_allocator.free(pixels);
+    const pixels = self.scratchAlloc(u8, n * 4) catch return;
+    defer self.scratchFree(u8, pixels);
 
-    // Element box in local raster coords, for punching / clipping.
-    const ex: i32 = @as(i32, @intCast(area.pos.x)) - rx;
-    const ey: i32 = @as(i32, @intCast(area.pos.y)) - ry;
+    // Element box in local raster coords, for punching / clipping. The
+    // punch/keep follows the element's *rounded* silhouette: clipping against a
+    // sharp box would carve straight edges across the corners of a rounded
+    // element, leaving white triangles where the shadow should hug the curve.
+    const ex: i32 = sx + spr - ox;
+    const ey: i32 = sy + spr - oy;
     const e_w: i32 = @intCast(area.size.w);
     const e_h: i32 = @intCast(area.size.h);
 
@@ -417,7 +935,7 @@ fn drawShadow(self: *Window, e: *lu.Element, area: lu.Area, sh: lu.Effect.Shadow
         for (0..@as(usize, @intCast(rw))) |x| {
             const px: i32 = @intCast(x);
             const py: i32 = @intCast(y);
-            const inside_elem = px >= ex and py >= ey and px < ex + e_w and py < ey + e_h;
+            const inside_elem = inRoundedRect(ex, ey, e_w, e_h, rr, px, py);
             var a = cov[y * @as(usize, @intCast(rw)) + x] * shadow_a;
             if (sh.mask == .out) {
                 if (inside_elem) a = 0;
@@ -439,10 +957,15 @@ fn drawShadow(self: *Window, e: *lu.Element, area: lu.Area, sh: lu.Effect.Shadow
         @intCast(rw),
         @intCast(rh),
     ) orelse return;
-    defer sdl.destroyTexture(tex);
     _ = sdl.setTextureBlendMode(tex, sdl.SDL_BLENDMODE_BLEND);
     _ = sdl.updateTexture(tex, null, @ptrCast(pixels.ptr), @intCast(rw * 4));
 
+    self.storeShadow(key, tex, rw, rh);
+    self.drawShadowTexture(tex, rw, rh, @as(i32, @intCast(area.pos.x)) + ox - spr - margin, @as(i32, @intCast(area.pos.y)) + oy - spr - margin);
+}
+
+/// Draws a shadow raster (from the cache or freshly rasterized) at `(rx, ry)`.
+fn drawShadowTexture(self: *Window, tex: *sdl.SDL_Texture, rw: i32, rh: i32, rx: i32, ry: i32) void {
     const src = sdl.SDL_FRect{ .x = 0, .y = 0, .w = @floatFromInt(rw), .h = @floatFromInt(rh) };
     const dst = sdl.SDL_FRect{
         .x = @floatFromInt(rx),
@@ -450,7 +973,37 @@ fn drawShadow(self: *Window, e: *lu.Element, area: lu.Area, sh: lu.Effect.Shadow
         .w = @floatFromInt(rw),
         .h = @floatFromInt(rh),
     };
-    _ = sdl.renderTexture(self.renderer, tex, &src, &dst);
+    self.emitQuad(tex, dst, src, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 });
+}
+
+/// Stores a shadow raster in the cache, flushing the whole cache when it hits
+/// `max_shadow_cache` entries so VRAM stays bounded. The per-frame eviction
+/// sweep (`evictStale`) additionally drops shadow textures that go idle.
+fn storeShadow(self: *Window, key: u64, tex: *sdl.SDL_Texture, w: i32, h: i32) void {
+    if (self.shadow_cache.count() >= max_shadow_cache) {
+        var it = self.shadow_cache.iterator();
+        while (it.next()) |entry| sdl.destroyTexture(entry.value_ptr.texture);
+        self.shadow_cache.clear();
+    }
+    if (self.shadow_cache.get(key)) |old| sdl.destroyTexture(old.texture);
+    self.shadow_cache.put(key, .{ .texture = tex, .w = w, .h = h, .last_seen = self.frame });
+}
+
+/// Content key for a shadow raster: the element's stable id, its shape (size
+/// and border radius, never its position), and every shadow setting that
+/// changes the pixels. Inputs are small so collisions are unlikely; a collision
+/// would only make a visually-equal shadow draw in place of the requested one.
+fn shadowKey(e: *const lu.Element, iw: i32, ih: i32, ox: i32, oy: i32, spr: i32, blur: i32, rr: i32, color: lu.Color, mask: lu.Effect.Shadow.ShadowMask) u64 {
+    var hasher = std.hash.Wyhash.init(0x5ed12a4acf31c1f3);
+    const vals = [12]i32{
+        iw,         ih,         ox,         oy,
+        spr,        blur,       rr,         @as(i32, color.r),
+        @as(i32, color.g), @as(i32, color.b), @as(i32, color.a), @intFromEnum(mask),
+    };
+    hasher.update(std.mem.asBytes(&vals));
+    const eid = lu.Context.cacheKey(e.id, e.id_extra);
+    hasher.update(std.mem.asBytes(&eid));
+    return hasher.final();
 }
 
 /// The border radius for a shadow shape, clamped so the corners never exceed
@@ -565,9 +1118,9 @@ fn drawBackground(self: *Window, e: *lu.Element, area: lu.Area) void {
             self.fillRoundedRect(area, e.border_radius, tint(tint(c, e.effects), e.background.effects));
         },
         .image => |img| self.drawImageBackground(img, area, e.border_radius, alpha),
-        .gradient => |g| self.drawGradientBackground(g, area, e.border_radius, alpha),
-        .buffer => |pb| self.drawBufferBackground(pb, area, e.border_radius, alpha),
-        .image_buffer => |b| self.drawBufferFitBackground(b, area, e.border_radius, alpha),
+        .gradient => |g| self.drawGradientBackground(e, g, area, e.border_radius, alpha),
+        .buffer => |pb| self.drawBufferBackground(e, pb, area, e.border_radius, alpha),
+        .image_buffer => |b| self.drawBufferFitBackground(e, b, area, e.border_radius, alpha),
         .cached => |c| self.drawCachedBackground(c.key, area, e.border_radius, alpha),
     }
 }
@@ -576,10 +1129,16 @@ fn drawBackground(self: *Window, e: *lu.Element, area: lu.Area) void {
 /// first time it is seen (the element's first frame) and reusing the texture
 /// every frame after.
 fn drawCachedBackground(self: *Window, key: u64, area: lu.Area, radius: lu.Corners, alpha: f32) void {
-    const entry = self.gpu_cache.get(key) orelse return;
+    self.cacheBegin();
+    const entry = self.gpu_cache.getMutable(key) orelse {
+        self.cacheEnd();
+        return;
+    };
+    entry.last_seen = self.frame;
     var tex_w: f32 = 0;
     var tex_h: f32 = 0;
     _ = sdl.textureSize(entry.texture, &tex_w, &tex_h);
+    self.cacheEnd();
     const src = sdl.SDL_FRect{ .x = 0, .y = 0, .w = tex_w, .h = tex_h };
     self.renderMasked(area, radius, entry.texture, src, null, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = alpha });
 }
@@ -609,7 +1168,7 @@ fn drawBorder(self: *Window, e: *lu.Element, area: lu.Area) void {
     };
 
     switch (e.border_color) {
-        .gradient => |g| self.drawGradientBorder(g, area, &bars),
+        .gradient => |g| self.drawGradientBorder(e, g, area, &bars),
         .color => |c| {
             const color = tint(tint(c, e.effects), e.background.effects);
             switch (e.background.base) {
@@ -641,6 +1200,13 @@ fn drawBorder(self: *Window, e: *lu.Element, area: lu.Area) void {
 /// anchored to the element. Interior texels are therefore pixel-identical no
 /// matter the window size; only the thin band actually cut off by a window
 /// edge differs (there is no content beyond it).
+///
+/// The blurred backdrop is cached per element geometry + blur settings, so the
+/// expensive framebuffer read and downsample chain run once and the result is
+/// reused every frame the element keeps its shape. Anything queued in the batch
+/// *before* this blur in painter's order is flushed to the backbuffer first, so
+/// the cached result is produced from the same content an immediate draw would
+/// see.
 fn drawBlurBackdrop(self: *Window, area: lu.Area, radius: lu.Corners, alpha: f32, effects: ?[]const lu.Effect) void {
     var blur_radius: u32 = 8;
     var saturation: f32 = 1.0;
@@ -667,6 +1233,21 @@ fn drawBlurBackdrop(self: *Window, area: lu.Area, radius: lu.Corners, alpha: f32
     const py = area.pos.y -| margin;
     const pw = area.size.w + 2 * margin;
     const ph = area.size.h + 2 * margin;
+
+    const geom = lu.Geometry{ .pos = area.pos, .size = area.size, .radius = radius };
+    const key = blurKey(geom, blur_radius, saturation);
+    self.cacheBegin();
+    const blur_entry = self.blur_cache.getMutable(key);
+    if (blur_entry) |entry| entry.last_seen = self.frame;
+    self.cacheEnd();
+    if (blur_entry) |entry| {
+        self.emitBlur(area, radius, alpha, entry.texture, entry.w, entry.h, px, py, pw, ph);
+        return;
+    }
+
+    // Whatever is queued in the batch belongs *before* this blur in painter's
+    // order and must be visible in the framebuffer read below, so flush it now.
+    self.flushBatch();
 
     // Read the whole framebuffer (not just the region): the blur kernel
     // reaches ~blur_radius beyond the element, and reading the whole target
@@ -729,7 +1310,6 @@ fn drawBlurBackdrop(self: *Window, area: lu.Area, radius: lu.Corners, alpha: f32
     var chain: [6]*sdl.SDL_Texture = undefined;
     chain[0] = t0;
     var count: usize = 1;
-    defer for (chain[1..count]) |tex| sdl.destroyTexture(tex);
 
     var prev: *sdl.SDL_Texture = t0;
     var prev_w: u32 = pw;
@@ -756,11 +1336,43 @@ fn drawBlurBackdrop(self: *Window, area: lu.Area, radius: lu.Corners, alpha: f32
     }
     _ = sdl.setRenderTarget(self.renderer, null);
 
-    // Draw the full element rect from the final texture, masked to `radius`.
-    // The window clip cuts off whatever sticks outside; the element itself
-    // never shrinks. The texture is premultiplied, so modulate rgb by `alpha`
-    // too to keep the premultiplied colors consistent when effects reduce
-    // opacity.
+    // The final texture becomes the cached backdrop; the 1:1 stamp and the
+    // downsample intermediates are torn down here. If the put fails (cache full)
+    // the final texture is queued for destruction after the batch flush instead.
+    self.cacheBegin();
+    if (self.blur_cache.get(key)) |old| sdl.destroyTexture(old.texture);
+    self.blur_cache.put(key, .{ .texture = prev, .w = prev_w, .h = prev_h, .last_seen = self.frame });
+    if (self.blur_cache.get(key) == null) self.deferDestroy(prev);
+    self.cacheEnd();
+    for (chain[0 .. count - 1]) |tex| sdl.destroyTexture(tex);
+
+    self.emitBlur(area, radius, alpha, prev, prev_w, prev_h, px, py, pw, ph);
+}
+
+/// Cache key for a blurred backdrop: the element geometry (position, size and
+/// corner radius — the pixels really do depend on where the element sits, since
+/// the blur samples the background behind it) plus the blur settings that change
+/// the pixels. Saturation only reshapes the source colors before the chain runs.
+fn blurKey(geom: lu.Geometry, blur_radius: u32, saturation: f32) u64 {
+    var hasher = std.hash.Wyhash.init(0x4711d00d);
+    hasher.update(std.mem.asBytes(&geom.pos.x));
+    hasher.update(std.mem.asBytes(&geom.pos.y));
+    hasher.update(std.mem.asBytes(&geom.size.w));
+    hasher.update(std.mem.asBytes(&geom.size.h));
+    hasher.update(std.mem.asBytes(&geom.radius.top_left));
+    hasher.update(std.mem.asBytes(&geom.radius.top_right));
+    hasher.update(std.mem.asBytes(&geom.radius.bottom_left));
+    hasher.update(std.mem.asBytes(&geom.radius.bottom_right));
+    hasher.update(std.mem.asBytes(&blur_radius));
+    hasher.update(std.mem.asBytes(&saturation));
+    return hasher.final();
+}
+
+/// Emits the masked blur draw from a cached (or freshly computed) blur texture,
+/// deriving the source rectangle from the element geometry the same way the
+/// downsample chain is anchored: the final texture covers the padded region, so
+/// the element rect maps to the inner `pw` by `ph` at the padded offset.
+fn emitBlur(self: *Window, area: lu.Area, radius: lu.Corners, alpha: f32, tex: *sdl.SDL_Texture, prev_w: u32, prev_h: u32, px: u32, py: u32, pw: u32, ph: u32) void {
     const tw: f32 = @floatFromInt(prev_w);
     const th: f32 = @floatFromInt(prev_h);
     const scale_x = tw / @as(f32, @floatFromInt(pw));
@@ -771,14 +1383,7 @@ fn drawBlurBackdrop(self: *Window, area: lu.Area, radius: lu.Corners, alpha: f32
         .w = @as(f32, @floatFromInt(area.size.w)) * scale_x,
         .h = @as(f32, @floatFromInt(area.size.h)) * scale_y,
     };
-    self.renderMasked(
-        area,
-        radius,
-        prev,
-        src,
-        null,
-        .{ .r = alpha, .g = alpha, .b = alpha, .a = alpha },
-    );
+    self.renderMasked(area, radius, tex, src, null, .{ .r = alpha, .g = alpha, .b = alpha, .a = alpha });
 }
 
 fn drawImageBackground(self: *Window, img: lu.Image, area: lu.Area, radius: lu.Corners, alpha: f32) void {
@@ -799,21 +1404,13 @@ fn drawImageBackground(self: *Window, img: lu.Image, area: lu.Area, radius: lu.C
     self.renderMasked(area, radius, tex, src, null, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = alpha });
 }
 
-/// Uploads a CPU pixel buffer to an SDL texture and draws it as the background.
-fn drawBufferBackground(self: *Window, pb: lu.PixelBuffer, area: lu.Area, radius: lu.Corners, alpha: f32) void {
+/// Draws a CPU pixel buffer as the background. The buffer's texture is served
+/// from the per-element cache (see `elementBufferTexture`), so a label or image
+/// drawn from a buffer is uploaded once and reused instead of being re-uploaded
+/// every frame.
+fn drawBufferBackground(self: *Window, e: *lu.Element, pb: lu.PixelBuffer, area: lu.Area, radius: lu.Corners, alpha: f32) void {
     if (pb.pixels.len == 0 or pb.width == 0 or pb.height == 0) return;
-    const tex = sdl.createTexture(
-        self.renderer,
-        sdl.pixels.SDL_PIXELFORMAT_ABGR8888,
-        sdl.SDL_TEXTUREACCESS_STREAMING,
-        @intCast(pb.width),
-        @intCast(pb.height),
-    ) orelse return;
-    defer sdl.destroyTexture(tex);
-
-    _ = sdl.setTextureBlendMode(tex, sdl.SDL_BLENDMODE_BLEND);
-    _ = sdl.updateTexture(tex, null, @ptrCast(pb.pixels.ptr), @intCast(pb.width * 4));
-
+    const tex = self.elementBufferTexture(e, pb, .linear) orelse return;
     var tex_w: f32 = 0;
     var tex_h: f32 = 0;
     _ = sdl.textureSize(tex, &tex_w, &tex_h);
@@ -821,21 +1418,11 @@ fn drawBufferBackground(self: *Window, pb: lu.PixelBuffer, area: lu.Area, radius
     self.renderMasked(area, radius, tex, src, null, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = alpha });
 }
 
-/// Draws a decoded RGBA buffer into `area`, scaled according to `b.fit`.
-fn drawBufferFitBackground(self: *Window, b: lu.Buffer8, area: lu.Area, radius: lu.Corners, alpha: f32) void {
+/// Draws a decoded RGBA buffer into `area`, scaled according to `b.fit`. Like
+/// `drawBufferBackground`, the texture is cached per element id.
+fn drawBufferFitBackground(self: *Window, e: *lu.Element, b: lu.Buffer8, area: lu.Area, radius: lu.Corners, alpha: f32) void {
     if (b.buffer.pixels.len == 0 or b.buffer.width == 0 or b.buffer.height == 0) return;
-    const tex = sdl.createTexture(
-        self.renderer,
-        sdl.pixels.SDL_PIXELFORMAT_ABGR8888,
-        sdl.SDL_TEXTUREACCESS_STREAMING,
-        @intCast(b.buffer.width),
-        @intCast(b.buffer.height),
-    ) orelse return;
-    defer sdl.destroyTexture(tex);
-
-    _ = sdl.setTextureBlendMode(tex, sdl.SDL_BLENDMODE_BLEND);
-    _ = sdl.setTextureScaleMode(tex, if (b.filter == .linear) sdl.SDL_SCALEMODE_LINEAR else sdl.SDL_SCALEMODE_NEAREST);
-    _ = sdl.updateTexture(tex, null, @ptrCast(b.buffer.pixels.ptr), @intCast(b.buffer.width * 4));
+    const tex = self.elementBufferTexture(e, b.buffer, b.filter) orelse return;
 
     const dst = fitRect(b.fit, area, @floatFromInt(b.buffer.width), @floatFromInt(b.buffer.height));
     const src = sdl.SDL_FRect{ .x = 0, .y = 0, .w = @floatFromInt(b.buffer.width), .h = @floatFromInt(b.buffer.height) };
@@ -873,11 +1460,13 @@ fn fitRect(fit: lu.ImageFit, area: lu.Area, iw: f32, ih: f32) lu.Area {
     };
 }
 
-/// Draws `g` as the background of `area`, masked to `radius`.
-fn drawGradientBackground(self: *Window, g: lu.Gradient, area: lu.Area, radius: lu.Corners, alpha: f32) void {
+/// Draws `g` as the background of `area`, masked to `radius`. The bake is served
+/// from the per-element cache so it is not re-rasterized (and re-rendered into a
+/// target texture) every frame.
+fn drawGradientBackground(self: *Window, e: *lu.Element, g: lu.Gradient, area: lu.Area, radius: lu.Corners, alpha: f32) void {
     if (area.size.w == 0 or area.size.h == 0 or g.points.len == 0) return;
-    const tex = self.gradientTexture(g, area.size.w, area.size.h) orelse return;
-    defer sdl.destroyTexture(tex);
+    const geom = e.geometry(area);
+    const tex = self.elementGradientTexture(e, g, geom) orelse return;
     var tex_w: f32 = 0;
     var tex_h: f32 = 0;
     _ = sdl.textureSize(tex, &tex_w, &tex_h);
@@ -887,10 +1476,10 @@ fn drawGradientBackground(self: *Window, g: lu.Gradient, area: lu.Area, radius: 
 
 /// Draws `g` over the border bars. The gradient coordinates are relative to
 /// `area`, the smallest rectangle containing every border shape.
-fn drawGradientBorder(self: *Window, g: lu.Gradient, area: lu.Area, bars: []const lu.Area) void {
+fn drawGradientBorder(self: *Window, e: *lu.Element, g: lu.Gradient, area: lu.Area, bars: []const lu.Area) void {
     if (area.size.w == 0 or area.size.h == 0 or g.points.len == 0) return;
-    const tex = self.gradientTexture(g, area.size.w, area.size.h) orelse return;
-    defer sdl.destroyTexture(tex);
+    const geom = e.geometry(area);
+    const tex = self.elementGradientTexture(e, g, geom) orelse return;
     _ = sdl.setTextureBlendMode(tex, sdl.SDL_BLENDMODE_BLEND);
     var tex_w: f32 = 0;
     var tex_h: f32 = 0;
@@ -911,7 +1500,7 @@ fn drawGradientBorder(self: *Window, g: lu.Gradient, area: lu.Area, bars: []cons
             .w = @floatFromInt(bar.size.w),
             .h = @floatFromInt(bar.size.h),
         };
-        _ = sdl.renderTexture(self.renderer, tex, &src, &dst);
+        self.emitQuad(tex, dst, src, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 });
     }
 }
 
@@ -1088,15 +1677,12 @@ fn saturateSurface(self: *Window, surface: *Surface, x: u32, y: u32, w: u32, h: 
 
 fn fillRect(self: *Window, area: lu.Area, color: lu.Color) void {
     if (area.size.w == 0 or area.size.h == 0) return;
-    _ = sdl.setRenderDrawBlendMode(self.renderer, sdl.SDL_BLENDMODE_BLEND);
-    _ = sdl.setRenderDrawColor(self.renderer, color.r, color.g, color.b, color.a);
-    const rect = sdl.SDL_FRect{
+    self.emitQuad(null, .{
         .x = @floatFromInt(area.pos.x),
         .y = @floatFromInt(area.pos.y),
         .w = @floatFromInt(area.size.w),
         .h = @floatFromInt(area.size.h),
-    };
-    _ = sdl.renderFillRect(self.renderer, &rect);
+    }, null, toFColor(color));
 }
 
 /// Fills a rectangle with rounded corners using a triangle fan.
@@ -1181,8 +1767,9 @@ fn renderMasked(
         indices[k * 3 + 2] = @intCast(if (k + 2 > segs) 1 else k + 2);
     }
 
-    _ = sdl.setRenderDrawBlendMode(self.renderer, sdl.SDL_BLENDMODE_BLEND);
-    _ = sdl.renderGeometry(self.renderer, tex, &verts, @intCast(n), &indices, @intCast(indices.len));
+    // Everything routes through the per-frame batch so the whole frame (shadows,
+    // fills, textures, blur) draws in one pass in painter's order.
+    self.emitPrim(tex, self.currentClip(), verts[0..n], indices[0 .. segs * 3]);
 }
 
 /// Builds the rounded-rect triangle fan for `area` into `verts`, returning the

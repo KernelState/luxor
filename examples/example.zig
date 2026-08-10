@@ -29,11 +29,22 @@ const toolbar_colors = [_]u32{ 0xFF5555FF, 0xFF55AAFF, 0xFF55FFAA, 0xFFAACCFF, 0
 const tile_colors = [_]u32{ 0xEE3344FF, 0xEE8855FF, 0xEECC33FF, 0x66CC55FF, 0x3399EEFF, 0x7744CCFF, 0xCC3388FF, 0x4488AAFF };
 
 pub fn main() !void {
-    var ctx = lu.Context{
-        .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-        .frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-        .freetype = try lu.Context.Freetype.init(),
-    };
+    // `Context` embeds the element pool (512 elements), so it is multi-megabyte;
+    // allocating it on the heap keeps `main`'s stack frame small enough for the
+    // default 8 MiB stack.
+    const ctx = try std.heap.page_allocator.create(lu.Context);
+    @memset(std.mem.asBytes(ctx), 0);
+    // The memset above zeroes `flags`, wiping the documented all-on defaults;
+    // `applyFlags` only ever disables a cache (via env), so restore the defaults
+    // explicitly or every cache silently stays off.
+    ctx.flags = .{};
+    ctx.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    ctx.frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    ctx.freetype = try lu.Context.Freetype.init();
+    ctx.leaf_layout = .{ .vtable = &lu.Layout.leaf, .parent = null };
+    // Destroy the context last, after the defers below have torn down the
+    // allocators and freetype that live inside it.
+    defer std.heap.page_allocator.destroy(ctx);
     defer ctx.freetype.deinit();
     defer ctx.arena.deinit();
     defer ctx.frame_arena.deinit();
@@ -59,7 +70,7 @@ pub fn main() !void {
 
     // Toggle caches via environment so the profiler can compare their cost.
     // `LUXOR_NO_GPU_CACHE=1`, `LUXOR_NO_TEXT_CACHE=1`, `LUXOR_NO_IMAGE_CACHE=1`.
-    applyFlags(&ctx);
+    applyFlags(ctx);
 
     var window = try lu.Window.init(.{
         .min_size = .{ .w = 800, .h = 600 },
@@ -68,7 +79,7 @@ pub fn main() !void {
         .decorated = true,
     });
     defer window.deinit();
-    window.plugCache(&ctx);
+    window.plugCache(ctx);
 
     // Button labels are rebuilt every frame, so format them once into buffers
     // that live for the whole app instead of leaking into the arena per frame.
@@ -111,7 +122,7 @@ pub fn main() !void {
             .pos = .{ .x = 0, .y = 0 },
             .background = lu.Background.solid(lu.Color{ .r = 0xDC, .g = 0xE4, .b = 0xF0, .a = 0xFF }),
             .layout = .{ .vtable = &lu.Layout.flex, .parent = null, .data = &root_cfg },
-            .ctx = &ctx,
+            .ctx = ctx,
             .events = lu.Context.noEvents,
         };
 
@@ -138,7 +149,7 @@ pub fn main() !void {
             .pos = .{ .x = 0, .y = 0 },
             .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
             .layout = .{ .vtable = &lu.Layout.flex, .parent = &root.layout.?, .data = &toolbar_cfg },
-            .ctx = &ctx,
+            .ctx = ctx,
             .events = lu.Context.noEvents,
         };
         // Stretch the toolbar across the window width (main is fixed), wrap the
@@ -155,7 +166,7 @@ pub fn main() !void {
             .pos = .{ .x = 0, .y = 0 },
             .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
             .layout = .{ .vtable = &lu.Layout.flex, .parent = &root.layout.?, .data = &button_field_cfg },
-            .ctx = &ctx,
+            .ctx = ctx,
             .events = lu.Context.noEvents,
         };
         // Stretch across the window; each row fills the width, and the field's own
@@ -179,10 +190,12 @@ pub fn main() !void {
         }, @src());
         grid.layout.?.start();
         for (tile_colors, 0..) |col, i| {
-            // Exercise every shadow feature: offsets, blur, spread, negative
-            // offsets, the inset (`in`) mask, and stacked shadows.
+            // Exercise every backdrop effect: a blur + drop shadow, shadows
+            // with different offsets/blur/spread, an inset (`in`) mask, and
+            // stacked shadows.
             const effects = switch (i % 4) {
                 0 => &[_]lu.Effect{
+                    .{ .blur = .{ .radius = 12, .saturation = 0.9 } },
                     .{ .shadow = .{ .mask = .out, .color = .{ .r = 0, .g = 0, .b = 0, .a = 160 }, .x_offset = 3, .y_offset = 3, .blur = 6 } },
                 },
                 1 => &[_]lu.Effect{
@@ -211,7 +224,7 @@ pub fn main() !void {
             .pos = .{ .x = 0, .y = 0 },
             .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
             .layout = .{ .vtable = &lu.Layout.flex, .parent = &root.layout.?, .data = &slider_row_cfg },
-            .ctx = &ctx,
+            .ctx = ctx,
             .events = lu.Context.noEvents,
         };
         _ = ctx.publishRequest(&slider_row, .{ .min_size = .{ .w = 0, .h = 0 } });

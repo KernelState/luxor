@@ -28,9 +28,37 @@ pub fn Cache(comptime Key: type, comptime Value: type, comptime BucketBytes: com
             return self.map.get(key);
         }
 
+        /// Returns a pointer to the stored value so callers can mutate it in
+        /// place (bump a last-seen frame counter) without replacing the whole
+        /// entry.
+        pub fn getMutable(self: *Self, key: Key) ?*Value {
+            self.ensure();
+            return self.map.getPtr(key);
+        }
+
+        /// Removes a single entry without freeing its value; the caller owns the
+        /// value (it may be an SDL texture torn down explicitly on eviction).
+        pub fn remove(self: *Self, key: Key) void {
+            self.ensure();
+            _ = self.map.remove(key);
+        }
+
         pub fn put(self: *Self, key: Key, value: Value) void {
             self.ensure();
             self.map.put(self.fba.allocator(), key, value) catch {};
+        }
+
+        /// Number of live entries (not the slab's capacity).
+        pub fn count(self: *Self) usize {
+            self.ensure();
+            return self.map.count();
+        }
+
+        /// Empties the map without freeing values; the caller owns them (they
+        /// are SDL textures in `Window`'s shadow cache, torn down explicitly).
+        pub fn clear(self: *Self) void {
+            self.ensure();
+            self.map.clearRetainingCapacity();
         }
 
         /// Iterates all live entries (for tearing down values the cache itself
