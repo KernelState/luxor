@@ -15,6 +15,10 @@ clip_stack: [max_clips]lu.Area = undefined,
 tindex: usize = 0,
 /// Current index in `clip_stack`
 cindex: usize = 0,
+/// Set while a primitive that must escape every ancestor clip (outer shadows)
+/// is being queued; `currentClip` then reports no clip so the batch flushes it
+/// with the renderer's clip disabled.
+clip_suspend: bool = false,
 /// Persistent per-element-id textures (created/uploaded via `plugCache`). The
 /// Window owns these and destroys them in `deinit`. Falls back to CPU
 /// rasterized `Background.buffer` in Context when a draw needs a texture that
@@ -537,7 +541,10 @@ fn batchReset(self: *Window) void {
 }
 
 /// The clip rect in effect right now (the top of the clip stack), or no clip.
+/// While `clip_suspend` is set, everything reports no clip so queued primitives
+/// (outer shadows) are flushed with the renderer clip disabled.
 fn currentClip(self: *const Window) ClipRec {
+    if (self.clip_suspend) return .{ .active = false };
     if (self.cindex == 0) return .{ .active = false };
     return .{ .active = true, .area = self.clip_stack[self.cindex - 1] };
 }
@@ -782,9 +789,11 @@ fn elementGradientTexture(self: *Window, e: *lu.Element, g: lu.Gradient, geom: l
 
 fn drawElement(self: *Window, e: *lu.Element, area: lu.Area) void {
     // Drop shadows extend outside the element's own box, so draw them before
-    // pushing the element clip (they still get clipped by the parent's content
-    // box, which matches CSS `overflow` semantics).
+    // pushing the element clip, with every ancestor clip suspended so a shadow
+    // can spill past the parent's content box.
+    self.clip_suspend = true;
     self.drawShadows(e, area, .out);
+    self.clip_suspend = false;
 
     self.pushClip(area);
     defer self.popClip();
@@ -1244,6 +1253,23 @@ fn drawBlurBackdrop(self: *Window, area: lu.Area, radius: lu.Corners, alpha: f32
         self.emitBlur(area, radius, alpha, entry.texture, entry.w, entry.h, px, py, pw, ph);
         return;
     }
+
+    // The element's clip rect is still on the renderer here (pushed by
+    // `drawElement`). The read and the offscreen stamp/downsample chain below
+    // render targets whose coordinates differ from window space, so an active
+    // clip would carve the mis-mapped element box out of the chain and leave a
+    // weird, half-blurred result. Suspend it for the read + chain and restore
+    // it once the blurred buffer is produced; the emission that follows queues
+    // into the batch under the element clip anyway.
+    var saved_clip: sdl.SDL_Rect = undefined;
+    const had_clip = sdl.renderClipEnabled(self.renderer);
+    if (had_clip) _ = sdl.getRenderClipRect(self.renderer, &saved_clip);
+    _ = sdl.setRenderClipRect(self.renderer, null);
+    defer if (had_clip) {
+        _ = sdl.setRenderClipRect(self.renderer, &saved_clip);
+    } else {
+        _ = sdl.setRenderClipRect(self.renderer, null);
+    };
 
     // Whatever is queued in the batch belongs *before* this blur in painter's
     // order and must be visible in the framebuffer read below, so flush it now.
