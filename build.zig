@@ -95,6 +95,22 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(hr);
 
+    const itest = b.addExecutable(.{
+        .name = "interaction_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/interaction_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "luxor", .module = lib.root_module },
+                .{ .name = "sdl", .module = sdl },
+            },
+        }),
+        .use_llvm = true,
+    });
+    const itest_install = b.addInstallArtifact(itest, .{});
+    b.getInstallStep().dependOn(&itest_install.step);
+
     const lib_tests = b.addTest(.{
         .root_module = lib.root_module,
     });

@@ -57,6 +57,13 @@ layout_cache: ?LayoutCacheSink = null,
 /// makes that cache a no-op: the rasterization/decode runs fresh every frame,
 /// so you can measure the real cost of text/images side by side. Default all-on.
 flags: Flags = .{},
+/// Per-frame event state for the view (the window). The Window's post-draw
+/// processing pass rewrites it every frame from the SDL events it pumped;
+/// widgets read it in `evalEvents` when they initialize elements, so an
+/// element's `active` state always reflects last frame while the hook callbacks
+/// (fired by that same pass) have effects visible next frame. Survives
+/// `clear()`.
+events: lu.View = .{},
 
 /// Static pool of `Element`s the builds allocate from. Layouts reference their
 /// children by pointer into this pool (never by value), so `Element` can embed
@@ -280,6 +287,19 @@ fn base(self: *Context, size: lu.Rect) lu.Element {
         .ctx = self,
         .focusable = false,
     };
+}
+
+/// Evaluates an element's interaction hooks against the view's per-frame event
+/// state, setting each hook's `active` from the element it targeted last frame.
+/// Must run after the user's `Overrides` (which wire the handlers and may set
+/// `id_extra`) so `active` reflects the element exactly as built. Elements
+/// render last frame's state: a button pressed this frame lights up next frame,
+/// and the hook callbacks fired by the view's processing pass take effect then.
+fn evalEvents(self: *Context, e: *lu.Element) void {
+    e.events.hover.fromId(e.id, self.events.hovered);
+    e.events.click.fromId(e.id, self.events.clicked);
+    e.events.focus.fromId(e.id, self.events.focused);
+    e.events.drag.fromId(e.id, self.events.dragged);
 }
 
 /// Requests `e`'s size and position from the current parent layout (set with a
@@ -896,6 +916,7 @@ pub fn label(self: *Context, text: []const u8, overrides: lu.Element.Overrides, 
     e.* = self.base(.{ .w = 0, .h = 0 });
     e.id = idOf(src);
     e.override(overrides);
+    self.evalEvents(e);
     const border = e.border;
     const pad = opts.padding;
     e.size = .{
@@ -922,6 +943,7 @@ pub fn box(self: *Context, size: lu.Rect, overrides: lu.Element.Overrides, compt
     e.* = self.base(size);
     e.id = idOf(src);
     e.override(overrides);
+    self.evalEvents(e);
     _ = self.publish(e);
     return e;
 }
@@ -1013,6 +1035,7 @@ pub fn button(self: *Context, text: []const u8, overrides: lu.Element.Overrides,
     e.background = lu.Background.solid(opts.color);
     e.border_radius = opts.radius;
     e.override(overrides);
+    self.evalEvents(e);
     const border = e.border;
     e.size = .{
         .w = inner.size.w + pad.left + pad.right + border.left + border.right,
@@ -1053,6 +1076,7 @@ pub fn checkbox(self: *Context, checked: bool, overrides: lu.Element.Overrides, 
     e.border_radius = opts.radius;
     if (checked) e.background = lu.Background.solid(opts.checked_color);
     e.override(overrides);
+    self.evalEvents(e);
     _ = self.publish(e);
     return e;
 }
@@ -1092,6 +1116,7 @@ pub fn progress_bar(self: *Context, value: f32, overrides: lu.Element.Overrides,
     }
 
     e.override(overrides);
+    self.evalEvents(e);
     _ = self.publish(e);
     return e;
 }
@@ -1145,6 +1170,7 @@ pub fn slider(self: *Context, value: f32, overrides: lu.Element.Overrides, opts:
     e.layout.?.addElement(knob_id, knob);
 
     e.override(overrides);
+    self.evalEvents(e);
     _ = self.publish(e);
     return e;
 }
@@ -1193,6 +1219,7 @@ pub fn image(self: *Context, source: lu.ImageSource, overrides: lu.Element.Overr
         .filter = opts.filter,
     });
     e.override(overrides);
+    self.evalEvents(e);
     _ = self.publish(e);
     return e;
 }

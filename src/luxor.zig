@@ -317,6 +317,38 @@ pub const Background = struct {
     }
 };
 
+/// Per-frame event state for the view (the window). The Window's post-draw
+/// processing pass rewrites this struct every frame from the SDL events it
+/// pumped; widgets read it when they initialize elements, so an element's
+/// `active` state reflects last frame while the hook callbacks fire (during the
+/// processing pass) and their effects appear next frame.
+///
+/// Element-specific events carry the stable id of the element they targeted
+/// last frame (null = none); non-element-specific events carry their data only.
+pub const View = struct {
+    /// The element under the pointer when the last frame was processed.
+    hovered: ?u64 = null,
+    /// The element being pressed (a click in progress); cleared on release.
+    clicked: ?u64 = null,
+    /// The element that owns keyboard focus.
+    focused: ?u64 = null,
+    /// The element being dragged; cleared on release.
+    dragged: ?u64 = null,
+    /// Current pointer position in window coordinates.
+    pointer: Pos = .{ .x = 0, .y = 0 },
+    /// Whether the pointer is inside the window.
+    pointer_inside: bool = false,
+    /// Whether the pointer moved since the last processed frame.
+    mouse_moved: bool = false,
+    /// New window size when the window was resized since the last frame.
+    resized: ?Rect = null,
+    /// The key of the last key edge; `key_down` tells which edge it was.
+    key: ?Key = null,
+    key_down: bool = false,
+    /// Whether the window was asked to close.
+    exit: bool = false,
+};
+
 pub fn Hook(comptime T: type) type {
     return struct {
         handle: ?Handle = null,
@@ -324,15 +356,17 @@ pub fn Hook(comptime T: type) type {
 
         const Self = @This();
         pub const Handle = union(enum) {
-            fptrs: []Fn,
+            fptrs: []const Fn,
             pub const Fn = struct {
                 data: *anyopaque,
                 func: *const fn (*anyopaque, T, bool) void,
             };
         };
 
+        /// Fires the handlers with `true`. Does not touch `active`: element
+        /// hooks get their render state from `fromId` at init time instead, so
+        /// the view's one-frame-lagged event state is what widgets draw.
         pub fn activate(self: *Self, data: T) void {
-            self.active = true;
             if (self.handle) |h| {
                 switch (h) {
                     .fptrs => |ps| {
@@ -342,8 +376,9 @@ pub fn Hook(comptime T: type) type {
             }
         }
 
+        /// Fires the handlers with `false`. Does not touch `active` (see
+        /// `activate`).
         pub fn deactivate(self: *Self, data: T) void {
-            self.active = false;
             if (self.handle) |h| {
                 switch (h) {
                     .fptrs => |ps| {
@@ -353,10 +388,32 @@ pub fn Hook(comptime T: type) type {
             }
         }
 
+        /// Evaluates `active` from the view's per-frame event state: `active`
+        /// becomes true only when `id` is the element the view reports for this
+        /// event. Called by widgets when an element is initialized (after the
+        /// user's overrides), so the element renders last frame's interaction
+        /// state rather than a hook-local latch.
+        pub fn fromId(self: *Self, id: u64, hit: ?u64) void {
+            self.active = if (hit) |h| h == id else false;
+        }
+
+        /// Fires the handlers with the current `active` state, without changing
+        /// it. Used for notifications that report progress on an interaction
+        /// that is already engaged (a drag start, a finished frame).
+        pub fn emit(self: *Self, data: T) void {
+            if (self.handle) |h| {
+                switch (h) {
+                    .fptrs => |ps| {
+                        for (ps) |p| p.func(p.data, data, self.active);
+                    },
+                }
+            }
+        }
+
         pub fn isEnabled(self: *Self) bool {
-            return blk: switch (self.handle) {
-                .fptrs => |ps| break :blk ps.len != 0,
-            };
+            return if (self.handle) |h| switch (h) {
+                .fptrs => |ps| ps.len != 0,
+            } else false;
         }
     };
 }

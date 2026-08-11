@@ -33,13 +33,13 @@ focusable: bool = true,
 const Element = @This();
 
 pub const Events = struct {
-    hover: lu.Hook(void),
-    click: lu.Hook(void),
-    drag: lu.Hook(u32),
-    render: lu.Hook(void),
-    modify: lu.Hook(void),
-    focus: lu.Hook(void),
-    key: lu.Hook(void),
+    hover: lu.Hook(void) = .{},
+    click: lu.Hook(void) = .{},
+    drag: lu.Hook(u32) = .{},
+    render: lu.Hook(void) = .{},
+    modify: lu.Hook(void) = .{},
+    focus: lu.Hook(void) = .{},
+    key: lu.Hook(void) = .{},
 };
 
 pub const Overrides = struct {
@@ -56,6 +56,10 @@ pub const Overrides = struct {
     margin: ?lu.Sides = null,
     focusable: ?bool = null,
     id_extra: ?u64 = null,
+    /// Event hooks to attach to the element. Applied like the other overrides,
+    /// so the widget evaluates them against the view's per-frame event state
+    /// (`fromId`) *after* this, and the element renders last frame's state.
+    events: ?Events = null,
 };
 
 pub fn override(self: *Element, o: Overrides) void {
@@ -71,6 +75,7 @@ pub fn override(self: *Element, o: Overrides) void {
         if (o.margin) |v| self.margin = v;
         if (o.focusable) |v| self.focusable = v;
         if (o.id_extra) |v| self.id_extra = v;
+        if (o.events) |v| self.events = v;
     }
 
     /// The element's draw-time shape in the parent's coordinate space: position

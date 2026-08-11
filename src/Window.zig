@@ -39,6 +39,34 @@ layout_cache: lu.Cache.Cache(u64, lu.Context.LayoutEntry, 65536) = .{},
 /// entry with the last frame it was used and evict entries idle for more than
 /// `eviction_frames`, so a disappearing element's textures are torn down.
 frame: u64 = 0,
+/// Set by `update` when the window is asked to close (QUIT or the window close
+/// button). The app loop should stop when `shouldQuit` reports true.
+quit: bool = false,
+/// The `Context` this view renders, set by `plugCache`. The post-draw
+/// processing pass publishes this frame's event state into `ctx.events`, which
+/// widgets read when they initialize elements next frame.
+ctx: ?*lu.Context = null,
+/// Last known pointer position in window coordinates, kept fresh by `update`.
+/// Hit-testing runs against this; the published copy lives in `ctx.events`.
+pointer: lu.Pos = .{ .x = 0, .y = 0 },
+/// Whether the pointer is currently inside the window (the OS does not report
+/// motion once it leaves, so this clears hover instead of freezing the last hit).
+pointer_inside: bool = false,
+/// Set whenever a `MOUSE_MOTION` arrives, reset at the top of `update`, so the
+/// processing pass can report "the pointer moved this frame" in `ctx.events`.
+mouse_moved: bool = false,
+/// Set to the new size whenever a `WINDOW_RESIZED` arrives, reset each frame.
+resized: ?lu.Rect = null,
+/// The key of the last `KEY_DOWN`/`KEY_UP` edge, reset each frame.
+key: ?lu.Key = null,
+key_down: bool = false,
+/// Button passed to drag hooks while a drag is in progress.
+drag_button: u32 = 0,
+/// Edge flags accumulated by `update` and consumed by the processing pass at
+/// the end of `render`, so per-frame rebuilds don't drop a press/release that
+/// arrived between frames.
+left_pressed: bool = false,
+left_released: bool = false,
 /// Per-frame scratch memory for transient working buffers (shadow coverage
 /// planes, blur row/column buffers, eviction key lists). Allocated on the heap
 /// in `init` (a multi-megabyte inline array would overflow the caller's stack);
@@ -286,9 +314,11 @@ pub fn texture(self: *Window, id: usize) ?*sdl.SDL_Texture {
 /// Hands this Window's persistent texture cache and layout-results cache to
 /// `ctx`, so rasterized text and images upload once per element id instead of
 /// on every frame, and containers with a stable id reuse their laid-out
-/// positions. Call once after the Window (and the Context) exist, before
-/// building widgets.
+/// positions. Also links the view's per-frame event state (`ctx.events`), which
+/// the post-draw processing pass rewrites every frame. Call once after the
+/// Window (and the Context) exist, before building widgets.
 pub fn plugCache(self: *Window, ctx: *lu.Context) void {
+    self.ctx = ctx;
     ctx.gpu_cache = .{
         .ptr = self,
         .lookup = &lookupCached,
@@ -407,6 +437,15 @@ pub fn popClip(self: *Window) void {
 /// Elements with a `blur` effect capture the pixels currently behind them in
 /// the backbuffer at draw time, so the blur is a live overlay: it only ever
 /// blurs what is directly underneath and is independent of the window size.
+///
+/// After the frame is drawn, a *processing* pass runs against the freshly
+/// laid-out tree: the pointer is hit-tested (clip-aware, so a child visually
+/// clipped by an ancestor cannot be clicked where it is not visible), pointer
+/// edges accumulated by `update` are dispatched onto the element hooks (hover,
+/// click, focus, drag), and the frame's event state is written into `ctx.events`.
+/// Because it runs after drawing, the frame always shows *last frame's* event
+/// state (widgets evaluate it at init) while the hook callbacks fire here and
+/// their effects appear next frame.
 pub fn render(self: *Window, root: *lu.Element) void {
     _ = sdl.getWindowSize(
         self.window,
@@ -433,6 +472,336 @@ pub fn render(self: *Window, root: *lu.Element) void {
     self.flushBatch();
     self.drainPending();
     if (self.debug_info) |*d| d.end(.draw);
+    self.events.draw.emit({});
+    self.process(root);
+}
+
+/// Whether `update` has seen the window asked to close (QUIT or a close
+/// request). The app loop should stop as soon as this is true.
+pub fn shouldQuit(self: *Window) bool {
+    return self.quit;
+}
+
+/// Pumps the SDL event queue, mapping each event onto the view's raw input
+/// state (pointer position, press/release edges, key edges, resize, exit) and
+/// firing the `Window.Events` hooks (`resize`, `cursor_move`, `click`, `key`,
+/// `exit`). The raw input is consumed by the processing pass at the end of
+/// `render`, which publishes the frame's event state into `ctx.events`. Call
+/// once per frame, before rebuilding the widget tree.
+pub fn update(self: *Window) void {
+    // Per-frame impulses: they only report what happened between this update
+    // and the previous one, so clear them before pumping.
+    self.mouse_moved = false;
+    self.resized = null;
+    self.key = null;
+    self.key_down = false;
+    var event: sdl.SDL_Event = undefined;
+    while (sdl.pollEvent(&event)) {
+        switch (event.type) {
+            sdl.SDL_EVENT_QUIT, sdl.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
+                self.events.exit.activate({});
+                self.quit = true;
+            },
+            sdl.SDL_EVENT_WINDOW_RESIZED => {
+                self.resized = .{
+                    .w = @intCast(event.window.data1),
+                    .h = @intCast(event.window.data2),
+                };
+                self.events.resize.activate(self.resized.?);
+            },
+            sdl.SDL_EVENT_WINDOW_MOUSE_ENTER => self.pointer_inside = true,
+            sdl.SDL_EVENT_WINDOW_MOUSE_LEAVE => self.pointer_inside = false,
+            sdl.SDL_EVENT_KEY_DOWN => {
+                if (keyFromScancode(event.key.scancode)) |k| {
+                    self.key = k;
+                    self.key_down = true;
+                    self.events.key.activate(k);
+                }
+            },
+            sdl.SDL_EVENT_KEY_UP => {
+                if (keyFromScancode(event.key.scancode)) |k| {
+                    self.key = k;
+                    self.key_down = false;
+                    self.events.key.deactivate(k);
+                }
+            },
+            sdl.SDL_EVENT_MOUSE_MOTION => {
+                self.pointer_inside = true;
+                self.mouse_moved = true;
+                self.pointer = sdlPosToLu(event.motion.x, event.motion.y, self.size);
+                self.events.cursor_move.activate(self.pointer);
+            },
+            sdl.SDL_EVENT_MOUSE_BUTTON_DOWN, sdl.SDL_EVENT_MOUSE_BUTTON_UP => {
+                const button = sdlButtonToLu(event.button.button);
+                self.pointer_inside = true;
+                self.pointer = sdlPosToLu(event.button.x, event.button.y, self.size);
+                if (event.type == sdl.SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                    self.events.click.activate(button);
+                    if (button == .left) self.left_pressed = true;
+                } else {
+                    self.events.click.deactivate(button);
+                    if (button == .left) self.left_released = true;
+                }
+            },
+            else => {},
+        }
+        // `window.size` is synced at the top of every `render` too, but keep it
+        // authoritative for hit-testing in case events arrive between renders.
+        _ = sdl.getWindowSize(self.window, @ptrCast(&self.size.w), @ptrCast(&self.size.h));
+    }
+}
+
+/// The processing pass that runs *after* the frame is drawn: hit-test the
+/// pointer against the freshly laid-out tree, dispatch pointer edges onto the
+/// element hooks, and rewrite `ctx.events` with this frame's event state. The
+/// next frame's widgets read that state at init (via `fromId`), so they render
+/// last frame's interactions while the hook callbacks fired here take effect
+/// next frame.
+fn process(self: *Window, root: *lu.Element) void {
+    const ctx = self.ctx orelse return;
+    const root_area = lu.Area{ .pos = root.pos, .size = root.size };
+    const hit = if (self.pointer_inside)
+        self.hitTest(root, root_area, null, self.pointer)
+    else
+        null;
+
+    // Non-element-specific state mirrors the raw input from `update`.
+    ctx.events.pointer = self.pointer;
+    ctx.events.pointer_inside = self.pointer_inside;
+    ctx.events.mouse_moved = self.mouse_moved;
+    ctx.events.resized = self.resized;
+    ctx.events.key = self.key;
+    ctx.events.key_down = self.key_down;
+    ctx.events.exit = self.quit;
+
+    // Hover: fire enter/leave against the previous frame's hovered element, and
+    // record this frame's hovered element in the view.
+    const hit_id = if (hit) |h| h.id else 0;
+    const prev_hovered = ctx.events.hovered orelse 0;
+    ctx.events.hovered = if (hit) |h| h.id else null;
+    if (hit_id != prev_hovered) {
+        if (prev_hovered != 0)
+            if (self.findElement(root, prev_hovered)) |old| old.events.hover.deactivate({});
+        if (hit) |h| h.events.hover.activate({});
+    }
+
+    if (self.left_pressed) {
+        self.left_pressed = false;
+        if (hit) |h| {
+            // A press starts a click; when the element also has a drag hook the
+            // press becomes the drag's start instead (the click hook still
+            // fires, but the release below never completes it).
+            ctx.events.clicked = h.id;
+            h.events.click.activate({});
+            if (h.events.drag.isEnabled()) {
+                ctx.events.dragged = h.id;
+                self.drag_button = @intFromEnum(lu.MouseButton.left);
+                // One call when the drag starts; the app reads `ctx.events`
+                // (dragged + pointer) during its build to follow the mouse.
+                h.events.drag.activate(self.drag_button);
+                self.focus(root, h);
+            } else {
+                self.focus(root, h);
+            }
+        } else {
+            ctx.events.clicked = null;
+            // Pressing empty space drops keyboard focus.
+            if (ctx.events.focused) |pid|
+                if (self.findElement(root, pid)) |old| old.events.focus.deactivate({});
+            ctx.events.focused = null;
+        }
+    }
+
+    if (self.left_released) {
+        self.left_released = false;
+        if (ctx.events.dragged) |did| {
+            if (self.findElement(root, did)) |d|
+                d.events.drag.deactivate(self.drag_button);
+            ctx.events.dragged = null;
+        } else if (ctx.events.clicked) |cid| {
+            // Only a release inside the element that took the press completes
+            // the click (the hook fires `false`); elsewhere the press is left
+            // discrete because the element is rebuilt next frame anyway.
+            if (hit) |h| if (h.id == cid) h.events.click.deactivate({});
+            ctx.events.clicked = null;
+        }
+    }
+}
+
+/// Moves keyboard focus to `hit` if it is focusable and differs from the
+/// current focus, debouncing the old element's `focus` hook.
+fn focus(self: *Window, root: *lu.Element, hit: *lu.Element) void {
+    const ctx = self.ctx orelse return;
+    if (!hit.focusable) return;
+    const prev = ctx.events.focused;
+    if (prev) |pid| if (pid == hit.id) return;
+    if (prev) |pid|
+        if (self.findElement(root, pid)) |old| old.events.focus.deactivate({});
+    ctx.events.focused = hit.id;
+    hit.events.focus.activate({});
+}
+
+/// Recursively finds the topmost element under `pos`. Mirror of the draw walk:
+/// children draw over their parent, so the deepest hit wins, and the effective
+/// clip of every ancestor (`clip` plus the element's own box and content box)
+/// gates the search so nothing invisible is returned.
+fn hitTest(self: *Window, e: *lu.Element, area: lu.Area, clip: ?lu.Area, pos: lu.Pos) ?*lu.Element {
+    if (!posInArea(pos, area)) return null;
+    if (clip) |c| if (!posInArea(pos, c)) return null;
+    if (e.layout) |*lay| {
+        if (lay.cindex > 0) {
+            const child_clip = intersectClip(clip, contentArea(e, area));
+            var top: ?*lu.Element = null;
+            for (0..lay.cindex) |i| {
+                const child = lay.children[i];
+                if (self.hitTest(child, .{ .pos = child.pos, .size = child.size }, child_clip, pos)) |h| top = h;
+            }
+            if (top) |t| return t;
+        }
+    }
+    return e;
+}
+
+/// Depth-first search for the element with stable id `id` in the laid-out tree.
+/// Used to reach the *previous* hover/focus element after the tree was rebuilt,
+/// since the old pointer was invalidated by the pool reset.
+fn findElement(self: *Window, e: *lu.Element, id: u64) ?*lu.Element {
+    if (e.id == id) return e;
+    if (e.layout) |*lay| {
+        for (0..lay.cindex) |i| {
+            if (self.findElement(lay.children[i], id)) |f| return f;
+        }
+    }
+    return null;
+}
+
+fn posInArea(pos: lu.Pos, area: lu.Area) bool {
+    return pos.x >= area.pos.x and pos.y >= area.pos.y and
+        pos.x < area.pos.x + area.size.w and pos.y < area.pos.y + area.size.h;
+}
+
+/// Intersects an optional clip rect with `area`, or returns `area` when no clip
+/// is active. A zero-area result simply fails every `posInArea` test.
+fn intersectClip(clip: ?lu.Area, area: lu.Area) ?lu.Area {
+    const a = clip orelse return area;
+    const x0 = @max(a.pos.x, area.pos.x);
+    const y0 = @max(a.pos.y, area.pos.y);
+    const x1 = @min(a.pos.x +| a.size.w, area.pos.x +| area.size.w);
+    const y1 = @min(a.pos.y +| a.size.h, area.pos.y +| area.size.h);
+    return .{
+        .pos = .{ .x = x0, .y = y0 },
+        .size = .{ .w = x1 -| x0, .h = y1 -| y0 },
+    };
+}
+
+/// Clamps raw SDL mouse coordinates into window pixel coordinates.
+fn sdlPosToLu(x: f32, y: f32, size: lu.Rect) lu.Pos {
+    const clamp_axis = struct {
+        fn f(v: f32, m: u32) u32 {
+            const iv = @max(@as(i32, @intFromFloat(@floor(v))), 0);
+            const limit = @as(i32, @intCast(m)) -| 1;
+            return @intCast(@min(iv, limit));
+        }
+    }.f;
+    return .{ .x = clamp_axis(x, size.w), .y = clamp_axis(y, size.h) };
+}
+
+/// Maps SDL mouse button indices onto `lu.MouseButton`. SDL numbers buttons
+/// 1..5 (left, middle, right, X1, X2); anything unmapped falls back to left.
+fn sdlButtonToLu(button: u8) lu.MouseButton {
+    return switch (button) {
+        sdl.SDL_BUTTON_LEFT => .left,
+        sdl.SDL_BUTTON_MIDDLE => .scroll,
+        else => .right,
+    };
+}
+
+/// Maps an SDL scancode onto the `lu.Key` repertoire, when it exists there.
+fn keyFromScancode(sc: c_int) ?lu.Key {
+    const letter = sdl.keycode.SDL_SCANCODE_A;
+    if (sc >= letter and sc < letter + 26)
+        return @enumFromInt(@as(u8, @intCast(sc - letter)));
+    return switch (sc) {
+        sdl.keycode.SDL_SCANCODE_1 => .num1,
+        sdl.keycode.SDL_SCANCODE_2 => .num2,
+        sdl.keycode.SDL_SCANCODE_3 => .num3,
+        sdl.keycode.SDL_SCANCODE_4 => .num4,
+        sdl.keycode.SDL_SCANCODE_5 => .num5,
+        sdl.keycode.SDL_SCANCODE_6 => .num6,
+        sdl.keycode.SDL_SCANCODE_7 => .num7,
+        sdl.keycode.SDL_SCANCODE_8 => .num8,
+        sdl.keycode.SDL_SCANCODE_9 => .num9,
+        sdl.keycode.SDL_SCANCODE_0 => .num0,
+        sdl.keycode.SDL_SCANCODE_F1 => .f1,
+        sdl.keycode.SDL_SCANCODE_F2 => .f2,
+        sdl.keycode.SDL_SCANCODE_F3 => .f3,
+        sdl.keycode.SDL_SCANCODE_F4 => .f4,
+        sdl.keycode.SDL_SCANCODE_F5 => .f5,
+        sdl.keycode.SDL_SCANCODE_F6 => .f6,
+        sdl.keycode.SDL_SCANCODE_F7 => .f7,
+        sdl.keycode.SDL_SCANCODE_F8 => .f8,
+        sdl.keycode.SDL_SCANCODE_F9 => .f9,
+        sdl.keycode.SDL_SCANCODE_F10 => .f10,
+        sdl.keycode.SDL_SCANCODE_F11 => .f11,
+        sdl.keycode.SDL_SCANCODE_F12 => .f12,
+        sdl.keycode.SDL_SCANCODE_RETURN => .enter,
+        sdl.keycode.SDL_SCANCODE_ESCAPE => .escape,
+        sdl.keycode.SDL_SCANCODE_BACKSPACE => .backspace,
+        sdl.keycode.SDL_SCANCODE_TAB => .tab,
+        sdl.keycode.SDL_SCANCODE_SPACE => .space,
+        sdl.keycode.SDL_SCANCODE_GRAVE => .grave,
+        sdl.keycode.SDL_SCANCODE_MINUS => .minus,
+        sdl.keycode.SDL_SCANCODE_EQUALS => .equal,
+        sdl.keycode.SDL_SCANCODE_LEFTBRACKET => .left_bracket,
+        sdl.keycode.SDL_SCANCODE_RIGHTBRACKET => .right_bracket,
+        sdl.keycode.SDL_SCANCODE_BACKSLASH => .backslash,
+        sdl.keycode.SDL_SCANCODE_SEMICOLON => .semicolon,
+        sdl.keycode.SDL_SCANCODE_APOSTROPHE => .apostrophe,
+        sdl.keycode.SDL_SCANCODE_COMMA => .comma,
+        sdl.keycode.SDL_SCANCODE_PERIOD => .period,
+        sdl.keycode.SDL_SCANCODE_SLASH => .slash,
+        sdl.keycode.SDL_SCANCODE_CAPSLOCK => .caps_lock,
+        sdl.keycode.SDL_SCANCODE_PRINTSCREEN => .print_screen,
+        sdl.keycode.SDL_SCANCODE_SCROLLLOCK => .scroll_lock,
+        sdl.keycode.SDL_SCANCODE_PAUSE => .pause,
+        sdl.keycode.SDL_SCANCODE_INSERT => .insert,
+        sdl.keycode.SDL_SCANCODE_HOME => .home,
+        sdl.keycode.SDL_SCANCODE_PAGEUP => .page_up,
+        sdl.keycode.SDL_SCANCODE_DELETE => .delete,
+        sdl.keycode.SDL_SCANCODE_END => .end,
+        sdl.keycode.SDL_SCANCODE_PAGEDOWN => .page_down,
+        sdl.keycode.SDL_SCANCODE_RIGHT => .right,
+        sdl.keycode.SDL_SCANCODE_LEFT => .left,
+        sdl.keycode.SDL_SCANCODE_DOWN => .down,
+        sdl.keycode.SDL_SCANCODE_UP => .up,
+        sdl.keycode.SDL_SCANCODE_NUMLOCKCLEAR => .num_lock,
+        sdl.keycode.SDL_SCANCODE_KP_DIVIDE => .kp_divide,
+        sdl.keycode.SDL_SCANCODE_KP_MULTIPLY => .kp_multiply,
+        sdl.keycode.SDL_SCANCODE_KP_MINUS => .kp_subtract,
+        sdl.keycode.SDL_SCANCODE_KP_PLUS => .kp_add,
+        sdl.keycode.SDL_SCANCODE_KP_ENTER => .kp_enter,
+        sdl.keycode.SDL_SCANCODE_KP_1 => .kp1,
+        sdl.keycode.SDL_SCANCODE_KP_2 => .kp2,
+        sdl.keycode.SDL_SCANCODE_KP_3 => .kp3,
+        sdl.keycode.SDL_SCANCODE_KP_4 => .kp4,
+        sdl.keycode.SDL_SCANCODE_KP_5 => .kp5,
+        sdl.keycode.SDL_SCANCODE_KP_6 => .kp6,
+        sdl.keycode.SDL_SCANCODE_KP_7 => .kp7,
+        sdl.keycode.SDL_SCANCODE_KP_8 => .kp8,
+        sdl.keycode.SDL_SCANCODE_KP_9 => .kp9,
+        sdl.keycode.SDL_SCANCODE_KP_0 => .kp0,
+        sdl.keycode.SDL_SCANCODE_KP_PERIOD => .kp_decimal,
+        sdl.keycode.SDL_SCANCODE_MENU => .menu,
+        sdl.keycode.SDL_SCANCODE_LCTRL => .left_ctrl,
+        sdl.keycode.SDL_SCANCODE_LSHIFT => .left_shift,
+        sdl.keycode.SDL_SCANCODE_LALT => .left_alt,
+        sdl.keycode.SDL_SCANCODE_LGUI => .left_super,
+        sdl.keycode.SDL_SCANCODE_RCTRL => .right_ctrl,
+        sdl.keycode.SDL_SCANCODE_RSHIFT => .right_shift,
+        sdl.keycode.SDL_SCANCODE_RALT => .right_alt,
+        sdl.keycode.SDL_SCANCODE_RGUI => .right_super,
+        else => null,
+    };
 }
 
 /// The current window state as `Overrides`, so a rebuilt root element tracks

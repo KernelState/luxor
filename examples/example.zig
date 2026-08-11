@@ -28,6 +28,64 @@ var slider_row_cfg = lu.Layout.FlexConfig{ .direction = .row, .gap = 16, .sizing
 const toolbar_colors = [_]u32{ 0xFF5555FF, 0xFF55AAFF, 0xFF55FFAA, 0xFFAACCFF, 0xFFCCAAFF, 0xFFAA55FF, 0xFF55FFFF, 0xFFFFAA55 };
 const tile_colors = [_]u32{ 0xEE3344FF, 0xEE8855FF, 0xEECC33FF, 0x66CC55FF, 0x3399EEFF, 0x7744CCFF, 0xCC3388FF, 0x4488AAFF };
 
+/// Mutable app state the interaction hooks read and write. Hooks are raw
+/// function pointers (`fn (*anyopaque, T, bool) void`) so they cannot close
+/// over locals; everything they need lives behind `data` here.
+const AppState = struct {
+    win: *lu.Window,
+    quit: bool = false,
+    /// Completed clicks on the toolbar buttons (the hook fires true on press,
+    /// false when the press is released inside the same button).
+    click_count: u32 = 0,
+    /// Driven by the slider: while `ctx.events.dragged` names the slider, the
+    /// build phase maps `ctx.events.pointer` onto the track. The drag hook only
+    /// fires once at press/release; it captures the slider's laid-out position.
+    slider_value: f32 = 0.66,
+    /// The slider element built this frame. Valid during the post-draw
+    /// processing pass (the tree is not reset until the next build), so the
+    /// drag hook can read its laid-out geometry when it fires.
+    slider_el: ?*lu.Element = null,
+    /// The slider's laid-out position, captured when a drag starts.
+    slider_pos: lu.Pos = .{ .x = 0, .y = 0 },
+    checkbox_value: bool = true,
+};
+
+fn onKey(data: *anyopaque, key: lu.Key, down: bool) void {
+    const app: *AppState = @ptrCast(@alignCast(data));
+    if (down and key == .escape) app.quit = true;
+}
+
+fn onClick(data: *anyopaque, _: void, pressed: bool) void {
+    const app: *AppState = @ptrCast(@alignCast(data));
+    if (!pressed) app.click_count += 1;
+}
+
+fn onCheckbox(data: *anyopaque, _: void, pressed: bool) void {
+    const app: *AppState = @ptrCast(@alignCast(data));
+    if (!pressed) app.checkbox_value = !app.checkbox_value;
+}
+
+/// Fires once when a drag starts (during the post-draw processing pass, so the
+/// slider element has been laid out) and once when it ends. Per-frame tracking
+/// happens in the build phase from `ctx.events.dragged` + `ctx.events.pointer`;
+/// this only remembers where the slider's track sits so that mapping works.
+fn onSliderDrag(data: *anyopaque, _: u32, _: bool) void {
+    const app: *AppState = @ptrCast(@alignCast(data));
+    const el = app.slider_el orelse return;
+    app.slider_pos = el.pos;
+}
+
+/// Maps the view's pointer onto the slider's track, clamping to 0.0-1.0. Reads
+/// the pointer from `ctx.events` (last frame's) so the knob trails the mouse by
+/// one frame, consistent with the rest of the interaction model.
+fn sliderFromPointer(app: *AppState, slider: *lu.Element) void {
+    const w: f32 = @floatFromInt(slider.size.w);
+    if (w <= 0) return;
+    const x: f32 = @floatFromInt(app.win.ctx.?.events.pointer.x);
+    const left: f32 = @floatFromInt(app.slider_pos.x);
+    app.slider_value = std.math.clamp((x - left) / w, 0.0, 1.0);
+}
+
 pub fn main() !void {
     // `Context` embeds the element pool (512 elements), so it is multi-megabyte;
     // allocating it on the heap keeps `main`'s stack frame small enough for the
@@ -94,23 +152,18 @@ pub fn main() !void {
         item_slices[i] = try std.fmt.bufPrint(&item_labels[i], "Item {d}", .{i + 1});
     }
 
-    var event: sdl.SDL_Event = undefined;
+    var app = AppState{ .win = &window };
+    window.events.key = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onKey } } } };
+
     var dbg = window.debug();
     defer window.debugRelease();
     var frame: u64 = 0;
     while (true) {
         dbg.begin(.frame);
         dbg.begin(.events);
-        while (sdl.pollEvent(&event)) {
-            switch (event.type) {
-                sdl.SDL_EVENT_QUIT, sdl.SDL_EVENT_WINDOW_CLOSE_REQUESTED => return,
-                sdl.SDL_EVENT_KEY_DOWN => {
-                    if (event.key.scancode == sdl.SDL_SCANCODE_ESCAPE) return;
-                },
-                else => {},
-            }
-        }
+        window.update();
         dbg.end(.events);
+        if (window.shouldQuit() or app.quit) return;
 
         // Immediate mode: reclaim the element pool, rebuild the tree, render.
         dbg.begin(.build);
@@ -141,6 +194,17 @@ pub fn main() !void {
             .size = 28,
         }, @src());
 
+        // Interaction status, rebuilt fresh every frame so clicks/drag updates
+        // from the previous frame show up immediately. The hover id lags one
+        // frame by construction (it is written during render).
+        var status_buf: [64]u8 = undefined;
+        const status = try std.fmt.bufPrint(&status_buf, "Clicks: {d} | slider: {d:.2} | box: {s}", .{
+            app.click_count,
+            app.slider_value,
+            if (app.checkbox_value) "on" else "off",
+        });
+        _ = try ctx.label(status, .{}, .{ .size = 22, .color = .{ .r = 0x44, .g = 0x44, .b = 0x44, .a = 0xFF } }, @src());
+
         // Toolbar: a flexbox wrap row. It is a child of the root, so it is
         // published while the root is the current parent; its buttons are built
         // against its own embedded layout, and `end` restores the root as current.
@@ -157,7 +221,18 @@ pub fn main() !void {
         _ = ctx.publishRequest(&toolbar, .{ .min_size = .{ .w = 0, .h = 0 }, .align_self = .stretch });
         toolbar.layout.?.start();
         for (toolbar_colors, 0..) |col, i| {
-            _ = try ctx.button(toolbar_slices[i], .{ .id_extra = i }, .{ .color = lu.Color.fromU32(col) }, @src());
+            // The click hook rides in through the overrides: widgets evaluate
+            // `fromId` *after* overrides, so `btn.events.hover.active` below
+            // reflects last frame's hit-test and the hook handles are attached.
+            const btn = try ctx.button(toolbar_slices[i], .{
+                .id_extra = i,
+                .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onClick } } } } },
+            }, .{ .color = lu.Color.fromU32(col) }, @src());
+            // Hover styling reflects the *previous* frame's hit-test (the view
+            // publishes hover after the frame is drawn); lighten the fill while
+            // it's under the pointer.
+            if (btn.events.hover.active)
+                btn.background = .{ .base = .{ .solid = lu.Color.fromU32(0xFFFFFFFF) }, .effects = &.{} };
         }
         toolbar.layout.?.end();
 
@@ -229,9 +304,20 @@ pub fn main() !void {
         };
         _ = ctx.publishRequest(&slider_row, .{ .min_size = .{ .w = 0, .h = 0 } });
         slider_row.layout.?.start();
-        _ = ctx.checkbox(true, .{}, .{}, @src());
-        _ = ctx.progress_bar(0.4, .{}, .{}, @src());
-        _ = ctx.slider(0.66, .{}, .{}, @src());
+        _ = ctx.checkbox(app.checkbox_value, .{
+            .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onCheckbox } } } } },
+        }, .{}, @src());
+        _ = ctx.progress_bar(app.slider_value, .{}, .{}, @src());
+        const slider = ctx.slider(app.slider_value, .{
+            .events = .{ .drag = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onSliderDrag } } } } },
+        }, .{}, @src());
+        // The drag hook fires once when a drag starts and ends (during the
+        // post-draw processing pass, so `slider` is laid out and the handler can
+        // capture its position). While the view reports this slider as dragged,
+        // re-map the pointer onto the track every frame right here in the build.
+        app.slider_el = slider;
+        if (ctx.events.dragged != null and ctx.events.dragged.? == slider.id)
+            sliderFromPointer(&app, slider);
         slider_row.layout.?.end();
 
         // Nothing is building any more; the window lays the tree out on render.
