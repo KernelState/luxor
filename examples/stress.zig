@@ -51,14 +51,11 @@ pub fn main() !void {
     const ctx = try std.heap.page_allocator.create(lu.Context);
     @memset(std.mem.asBytes(ctx), 0);
     ctx.flags = .{};
-    ctx.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    ctx.frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    ctx.initAlloc();
     ctx.freetype = try lu.Context.Freetype.init();
     ctx.leaf_layout = .{ .vtable = &lu.Layout.leaf, .parent = null };
     defer std.heap.page_allocator.destroy(ctx);
     defer ctx.freetype.deinit();
-    defer ctx.arena.deinit();
-    defer ctx.frame_arena.deinit();
 
     ctx.fonts[0] = try ctx.freetype.createFont(
         "/usr/share/fonts/TTF/IBMPlexSans-Regular.ttf",
@@ -76,7 +73,7 @@ pub fn main() !void {
         .title = "luxor flexbox stress",
         .transparent = false,
         .decorated = true,
-    });
+    }, ctx);
     defer window.deinit();
     window.plugCache(ctx);
 

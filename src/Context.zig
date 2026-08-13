@@ -15,13 +15,51 @@ const c = @cImport({
     @cInclude("harfbuzz/hb-ft.h");
 });
 
-arena: std.heap.ArenaAllocator,
-/// Per-frame scratch: text pixel buffers, shaping glyph arrays, and `TextConfig`
-/// structs created while the tree is rebuilt every frame. Reset to its base at
-/// the top of each frame (see `clear`), so a frame reuses the same backing
-/// memory instead of allocating fresh heaps forever. `arena` alone would grow
-/// without bound because the tree (and every label/button) is rebuilt each frame.
-frame_arena: std.heap.ArenaAllocator,
+/// Bytes of `fba_buf` dedicated to long-lived allocations: the window's batch
+/// render buffers, its per-frame scratch pool, and text/image cache raster
+/// buffers. The per-frame `frame_arena` gets the remaining (high) bytes. The
+/// regions are separate because the frame side is reset wholesale every frame
+/// and the persistent side must survive those resets: `FixedBufferAllocator.free`
+/// only reclaims the last allocation, so interleaving the two on one bump would
+/// make the frame reset discard persistent buffers (or silently no-op and
+/// slowly leak). Tune the total with `-Dfba-bytes`.
+const pers_bytes = options.fba_bytes * 5 / 8;
+
+/// Long-lived allocations for the process lifetime: the window's batch render
+/// buffers, its per-frame scratch pool, and text/image raster cache buffers.
+/// Set to `arena_fba.allocator()` (the low region of `fba_buf`) by `initAlloc`.
+/// Never reset, so cached buffers stay valid across frames and the region only
+/// grows as caches churn; on exhaustion the failing allocation degrades
+/// gracefully (a cache entry is skipped, an image is not decoded).
+arena: std.mem.Allocator = undefined,
+/// Per-frame scratch: shaping glyph arrays, layout request/child lists, and
+/// `TextConfig` structs created while the tree is rebuilt every frame. A
+/// fixed-buffer allocator over the remaining (high) region of `fba_buf`,
+/// reset wholesale at the top of each frame (see `clear`), so a frame reuses
+/// exactly the same backing memory. It is reset as a whole (not via arena chunk
+/// frees) because `FixedBufferAllocator.free` only reclaims the last
+/// allocation; a wholesale `reset` avoids that constraint entirely.
+frame_arena: std.heap.FixedBufferAllocator = undefined,
+/// The default allocator for frame-lifetime storage: the embedded `frame_arena`.
+/// Elements allocate their layout request/child lists from it (`Layout` embeds
+/// `std.ArrayList`s instead of huge fixed arrays, so copying an `Element` no
+/// longer drags a 1500-slot array with it), and the Window draws per-frame
+/// scratch overflow from it too. Swap it out with `setAlloc`; the buffer is
+/// reclaimed at the top of each frame (see `clear`).
+allocator: std.mem.Allocator = undefined,
+/// Root of the persistent region: caches and the window batch keep their
+/// buffers here for the process lifetime. Sized by the `-Dfba-bytes` build
+/// option (default 8MB), of which `pers_bytes` feeds `arena` and the rest
+/// feeds `frame_arena`.
+arena_fba: std.heap.FixedBufferAllocator = undefined,
+/// The fixed buffer backing the two regions, sized by the `-Dfba-bytes` build
+/// option (default 8MB): `[0 .. pers_bytes]` feeds `arena` and the rest feeds
+/// `frame_arena`. 0 bytes disables the embedded buffer entirely.
+fba_buf: [options.fba_bytes]u8 align(@alignOf(usize)) = undefined,
+/// True while `allocator` is the built-in embedded arena (i.e. the app has not
+/// called `setAlloc`). The Window's scratch code uses this to decide whether an
+/// allocation lives in `fba_buf` (freeing a no-op, reclaimed on reset).
+fba_active: bool = true,
 freetype: Freetype,
 fonts: [10]Font = undefined,
 font_count: u8 = 0,
@@ -261,11 +299,41 @@ pub fn allocElement(self: *Context) *lu.Element {
     return e;
 }
 
+/// Wire the two embedded regions of `fba_buf`: the persistent `arena` (raster
+/// caches, window batch buffers) over the low bytes, `frame_arena` over the
+/// remaining (high) bytes, and make `frame_arena` the default allocator. Both
+/// regions are sized at compile time (see `pers_bytes`). An app that wants to
+/// override the built-in frame allocator can call `setAlloc` afterwards with
+/// its own. Call `zeroInit` first (e.g. `std.mem.zeroInit(lu.Context, .{})`) or
+/// use `std.heap.page_allocator.create` + `@memset` as the examples do, then
+/// this fills in the allocator-dependent fields.
+pub fn initAlloc(self: *Context) void {
+    self.arena_fba = std.heap.FixedBufferAllocator.init(self.fba_buf[0..pers_bytes]);
+    self.frame_arena = std.heap.FixedBufferAllocator.init(self.fba_buf[pers_bytes..]);
+    self.arena = self.arena_fba.allocator();
+    self.allocator = self.frame_arena.allocator();
+    self.fba_active = true;
+}
+
+/// Swap the allocator frame-lifetime storage (Layout arrays, Window scratch
+/// overflow) uses. The user's allocator takes over; the embedded `frame_arena`
+/// still serves internal shaping buffers and is reset by `clear`, and the
+/// persistent `arena` (caches, batch) stays over the embedded buffer. `clear`
+/// no longer touches frame-lifetime allocations made through this allocator.
+pub fn setAlloc(self: *Context, alloc: std.mem.Allocator) void {
+    self.allocator = alloc;
+    self.fba_active = false;
+}
+
 /// Reset the element pool and frame scratch for a fresh frame. Old element
-/// pointers must not be used afterwards; layouts are rebuilt every frame anyway.
+/// pointers and layout pointers must not be used afterwards; the tree and its
+/// layouts are rebuilt every frame anyway. Returns every per-frame allocation
+/// to `frame_arena` (a wholesale bump reset, so the same backing memory is
+/// reused every frame). The persistent `arena` is untouched: cached raster
+/// buffers from previous frames stay live here.
 pub fn clear(self: *Context) void {
     self.plen = 0;
-    _ = self.frame_arena.reset(.retain_capacity);
+    self.frame_arena.reset();
 }
 
 /// A fully-wired, inert set of events used by every generated element. Widgets
@@ -332,12 +400,12 @@ pub fn publishRequest(self: *Context, e: *lu.Element, req: lu.Layout.Request) ?u
 /// (progress bar fill, slider fill/knob). Embedded by value in the element's
 /// `.layout`; `parent` is the current parent so `end` restores it.
 fn makeAbsolute(self: *Context) lu.Layout {
-    return .{ .vtable = &lu.Layout.absolute, .parent = self.current };
+    return .{ .vtable = &lu.Layout.absolute, .parent = self.current, .allocator = self.allocator };
 }
 
 /// A mono layout value for centering a single child (button label).
 fn makeMono(self: *Context, pad: lu.Sides) lu.Layout {
-    return .{ .vtable = &lu.Layout.mono, .parent = self.current, .padding = pad };
+    return .{ .vtable = &lu.Layout.mono, .parent = self.current, .padding = pad, .allocator = self.allocator };
 }
 
 pub const Freetype = struct {
@@ -802,7 +870,7 @@ fn renderTextCached(self: *Context, fnSelf: *Font, text: []const u8, area: lu.Re
     }
     self.dbg.announce("text rasterize");
     const buf = try fnSelf.renderText(
-        self.arena.allocator(),
+        self.arena,
         text,
         area,
         spacing,
@@ -900,7 +968,13 @@ fn textLay(layout: *lu.Layout) void {
         .id = el.id,
         .id_extra = el.id_extra,
     };
-    layout.children[0] = child;
+    layout.children.clearRetainingCapacity();
+    layout.children.append(ctx.allocator, child) catch {
+        if (builtin.mode == .Debug) @panic("layout children allocation failed: raise -Dfba-bytes (or use Context.setAlloc)");
+        std.log.warn("layout children allocation failed; increase -Dfba-bytes", .{});
+        layout.cindex = 0;
+        return;
+    };
     layout.cindex = 1;
 }
 
@@ -947,7 +1021,7 @@ pub fn label(self: *Context, text: []const u8, overrides: lu.Element.Overrides, 
         .w = natural.w + pad.left + pad.right + border.left + border.right,
         .h = natural.h + pad.top + pad.bottom + border.top + border.bottom,
     };
-    e.layout = .{ .vtable = &textVTable, .parent = self.current, .padding = pad, .data = @ptrCast(cfg) };
+    e.layout = .{ .vtable = &textVTable, .parent = self.current, .padding = pad, .data = @ptrCast(cfg), .allocator = self.allocator };
     _ = self.publish(e);
     return e;
 }
@@ -1220,13 +1294,13 @@ pub const ImageOpts = struct {
 /// requested through `opts`.
 pub fn image(self: *Context, source: lu.ImageSource, overrides: lu.Element.Overrides, opts: ImageOpts, comptime src: std.builtin.SourceLocation) !*lu.Element {
     const decoded = if (self.flags.image_cache)
-        try self.image_cache.decode(self.arena.allocator(), source, .{
+        try self.image_cache.decode(self.arena, source, .{
             .svg_width = opts.svg_width,
             .svg_height = opts.svg_height,
             .scale = opts.svg_scale,
         })
     else
-        try self.image_cache.decodeNoCache(self.arena.allocator(), source, .{
+        try self.image_cache.decodeNoCache(self.arena, source, .{
             .svg_width = opts.svg_width,
             .svg_height = opts.svg_height,
             .scale = opts.svg_scale,

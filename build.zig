@@ -84,6 +84,25 @@ pub fn build(b: *std.Build) void {
         "Window primitive batch run capacity",
     ) orelse 16384;
 
+    // The Context's default allocator is a pair of fixed-buffer allocators over
+    // one embedded buffer (see `Context.fba_buf`) sized by this option. It
+    // splits into a persistent region (~5/8: window batch render buffers
+    // ~3.4MB at the default batch caps, the 1MB scratch pool, and cache raster
+    // buffers) and a per-frame region (~3/8: layout request/child lists,
+    // shaping), the latter reset wholesale every frame so a frame reuses the
+    // same backing memory. The persistence split exists because the frame side
+    // must be reclaimable every frame while cached rasters outlive it, and
+    // FixedBufferAllocator's LIFO-only free forbids interleaving them on one
+    // bump. 8MB gives ~5MB to the persistent side and ~3MB to the per-frame
+    // side; the stress example's 1500 children fit comfortably, and apps with
+    // heavier image caches or batch caps can raise this. 0 disables the
+    // embedded buffer.
+    const fba_bytes = b.option(
+        usize,
+        "fba-bytes",
+        "Context fixed-buffer allocator size in bytes (default 8MB)",
+    ) orelse 8 << 20;
+
     const sdl = b.dependency("zsdl3", .{
         .sdl_image = false,
         .sdl_mixer = false,
@@ -100,6 +119,7 @@ pub fn build(b: *std.Build) void {
         .batch_verts = batch_verts,
         .batch_idx = batch_idx,
         .batch_prims = batch_prims,
+        .fba_bytes = fba_bytes,
     };
 
     const lib = b.addLibrary(.{
@@ -165,6 +185,7 @@ pub fn build(b: *std.Build) void {
         .batch_verts = batch_verts,
         .batch_idx = batch_idx,
         .batch_prims = batch_prims,
+        .fba_bytes = fba_bytes,
     };
     const stress_luxor = makeLuxorModule(b, target, optimize, sdl, stress_caps);
 
@@ -242,6 +263,7 @@ const Caps = struct {
     batch_verts: usize,
     batch_idx: usize,
     batch_prims: usize,
+    fba_bytes: usize,
 };
 
 /// Builds a luxor module with the given `Caps`, wiring the vendored/system
@@ -265,6 +287,7 @@ fn makeLuxorModule(
     options.addOption(usize, "batch_verts", caps.batch_verts);
     options.addOption(usize, "batch_idx", caps.batch_idx);
     options.addOption(usize, "batch_prims", caps.batch_prims);
+    options.addOption(usize, "fba_bytes", caps.fba_bytes);
 
     const m = b.createModule(.{
         .root_source_file = b.path("src/luxor.zig"),

@@ -69,10 +69,10 @@ drag_button: u32 = 0,
 left_pressed: bool = false,
 left_released: bool = false,
 /// Per-frame scratch memory for transient working buffers (shadow coverage
-/// planes, blur row/column buffers, eviction key lists). Allocated on the heap
-/// in `init` (a multi-megabyte inline array would overflow the caller's stack);
-/// reset to its base at the top of every `render`, and allocations that
-/// overflow it fall back to the page allocator.
+/// planes, blur row/column buffers, eviction key lists). Allocated from the
+/// Context's persistent arena in `init` (a multi-megabyte inline array would
+/// overflow the caller's stack); reset to its base at the top of every
+/// `render`, and allocations that overflow it fall back to the frame arena.
 scratch: []u8 = &.{},
 scratch_fba: std.heap.FixedBufferAllocator = undefined,
 scratch_ready: bool = false,
@@ -224,7 +224,7 @@ const BlurEntry = struct {
     last_seen: u64,
 };
 
-pub fn init(config: Config) !Window {
+pub fn init(config: Config, ctx: *lu.Context) !Window {
     var flags: u32 = 0;
     if (config.resizable)
         flags |= sdl.SDL_WINDOW_RESIZABLE;
@@ -238,13 +238,15 @@ pub fn init(config: Config) !Window {
         .window = undefined,
         .size = undefined,
         .title = config.title,
+        .ctx = ctx,
     };
     // The per-frame scratch pool and batch buffers are the bulk of the struct's
-    // memory; keep them on the heap so `Window` stays a small stack value.
-    self.scratch = try std.heap.page_allocator.alloc(u8, scratch_pool_bytes);
-    self.batch.prims = try std.heap.page_allocator.alloc(BatchPrim, max_batch_prims);
-    self.batch.verts = try std.heap.page_allocator.alloc(sdl.SDL_Vertex, max_batch_verts);
-    self.batch.idx = try std.heap.page_allocator.alloc(c_int, max_batch_idx);
+    // memory; they live in the Context's persistent arena so `Window` stays a
+    // small stack value and nothing allocates from the page heap.
+    self.scratch = try ctx.arena.alloc(u8, scratch_pool_bytes);
+    self.batch.prims = try ctx.arena.alloc(BatchPrim, max_batch_prims);
+    self.batch.verts = try ctx.arena.alloc(sdl.SDL_Vertex, max_batch_verts);
+    self.batch.idx = try ctx.arena.alloc(c_int, max_batch_idx);
     if (!sdl.createWindowAndRenderer(
         config.title,
         @intCast(config.min_size.w),
@@ -279,10 +281,12 @@ pub fn deinit(self: *Window) void {
     while (bit.next()) |entry| {
         sdl.destroyTexture(entry.value_ptr.texture);
     }
-    std.heap.page_allocator.free(self.scratch);
-    std.heap.page_allocator.free(self.batch.prims);
-    std.heap.page_allocator.free(self.batch.verts);
-    std.heap.page_allocator.free(self.batch.idx);
+    if (self.ctx) |c| {
+        c.arena.free(self.scratch);
+        c.arena.free(self.batch.prims);
+        c.arena.free(self.batch.verts);
+        c.arena.free(self.batch.idx);
+    }
     sdl.destroyRenderer(self.renderer);
     sdl.destroyWindow(self.window);
 }
@@ -395,7 +399,7 @@ fn storeLayout(ptr: *anyopaque, key: u64, layout: *lu.Layout) void {
         .last_seen = self.frame,
     };
     for (0..layout.cindex) |i| {
-        const c = layout.children[i];
+        const c = layout.children.items[i];
         entry.kids[i] = .{
             .id = c.id,
             .extra = c.id_extra,
@@ -668,7 +672,7 @@ fn hitTest(self: *Window, e: *lu.Element, area: lu.Area, clip: ?lu.Area, pos: lu
             const child_clip = intersectClip(clip, contentArea(e, area));
             var top: ?*lu.Element = null;
             for (0..lay.cindex) |i| {
-                const child = lay.children[i];
+                const child = lay.children.items[i];
                 if (self.hitTest(child, .{ .pos = child.pos, .size = child.size }, child_clip, pos)) |h| top = h;
             }
             if (top) |t| return t;
@@ -684,7 +688,7 @@ fn findElement(self: *Window, e: *lu.Element, id: u64) ?*lu.Element {
     if (e.id == id) return e;
     if (e.layout) |*lay| {
         for (0..lay.cindex) |i| {
-            if (self.findElement(lay.children[i], id)) |f| return f;
+            if (self.findElement(lay.children.items[i], id)) |f| return f;
         }
     }
     return null;
@@ -839,23 +843,38 @@ fn ensureScratch(self: *Window) void {
 }
 
 /// Allocates `n` items from the per-frame scratch pool, falling back to the
-/// page allocator for allocations that overflow the pool. Pool memory is
-/// reclaimed wholesale at the next frame's `scratch_fba.reset()`.
+/// context's frame allocator (`ctx.allocator`) for allocations that overflow
+/// the pool. Pool memory is reclaimed wholesale at the next frame's
+/// `scratch_fba.reset()`; overflow served by `ctx.allocator` is reclaimed when
+/// the context's `clear()` resets the frame arena.
 fn scratchAlloc(self: *Window, comptime T: type, n: usize) ![]T {
     self.ensureScratch();
     if (self.scratch_fba.allocator().alloc(T, n)) |m| return m else |_| {}
-    return std.heap.page_allocator.alloc(T, n);
+    if (self.ctx) |c| {
+        if (c.allocator.alloc(T, n)) |m| return m else |_| {}
+    }
+    return error.OutOfMemory;
 }
 
 /// Frees a scratch allocation. Pool-owned memory is a no-op (reclaimed on the
-/// next frame reset); page-backed overflow is returned to the allocator.
+/// next frame reset); memory owned by the context's embedded arenas is a no-op
+/// too (reclaimed when the frame arena resets); memory from an allocator the
+/// app installed via `setAlloc` is returned to it.
 fn scratchFree(self: *Window, comptime T: type, m: []T) void {
     if (m.len == 0) return;
     const lo: usize = @intFromPtr(self.scratch.ptr);
     const hi: usize = lo + self.scratch.len;
     const p: usize = @intFromPtr(m.ptr);
     if (p >= lo and p < hi) return;
-    std.heap.page_allocator.free(m);
+    if (self.ctx) |c| {
+        if (c.fba_active) {
+            const blo: usize = @intFromPtr(&c.fba_buf);
+            const bhi: usize = blo + c.fba_buf.len;
+            if (p >= blo and p < bhi) return;
+        } else {
+            c.allocator.free(m);
+        }
+    }
 }
 
 /// Frees every texture cached entry that has not been used in the last
@@ -1178,7 +1197,7 @@ fn drawElement(self: *Window, e: *lu.Element, area: lu.Area) void {
     const layout = &(e.layout orelse return);
     if (layout.cindex == 0) return;
     for (0..layout.cindex) |i| {
-        const child = layout.children[i];
+        const child = layout.children.items[i];
         self.drawElement(child, .{ .pos = child.pos, .size = child.size });
     }
 }
@@ -1288,8 +1307,8 @@ fn drawShadow(self: *Window, e: *lu.Element, area: lu.Area, sh: lu.Effect.Shadow
     // Blur the coverage plane (separable box blur, two iterations) to get a
     // smooth gaussian-like falloff.
     if (blur > 0) {
-        boxBlur(cov, scratch, @intCast(rw), @intCast(rh), blur);
-        boxBlur(scratch, cov, @intCast(rw), @intCast(rh), blur);
+        boxBlur(self.ctx.?.allocator, cov, scratch, @intCast(rw), @intCast(rh), blur);
+        boxBlur(self.ctx.?.allocator, scratch, cov, @intCast(rw), @intCast(rh), blur);
     }
 
     const pixels = self.scratchAlloc(u8, n * 4) catch return;
@@ -1423,11 +1442,12 @@ fn inRoundedRect(x: i32, y: i32, w: i32, h: i32, r: i32, px: i32, py: i32) bool 
 
 /// Separable box blur of `src` into `dst`, both `w` x `h` planes. Each row and
 /// column is averaged over a window of `2*radius+1` pixels (clamped at the
-/// edges).
-fn boxBlur(src: []const f32, dst: []f32, w: usize, h: usize, radius: i32) void {
+/// edges). The row/column stripes come from `alloc` (the frame arena, by
+/// default), freed at the end of the call.
+fn boxBlur(alloc: std.mem.Allocator, src: []const f32, dst: []f32, w: usize, h: usize, radius: i32) void {
     const r = @min(@as(i32, @intCast(@max(w, h))), @max(radius, 1));
-    const row = std.heap.page_allocator.alloc(f32, w) catch return;
-    defer std.heap.page_allocator.free(row);
+    const row = alloc.alloc(f32, w) catch return;
+    defer alloc.free(row);
 
     // Horizontal pass.
     for (0..h) |y| {
@@ -1448,8 +1468,8 @@ fn boxBlur(src: []const f32, dst: []f32, w: usize, h: usize, radius: i32) void {
     }
 
     // Vertical pass over the horizontally-blurred `dst`.
-    const col = std.heap.page_allocator.alloc(f32, h) catch return;
-    defer std.heap.page_allocator.free(col);
+    const col = alloc.alloc(f32, h) catch return;
+    defer alloc.free(col);
     for (0..w) |x| {
         for (0..h) |y| {
             const lo_r = @max(0, @as(i32, @intCast(y)) - r);

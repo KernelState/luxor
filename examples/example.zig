@@ -96,16 +96,13 @@ pub fn main() !void {
     // `applyFlags` only ever disables a cache (via env), so restore the defaults
     // explicitly or every cache silently stays off.
     ctx.flags = .{};
-    ctx.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    ctx.frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    ctx.initAlloc();
     ctx.freetype = try lu.Context.Freetype.init();
     ctx.leaf_layout = .{ .vtable = &lu.Layout.leaf, .parent = null };
-    // Destroy the context last, after the defers below have torn down the
-    // allocators and freetype that live inside it.
+    // Destroy the context last, after the defers below have torn down freetype
+    // and the fonts that live inside it.
     defer std.heap.page_allocator.destroy(ctx);
     defer ctx.freetype.deinit();
-    defer ctx.arena.deinit();
-    defer ctx.frame_arena.deinit();
 
     ctx.fonts[0] = try ctx.freetype.createFont(
         "/usr/share/fonts/TTF/IBMPlexSans-Regular.ttf",
@@ -135,7 +132,7 @@ pub fn main() !void {
         .title = "luxor example",
         .transparent = false,
         .decorated = true,
-    });
+    }, ctx);
     defer window.deinit();
     window.plugCache(ctx);
 

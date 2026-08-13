@@ -12,11 +12,11 @@ const builtin = @import("builtin");
 const options = @import("options");
 const lu = @import("luxor.zig");
 
-/// The number of requests/children a single layout can hold (the per-layout
-/// static arrays). Elements are referenced by pointer (into the widget's
-/// element pool), never by value, so `Element` can embed a `Layout` by value
-/// without a size-recursion loop. Configurable at build time with
-/// `-Dlayout-inner=<n>`; the default matches the library's baseline.
+/// The number of requests/children a single layout can hold in one SizedBox
+/// pass. Elements are referenced by pointer (into the widget's element pool),
+/// never by value, so `Element` can embed a `Layout` by value without a
+/// size-recursion loop. Configurable at build time with `-Dlayout-inner=<n>`;
+/// the default matches the library's baseline.
 pub const Inner = options.inner;
 /// Size of working scratch buffers used while laying out a container. Content
 /// with more children than this cannot be laid out. Configurable at build time
@@ -40,16 +40,24 @@ pub const Layout = struct {
     /// widget through the element's `widget` pointer, so neither takes an
     /// argument.
     element: ?*lu.Element = null,
+    /// The allocator the layout grows its loaded children/requests from. Set
+    /// by `Context` when the layout is created (see `Context.allocator`), so
+    /// element structs stay tiny: the arrays live in one scratch buffer shared
+    /// by the whole frame instead of being copied into every element. Layouts
+    /// built without a Context fall back to their element's context, or the
+    /// page allocator when neither exists (tests).
+    allocator: ?std.mem.Allocator = null,
     /// The laid-out children, filled by `lay`. Each child's `.size` and `.pos`
     /// are final (world space). The window walks this list to draw. Children
     /// are pointers into the widget's element pool, never stored by value.
-    children: [Inner]*lu.Element = undefined,
+    /// Grows from `allocatorOf` so element structs stay tiny.
+    children: std.ArrayListUnmanaged(*lu.Element) = .{ .items = &.{}, .capacity = 0 },
     /// Number of laid-out children.
     cindex: usize = 0,
     /// The box this layout lays its children into, set by `lay`.
     container: lu.Rect = .{ .w = 0, .h = 0 },
     /// The saved requests from the build phase (`request` + `addElement`).
-    requests: [Inner]Request = undefined,
+    requests: std.ArrayListUnmanaged(Request) = .{ .items = &.{}, .capacity = 0 },
     /// Next free slot in `requests`.
     rindex: usize = 0,
 
@@ -208,7 +216,19 @@ pub const Layout = struct {
     /// every frame (so `rindex` starts at zero anyway); this is for layouts that
     /// live across frames and re-register their children each build.
     pub fn reset(self: *Layout) void {
+        self.requests.clearRetainingCapacity();
         self.rindex = 0;
+    }
+
+    /// The allocator this layout grows its arrays from: the one `Context`
+    /// installed (see `allocator`), otherwise the element's context allocator,
+    /// otherwise the page allocator.
+    pub fn allocatorOf(self: *const Layout) std.mem.Allocator {
+        if (self.allocator) |a| return a;
+        if (self.element) |el| {
+            if (el.ctx) |c| return c.allocator;
+        }
+        return std.heap.page_allocator;
     }
 
     /// Request space from the layout, returning the id assigned to this
@@ -216,17 +236,17 @@ pub const Layout = struct {
     /// element; the parent reads `getSize` style information from the element
     /// after `lay`.
     pub fn request(self: *Layout, req: Request) u32 {
-        if (self.rindex == self.requests.len) {
+        const id: u32 = @intCast(self.requests.items.len);
+        const alloc = self.allocatorOf();
+        self.requests.append(alloc, req) catch {
             if (builtin.mode == .Debug) {
-                @panic("Reached maximum layout requests");
+                @panic("layout request allocation failed: raise -Dfba-bytes (or use Context.setAlloc)");
             } else {
-                std.log.warn("Reached maximum layout requests, please contact the developer to fix this", .{});
-                return @intCast(self.rindex);
+                std.log.warn("layout request allocation failed; increase -Dfba-bytes", .{});
             }
-        }
-        const id: u32 = @intCast(self.rindex);
-        self.requests[self.rindex] = req;
-        self.rindex += 1;
+            return id;
+        };
+        self.rindex = self.requests.items.len;
         return id;
     }
 
@@ -236,11 +256,11 @@ pub const Layout = struct {
     /// is a pointer into the widget's element pool; the caller keeps it alive.
     pub fn addElement(self: *Layout, id: u32, element: *lu.Element) void {
         const idx: usize = id;
-        if (idx >= self.rindex) {
+        if (idx >= self.requests.items.len) {
             @panic("layout.addElement called with an invalid request id; request() assigns one first");
         }
-        self.requests[idx].element = element;
-        if (self.requests[idx].element.?.layout) |*l| l.element = self.requests[idx].element;
+        self.requests.items[idx].element = element;
+        if (self.requests.items[idx].element.?.layout) |*l| l.element = self.requests.items[idx].element;
     }
 
     /// Lay out this layout's children, top-down. The window sets the root
@@ -252,16 +272,17 @@ pub const Layout = struct {
     /// child results are replayed instead of re-running the layout math. Returns
     /// the laid-out children.
     pub fn lay(self: *Layout) []*lu.Element {
-        const el = self.element orelse return self.children[0..0];
+        const el = self.element orelse return self.children.items[0..0];
         const pad = self.padding;
         self.container = .{
             .w = el.size.w -| (pad.left + pad.right),
             .h = el.size.h -| (pad.top + pad.bottom),
         };
+        self.children.clearRetainingCapacity();
         self.cindex = 0;
         self.gather();
         for (0..self.cindex) |i| {
-            const child = self.children[i];
+            const child = self.children.items[i];
             child.pos.x += el.pos.x + pad.left;
             child.pos.y += el.pos.y + pad.top;
             if (child.layout) |*cl| {
@@ -269,7 +290,7 @@ pub const Layout = struct {
                 _ = cl.lay();
             }
         }
-        return self.children[0..self.cindex];
+        return self.children.items[0..self.cindex];
     }
 
     /// Computes `layout.children` and each child's relative `.pos`/`.size`,
@@ -313,20 +334,29 @@ pub const Layout = struct {
     /// child whose stable id moved), which forces a real `lay`.
     fn replay(self: *Layout, entry: *const lu.Context.LayoutEntry) bool {
         if (entry.n > self.rindex) return false;
+        self.children.clearRetainingCapacity();
+        var cindex: usize = 0;
         var idx: usize = 0;
         for (0..self.rindex) |i| {
-            const req = &self.requests[i];
+            const req = &self.requests.items[i];
             const ce = req.element orelse continue;
             if (idx >= entry.n) return false;
             const kid = entry.kids[idx];
             if (ce.id != kid.id or ce.id_extra != kid.extra) return false;
             ce.pos = kid.pos;
             ce.size = kid.size;
-            self.children[idx] = ce;
+            self.children.append(self.allocatorOf(), ce) catch {
+                if (builtin.mode == .Debug) {
+                    @panic("layout children allocation failed: raise -Dfba-bytes (or use Context.setAlloc)");
+                }
+                std.log.warn("layout children allocation failed; increase -Dfba-bytes", .{});
+                return false;
+            };
+            cindex += 1;
             idx += 1;
         }
         if (idx != entry.n) return false;
-        self.cindex = idx;
+        self.cindex = cindex;
         return true;
     }
 
@@ -376,26 +406,36 @@ fn leafLay(_: *Layout) void {}
 
 /// Places each child at exactly its requested position and size.
 fn absoluteLay(layout: *Layout) void {
-    layout.cindex = 0;
+    layout.children.clearRetainingCapacity();
+    var cindex: usize = 0;
     for (0..layout.rindex) |id| {
-        const req = &layout.requests[id];
+        const req = &layout.requests.items[id];
         const el = req.element orelse continue;
-        layout.children[layout.cindex] = el;
+        layout.children.append(layout.allocatorOf(), el) catch {
+            if (builtin.mode == .Debug) @panic("layout children allocation failed: raise -Dfba-bytes (or use Context.setAlloc)");
+            std.log.warn("layout children allocation failed; increase -Dfba-bytes", .{});
+            return;
+        };
         el.pos = req.pos orelse .{ .x = 0, .y = 0 };
         el.size = req.size orelse req.min_size;
-        layout.cindex += 1;
+        cindex += 1;
     }
+    layout.cindex = cindex;
 }
 
 /// Centers a single child in the container. Used by text widgets to center
 /// their label; the child's own request carries its size.
 fn monoLay(layout: *Layout) void {
-    layout.cindex = 0;
+    layout.children.clearRetainingCapacity();
     if (layout.rindex == 0) return;
-    const req = &layout.requests[0];
+    const req = &layout.requests.items[0];
     const el = req.element orelse return;
     const child = req.size orelse req.min_size;
-    layout.children[0] = el;
+    layout.children.append(layout.allocatorOf(), el) catch {
+        if (builtin.mode == .Debug) @panic("layout children allocation failed: raise -Dfba-bytes (or use Context.setAlloc)");
+        std.log.warn("layout children allocation failed; increase -Dfba-bytes", .{});
+        return;
+    };
     el.pos = .{
         .x = @divTrunc(layout.container.w -| child.w, 2),
         .y = @divTrunc(layout.container.h -| child.h, 2),
@@ -443,7 +483,7 @@ fn packFlex(layout: *Layout, cfg: *const Layout.FlexConfig, row: bool, pk: *Pack
     const n_max = @min(layout.rindex, Max);
     pk.n = 0;
     for (0..n_max) |i| {
-        const req = &layout.requests[i];
+        const req = &layout.requests.items[i];
         if (req.element == null) continue;
         const own = req.size orelse req.min_size;
         const exact = req.size != null;
@@ -666,6 +706,7 @@ fn flexLay(layout: *Layout) void {
     packFlex(layout, cfg, row, &pk);
     const n = pk.n;
     if (n == 0) {
+        layout.children.clearRetainingCapacity();
         layout.cindex = 0;
         return;
     }
@@ -786,6 +827,7 @@ fn flexLay(layout: *Layout) void {
         used_cross += line_cross[li];
     }
 
+    layout.children.clearRetainingCapacity();
     layout.cindex = 0;
     var cy: i64 = 0;
     for (0..nl) |li| {
@@ -842,13 +884,18 @@ fn flexLay(layout: *Layout) void {
             }
             cursor += @as(i64, use_main) + @as(i64, space);
             const ce = pk.el[g];
-            layout.children[layout.cindex] = ce;
+            layout.children.append(layout.allocatorOf(), ce) catch {
+                if (builtin.mode == .Debug) @panic("layout children allocation failed: raise -Dfba-bytes (or use Context.setAlloc)");
+                std.log.warn("layout children allocation failed; increase -Dfba-bytes", .{});
+                layout.cindex = layout.children.items.len;
+                return;
+            };
             ce.pos = area.pos;
             ce.size = area.size;
-            layout.cindex += 1;
         }
         if (li + 1 < nl) cy += @as(i64, line_cross[li]) + cfg.gap;
     }
+    layout.cindex = layout.children.items.len;
 }
 
 // ---------------------------------------------------------------------------
@@ -862,7 +909,7 @@ fn gridExtents(layout: *Layout, cfg: *const Layout.GridConfig, max_w: *u32, max_
     var mh: u32 = 0;
     var n: usize = 0;
     for (0..layout.rindex) |i| {
-        const req = &layout.requests[i];
+        const req = &layout.requests.items[i];
         if (req.element == null) continue;
         const child = req.size orelse req.min_size;
         var w = child.w;
@@ -909,9 +956,10 @@ fn gridLay(layout: *Layout) void {
     const cfg = Layout.gridCfg(layout) orelse return;
     var n: usize = 0;
     for (0..layout.rindex) |i| {
-        if (layout.requests[i].element != null) n += 1;
+        if (layout.requests.items[i].element != null) n += 1;
     }
     if (n == 0) {
+        layout.children.clearRetainingCapacity();
         layout.cindex = 0;
         return;
     }
@@ -932,10 +980,10 @@ fn gridLay(layout: *Layout) void {
         }
     }
 
-    layout.cindex = 0;
+    layout.children.clearRetainingCapacity();
     var i: usize = 0;
     for (0..layout.rindex) |idx| {
-        if (layout.requests[idx].element == null) continue;
+        if (layout.requests.items[idx].element == null) continue;
         const col = i % cols;
         const r = i / cols;
         var area = lu.Area{
@@ -945,20 +993,25 @@ fn gridLay(layout: *Layout) void {
             },
             .size = .{ .w = col_w, .h = row_h },
         };
-        const min = layout.requests[idx].min_size;
+        const min = layout.requests.items[idx].min_size;
         area.size.w = @max(area.size.w, min.w);
         area.size.h = @max(area.size.h, min.h);
-        if (layout.requests[idx].max_size) |mx| {
+        if (layout.requests.items[idx].max_size) |mx| {
             area.size.w = @min(area.size.w, mx.w);
             area.size.h = @min(area.size.h, mx.h);
         }
-        const ce = layout.requests[idx].element.?;
-        layout.children[layout.cindex] = ce;
+        const ce = layout.requests.items[idx].element.?;
+        layout.children.append(layout.allocatorOf(), ce) catch {
+            if (builtin.mode == .Debug) @panic("layout children allocation failed: raise -Dfba-bytes (or use Context.setAlloc)");
+            std.log.warn("layout children allocation failed; increase -Dfba-bytes", .{});
+            layout.cindex = layout.children.items.len;
+            return;
+        };
         ce.pos = area.pos;
         ce.size = area.size;
-        layout.cindex += 1;
         i += 1;
     }
+    layout.cindex = layout.children.items.len;
 }
 
 // ---------------------------------------------------------------------------
