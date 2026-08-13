@@ -111,6 +111,36 @@ pub fn build(b: *std.Build) void {
     const itest_install = b.addInstallArtifact(itest, .{});
     b.getInstallStep().dependOn(&itest_install.step);
 
+    const stress = b.addExecutable(.{
+        .name = "stress",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/stress.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "luxor", .module = lib.root_module },
+                .{ .name = "sdl", .module = sdl },
+            },
+        }),
+        .use_llvm = true,
+    });
+    const stress_install = b.addInstallArtifact(stress, .{});
+    b.getInstallStep().dependOn(&stress_install.step);
+    const stress_run = b.addRunArtifact(stress);
+
+    const stress_step = b.step("stress", "Build the flexbox stress test (one container packed to Layout.Inner children)");
+    stress_step.dependOn(&stress_install.step);
+    stress_step.dependOn(&stress_run.step);
+
+    const run_stress_step = b.step("run-stress", "Run the flexbox stress test");
+    const run_stress_cmd = b.addRunArtifact(stress);
+    run_stress_step.dependOn(&stress_install.step);
+    run_stress_step.dependOn(&run_stress_cmd.step);
+    run_stress_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_stress_cmd.addArgs(args);
+    }
+
     const lib_tests = b.addTest(.{
         .root_module = lib.root_module,
     });

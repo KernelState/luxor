@@ -4,6 +4,10 @@ const options = @import("options");
 
 pub const Element = @import("Element.zig");
 pub const Layout = @import("Layout.zig").Layout;
+/// Per-layout capacity: the maximum requests/children a single layout can hold.
+pub const LayoutInner = @import("Layout.zig").Inner;
+/// Size of the working scratch buffers used while laying out a container.
+pub const LayoutMax = @import("Layout.zig").Max;
 pub const Window = if (options.sdl)
     @import("Window.zig")
 else
