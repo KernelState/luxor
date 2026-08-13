@@ -8,6 +8,9 @@ pub const Layout = @import("Layout.zig").Layout;
 pub const LayoutInner = @import("Layout.zig").Inner;
 /// Size of the working scratch buffers used while laying out a container.
 pub const LayoutMax = @import("Layout.zig").Max;
+/// Maximum elements the `Context` element pool (see `Context.PoolN`) can hold
+/// before a frame must call `clear`.
+pub const PoolN = @import("options").pool;
 pub const Window = if (options.sdl)
     @import("Window.zig")
 else

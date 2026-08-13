@@ -16,6 +16,32 @@
 /// "10% lows" event.
 const std = @import("std");
 
+/// Master switch for the whole debug/profiler subsystem. Set to `false` and
+/// every debug call becomes a no-op: all methods below compile to empty bodies,
+/// the Window's hot-path section brackets are guarded with `comptime`, and
+/// plugins (including the built-in example recorder) stop firing. Call sites
+/// stay valid source, but emit no code.
+pub const enabled: bool = true;
+
+/// Registered debug "plugins": objects with optional per-frame and per-report
+/// hooks, so app or library code can hang its own highly-specific diagnostics
+/// off the profiler without touching the timing core.
+pub const MaxPlugins = 8;
+
+pub const PluginVTable = struct {
+    /// Short name used in diagnostics (not printed by default).
+    name: []const u8 = "plugin",
+    /// Runs after each finished frame (`_finalize`).
+    onFrame: ?*const fn (data: *anyopaque, dbg: *DebugInfo) void = null,
+    /// Runs at the end of each periodic report, after the section rows.
+    onReport: ?*const fn (data: *anyopaque, dbg: *DebugInfo) void = null,
+};
+
+pub const Plugin = struct {
+    vtable: *const PluginVTable,
+    data: *anyopaque,
+};
+
 /// Monotonic clock in nanoseconds. Uses the Linux vDSO path (a ~10-40ns call)
 /// when available, which is what keeps the measuring overhead negligible.
 /// `std.time` in this toolchain carries no clock source, so we go to the
@@ -56,6 +82,10 @@ pub const DebugInfo = struct {
     /// How many most-recent frame samples the report averages over.
     pub const HistoryWindow = 200;
 
+    /// Wall-clock cadence of the periodic report: it prints once this much real
+    /// time passes, regardless of how many frames that took.
+    pub const report_interval_ns: i128 = 2 * std.time.ns_per_s;
+
     /// A frame is "anomalous" (printed live) when it is at least `spike_factor`
     /// times the running average of the window and `spike_min_ns` over it.
     pub const spike_factor: f32 = 2.0;
@@ -64,6 +94,27 @@ pub const DebugInfo = struct {
     pub const spike_min_ns: u64 = std.time.ns_per_ms;
 
     const N = @typeInfo(Section).@"enum".fields.len;
+
+    // --- custom trace (its own subsystem, hashmap-shaped) ---
+    pub const MaxCustom = 32;
+    const MaxDepth = 16;
+    const CustomAcc = struct {
+        name: []const u8 = "",
+        frame_ns: u64 = 0,
+        frame_count: u32 = 0,
+        // Announced steps this frame (cache hits/misses, loops, ...): folded
+        // into the window totals at frame end, same as times.
+        frame_steps: u64 = 0,
+        window_steps: u64 = 0,
+        /// How many window frames saw a step in this node (for the per-frame
+        /// step rate; step-only nodes may have `window_count == 0`).
+        step_frames: u32 = 0,
+        window_total_ns: u64 = 0,
+        window_count: u32 = 0,
+        best_ns: u64 = std.math.maxInt(u64),
+        worst_ns: u64 = 0,
+    };
+    const Scope = struct { name: []const u8, start: i128 };
 
     /// One recorded frame: the whole-frame time plus per-section times.
     const FrameSample = struct {
@@ -97,20 +148,158 @@ pub const DebugInfo = struct {
     spos: usize = 0,
     /// Frames recorded so far, capped at `HistoryWindow`.
     scount: usize = 0,
+    /// Frames captured since the last periodic report (the report's own window).
+    report_frames: usize = 0,
     /// Monotonic time the profiler came alive (for elapsed in live spikes).
     start_ns: i128 = 0,
+    /// Monotonic time the last periodic report printed (drives `_maybePeriodic`).
+    last_report_ns: i128 = 0,
+
+    // --- plugin registry ---
+    plugins: [MaxPlugins]Plugin = undefined,
+    nplugins: usize = 0,
+
+    /// Runtime on/off: `false` makes every method below a no-op without needing
+    /// `if (dbg) |d| d.begin(...)` at the call sites. `enabled` (comptime) is
+    /// the compile-time master switch; this is the per-frame one. Setters keep
+    /// wrapped values as-is, so `main` can do `ctx.dbg.active = stay`. Right now
+    /// turning it off mid-run just stops the measurement.
+    active: bool = true,
+
+    // --- custom trace (its own subsystem, hashmap-shaped) ---
+    custom: [MaxCustom]CustomAcc = [_]CustomAcc{.{}} ** MaxCustom,
+    custom_count: usize = 0,
+    scopes: [MaxDepth]Scope = undefined,
+    scope_depth: usize = 0,
 
     pub fn init() DebugInfo {
-        return .{ .start_ns = now() };
+        const t = now();
+        var info = DebugInfo{ .start_ns = t, .last_report_ns = t };
+        // The built-in example plugin rides along: it prints the custom-trace
+        // block (see `beginCustom`) at every periodic report, so calling
+        // `beginCustom("adding elements")`/`endCustom` is enough to get its
+        // per-frame avg/worst diagnostics without extra setup.
+        _ = info.plug(&example_vtable, undefined);
+        return info;
     }
 
     /// Resets every measurement. Called by the Window when the last debug
     /// watcher releases, so a later `debug()` starts from a clean slate.
     pub fn deinit(self: *DebugInfo) void {
-        self.* = .{ .start_ns = now() };
+        const t = now();
+        self.* = .{ .start_ns = t, .last_report_ns = t };
+    }
+
+    /// Registers a plugin hook set. Returns its slot index, or null when the
+    /// registry is full (or the profiler is compiled out).
+    pub fn plug(self: *DebugInfo, vtable: *const PluginVTable, data: *anyopaque) ?usize {
+        if (comptime !enabled) return null;
+        if (self.nplugins >= MaxPlugins) return null;
+        const i = self.nplugins;
+        self.plugins[i] = .{ .vtable = vtable, .data = data };
+        self.nplugins += 1;
+        return i;
+    }
+
+    /// Runtime on/off switch, meant for a zero-initialized `Context.dbg`:
+    /// `ctx.dbg.enable(profile)` registers the built-in example plugin on the
+    /// way up (so its custom-trace report works without a separate `init`)
+    /// and anchors the report clocks so the first 2s cadence starts now.
+    /// When disabled, every method is a no-op.
+    pub fn enable(self: *DebugInfo, on: bool) void {
+        if (comptime !enabled) return;
+        if (on and self.nplugins == 0) _ = self.plug(&example_vtable, undefined);
+        self.active = on;
+        if (on) {
+            self.start_ns = now();
+            self.last_report_ns = now();
+        }
+    }
+
+    /// Starts timing a custom, named node ("adding elements", "ending layouts",
+    /// ...). Pairs made of `beginCustom(name)`/`endCustom(name)` accumulate
+    /// into one hashmap entry per name: calling the same name twice in a frame
+    /// adds both spans to its per-frame time, and the report shows each node's
+    /// averaged and worst frame. Nested names are tracked with a small stack,
+    /// so a node can have sub-nodes.
+    pub fn beginCustom(self: *DebugInfo, name: []const u8) void {
+        if (comptime !enabled) return;
+        if (!self.active) return;
+        if (self.scope_depth >= MaxDepth) return;
+        self.scopes[self.scope_depth] = .{ .name = name, .start = now() };
+        self.scope_depth += 1;
+    }
+
+    /// Closes the innermost `beginCustom(name)` whose name matches and folds
+    /// its duration into that node's per-frame accumulator. Unknown or
+    /// mismatched names are ignored.
+    pub fn endCustom(self: *DebugInfo, name: []const u8) void {
+        if (comptime !enabled) return;
+        if (!self.active) return;
+        if (self.scope_depth == 0) return;
+        const top = self.scope_depth - 1;
+        if (!std.mem.eql(u8, self.scopes[top].name, name)) return;
+        const span: u64 = @intCast(now() - self.scopes[top].start);
+        self.scope_depth -= 1;
+        if (span == 0) return;
+        const e = self.findCustom(name) orelse return;
+        e.frame_ns += span;
+        e.frame_count += 1;
+    }
+
+    /// Announces a step under `name` — a cache hit, a cache miss, a loop
+    /// iteration, *anything* requested via `onFrame`-style code (e.g. the
+    /// widget builders in `Context`). It accumulates: `announce("cache hit")`
+    /// called a hundred times in a frame adds a hundred to that node's window
+    /// total, printed by the built-in example plugin. No time is recorded, so
+    /// this is the cheapest way to trace *what is happening* on the build side.
+    pub fn announce(self: *DebugInfo, name: []const u8) void {
+        if (comptime !enabled) return;
+        if (!self.active) return;
+        const e = self.findCustom(name) orelse return;
+        e.frame_steps += 1;
+    }
+
+    /// Linear-probe lookup (hash of the name is a poor fit for a comptime-ish
+    /// registry): finds the `CustomAcc` for `name`, creating it on demand.
+    fn findCustom(self: *DebugInfo, name: []const u8) ?*CustomAcc {
+        for (0..self.custom_count) |i| {
+            if (std.mem.eql(u8, self.custom[i].name, name)) return &self.custom[i];
+        }
+        if (self.custom_count >= MaxCustom) return null;
+        const e = &self.custom[self.custom_count];
+        self.custom_count += 1;
+        e.name = name;
+        return e;
+    }
+
+    /// Folds every custom node's per-frame accumulation into the window stats
+    /// (avg/worst/best, plus announced step counts) at the end of a frame, then
+    /// resets it.
+    fn _foldCustom(self: *DebugInfo) void {
+        if (comptime !enabled) return;
+        for (0..self.custom_count) |i| {
+            const e = &self.custom[i];
+            if (e.frame_count == 0 and e.frame_steps == 0) continue;
+            if (e.frame_count != 0) {
+                if (e.frame_ns > e.worst_ns) e.worst_ns = e.frame_ns;
+                if (e.frame_ns < e.best_ns) e.best_ns = e.frame_ns;
+                e.window_total_ns += e.frame_ns;
+                e.window_count += 1;
+            }
+            if (e.frame_steps != 0) {
+                e.window_steps += e.frame_steps;
+                e.step_frames += 1;
+            }
+            e.frame_ns = 0;
+            e.frame_count = 0;
+            e.frame_steps = 0;
+        }
     }
 
     pub fn begin(self: *DebugInfo, section: Section) void {
+        if (comptime !enabled) return;
+        if (!self.active) return;
         const i = @intFromEnum(section);
         if (self.depth[i] == 0) self.start[i] = now();
         self.depth[i] += 1;
@@ -120,6 +309,8 @@ pub const DebugInfo = struct {
     /// `begin` was never called for it (e.g. a section the app does not use).
     /// Nested `begin`s are folded by their outermost `end`.
     pub fn end(self: *DebugInfo, section: Section) void {
+        if (comptime !enabled) return;
+        if (!self.active) return;
         const i = @intFromEnum(section);
         if (self.depth[i] == 0) return;
         self.depth[i] -= 1;
@@ -137,6 +328,7 @@ pub const DebugInfo = struct {
     /// Runs whenever a whole frame closes: pushes it into the ring, advances the
     /// FPS window, and live-detects anomalies.
     fn _finalize(self: *DebugInfo) void {
+        if (comptime !enabled) return;
         const frame_i = @intFromEnum(Section.frame);
         const total_ns = self.last_ns[frame_i];
 
@@ -145,11 +337,40 @@ pub const DebugInfo = struct {
         self.samples[self.spos] = .{ .total_ns = total_ns, .sec_ns = sec };
         self.spos = (self.spos + 1) % HistoryWindow;
         if (self.scount < HistoryWindow) self.scount += 1;
+        self.report_frames += 1;
 
         self._updateFps();
 
         // Live anomaly watch once we have enough history to trust the average.
         if (self.scount >= 30) self._detectSpike(total_ns);
+
+        // Fold the custom-trace per-frame accumulators into the window stats.
+        self._foldCustom();
+
+        // Let plugins watch every finished frame (element adds, layout ends,
+        // whatever they are hooked to).
+        for (0..self.nplugins) |i| {
+            const p = self.plugins[i];
+            if (p.vtable.onFrame) |f| f(p.data, self);
+        }
+
+        // Periodic report on a wall-clock cadence.
+        self._maybePeriodic();
+    }
+
+    /// Prints the periodic report once `report_interval_ns` of real time has
+    /// elapsed since the last one, so output arrives on a seconds cadence
+    /// (2s) no matter how fast or slowly frames are coming. The report covers
+    /// exactly the frames captured since the previous report.
+    fn _maybePeriodic(self: *DebugInfo) void {
+        if (comptime !enabled) return;
+        const current = now();
+        if (current - self.last_report_ns >= report_interval_ns) {
+            self.last_report_ns = current;
+            const captured = self.report_frames;
+            self.report_frames = 0;
+            self.print(captured);
+        }
     }
 
     /// Prints a full live review when a frame departs from the window's running
@@ -238,11 +459,13 @@ pub const DebugInfo = struct {
     /// The current FPS from the rolling window (0 until the first window
     /// partially fills).
     pub fn fps(self: *const DebugInfo) f64 {
+        if (comptime !enabled) return 0;
         return self.fps_now;
     }
 
     /// Average duration (ms) of `section` over the samples since re-init.
     pub fn averageMs(self: *const DebugInfo, section: Section) f64 {
+        if (comptime !enabled) return 0;
         const i = @intFromEnum(section);
         const n = self.count[i];
         if (n == 0) return 0;
@@ -263,13 +486,18 @@ pub const DebugInfo = struct {
     /// The per-section totals shared by the periodic report and the live spike
     /// review; see `printSections`.
 
-    /// Writes a report to stderr averaged over the last `HistoryWindow` frames:
-    /// FPS, frame avg/min/max plus p50/p95/p99, a "10% lows" number, and each
-    /// timed section's average, worst frame and share of the frame.
-    pub fn print(self: *const DebugInfo) void {
-        const n = self.scount;
+    /// Writes a report to stderr averaged over the `n` frames recorded since the
+    /// last periodic report (the ring keeps at most `HistoryWindow`, so the
+    /// newest `n` samples are used): FPS, frame avg/min/max plus p50/p95/p99,
+    /// a "10% lows" number, and each timed section's average, worst frame and
+    /// share of the frame.
+    pub fn print(self: *const DebugInfo, captured: usize) void {
+        if (comptime !enabled) return;
+        if (!self.active) return;
+        // The ring only holds `HistoryWindow`, so n is that at most.
+        const n = @min(captured, HistoryWindow);
         if (n == 0) {
-            std.debug.print("profiler: no frames yet\n", .{});
+            std.debug.print("profiler: no frames captured since the last report\n", .{});
             return;
         }
         var buf: [HistoryWindow]u64 = undefined;
@@ -283,7 +511,7 @@ pub const DebugInfo = struct {
         const p99_ns = buf[self.percentileIndex(n, 0.99)];
         const lows_ns = self.tenPercentLows(buf[0..n]);
 
-        std.debug.print("\n=== profiler: last {d} frames ===\n", .{n});
+        std.debug.print("\n=== profiler: {d} frames captured ===\n", .{n});
         std.debug.print("fps: {d:.1}\n", .{self.fps_now});
 
         // Per-section totals/counts/max over the window (ring order).
@@ -315,6 +543,12 @@ pub const DebugInfo = struct {
             0;
 
         self.printSections(n, section_totals, section_counts, section_max, avg_frame_ms);
+
+        // Plugin reports ride at the end of the periodic report.
+        for (0..self.nplugins) |i| {
+            const p = self.plugins[i];
+            if (p.vtable.onReport) |f| f(p.data, @constCast(self));
+        }
     }
 
     /// The per-section block shared by the periodic 200-frame report and the
@@ -374,6 +608,55 @@ pub const DebugInfo = struct {
         );
     }
 };
+
+/// The built-in example plugin, integrated in the library itself: a recorder
+/// that prints the custom-trace nodes at every periodic report. You get it for
+/// free by using `beginCustom(name)`/`endCustom(name)` — e.g. bracketing
+/// element creation and layout teardown:
+///
+/// ```zig
+/// dbg.beginCustom("adding elements");
+/// for (0..RENDER) |i| _ = ctx.box(.{}, .{}, @src());
+/// dbg.endCustom("adding elements");
+///
+/// dbg.beginCustom("ending layouts");
+/// field.layout.?.end();
+/// dbg.endCustom("ending layouts");
+/// ```
+///
+/// Each report shows, per node: the average and worst per-frame time and how
+/// many frames it was seen in. This is a *separate subsystem* from the section
+/// profiler — it lives on the same `DebugInfo` but tracks its own named,
+/// hashmap-accumulated spans.
+const example_vtable = PluginVTable{
+    .name = "custom-trace recorder",
+    .onReport = &exampleReport,
+};
+
+fn exampleReport(data: *anyopaque, dbg: *DebugInfo) void {
+    _ = data;
+    if (comptime !enabled) return;
+    if (dbg.custom_count == 0) return;
+    std.debug.print("custom trace:\n", .{});
+    for (0..dbg.custom_count) |i| {
+        const e = dbg.custom[i];
+        if (e.window_count == 0 and e.window_steps == 0) continue;
+        if (e.window_count != 0) {
+            const avg_ms = @as(f64, @floatFromInt(e.window_total_ns)) / @as(f64, @floatFromInt(e.window_count)) / std.time.ns_per_ms;
+            std.debug.print(
+                "  {s:<24} avg {d:9.3}ms  worst {d:9.3}ms  best {d:9.3}ms  x{d}\n",
+                .{ e.name, avg_ms, dbg.ms(e.worst_ns), dbg.ms(e.best_ns), e.window_count },
+            );
+        }
+        if (e.window_steps != 0) {
+            const per = @as(f64, @floatFromInt(e.window_steps)) / @as(f64, @floatFromInt(@max(e.step_frames, 1)));
+            std.debug.print(
+                "  {s:<24} steps  {d:9}  per-frame {d:.2}  x{d}f\n",
+                .{ e.name, e.window_steps, per, e.step_frames },
+            );
+        }
+    }
+}
 
 test "fps and sections accumulate" {
     var info = DebugInfo.init();
@@ -447,4 +730,79 @@ test "spike reviews are triggered and include sections" {
         total += info.samples[pos].total_ns;
     }
     try std.testing.expect(total > 0);
+}
+
+test "custom nodes accumulate per frame and fold into window stats" {
+    var info = DebugInfo.init();
+    for (0..3) |_| {
+        info.begin(.frame);
+        info.beginCustom("adding elements");
+        info.endCustom("adding elements");
+        // Same name twice in one frame: both spans add to its per-frame total.
+        info.beginCustom("adding elements");
+        info.endCustom("adding elements");
+        info.end(.frame);
+    }
+    try std.testing.expect(info.custom_count == 1);
+    const e = info.custom[0];
+    try std.testing.expect(std.mem.eql(u8, e.name, "adding elements"));
+    try std.testing.expect(e.frame_count == 0);
+    try std.testing.expect(e.window_count == 3);
+    try std.testing.expect(e.worst_ns > 0);
+    try std.testing.expect(e.best_ns <= e.worst_ns);
+    try std.testing.expect(e.window_total_ns >= e.worst_ns);
+}
+
+test "announced steps fold into window totals across frames" {
+    var info = DebugInfo.init();
+    for (0..3) |_| {
+        info.begin(.frame);
+        info.announce("cache hit");
+        info.announce("cache hit");
+        info.announce("text rasterize");
+        info.announce("cache hit");
+        info.end(.frame);
+    }
+    var found_hit = false;
+    var found_raster = false;
+    for (0..info.custom_count) |i| {
+        const e = info.custom[i];
+        if (std.mem.eql(u8, e.name, "cache hit")) {
+            found_hit = true;
+            try std.testing.expect(e.window_steps == 9);
+            try std.testing.expect(e.step_frames == 3);
+        } else if (std.mem.eql(u8, e.name, "text rasterize")) {
+            found_raster = true;
+            try std.testing.expect(e.window_steps == 3);
+            try std.testing.expect(e.step_frames == 3);
+        }
+    }
+    try std.testing.expect(found_hit and found_raster);
+}
+
+test "plugin hooks fire on frame end and report" {
+    const State = struct {
+        frames: u32 = 0,
+        reports: u32 = 0,
+
+        fn onF(data: *anyopaque, _: *DebugInfo) void {
+            const s: *@This() = @ptrCast(@alignCast(data));
+            s.frames += 1;
+        }
+        fn onR(data: *anyopaque, _: *DebugInfo) void {
+            const s: *@This() = @ptrCast(@alignCast(data));
+            s.reports += 1;
+        }
+    };
+    var state = State{};
+    var info = DebugInfo.init();
+    info.nplugins = 0; // drop the built-in example plugin so counts are ours
+    _ = info.plug(&.{ .name = "test", .onFrame = &State.onF, .onReport = &State.onR }, &state);
+    for (0..4) |_| {
+        info.begin(.frame);
+        info.end(.frame);
+    }
+    try std.testing.expect(state.frames == 4);
+    info.print(4);
+    try std.testing.expect(state.reports == 1);
 }

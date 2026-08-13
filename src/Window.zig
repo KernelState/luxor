@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const options = @import("options");
 const lu = @import("luxor.zig");
 const sdl = @import("sdl");
 
@@ -82,12 +83,6 @@ batch: Batch = .{},
 /// queued batch primitives; destroyed after the batch is flushed.
 pending: [max_pending]?*sdl.SDL_Texture = undefined,
 pn: usize = 0,
-/// Frame profiler, reference-counted. Null when no debug watcher is alive;
-/// `debug()` re-inits it on demand, and the last `debugRelease()` deinits it.
-debug_info: ?lu.Debug.DebugInfo = null,
-/// Live debug watchers. Zero means measuring is fully off (render does a null
-/// check per section instead of reading the clock).
-debug_refs: u32 = 0,
 
 const max_textures = 1024;
 const max_clips = 64;
@@ -112,12 +107,14 @@ const gradient_indices_max = gradient_cells_max * gradient_cells_max * 6;
 /// and stretched to the drawing area.
 const max_gradient_size: f32 = 512.0;
 
-/// Frame buffer sizes for the batched primitive queue. The scene is small
-/// (hundreds of rounded-rect fans and textured quads); when the buffers fill
-/// mid-frame the queued primitives are flushed early and the queue reopens.
-const max_batch_verts = 16384;
-const max_batch_idx = 65536;
-const max_batch_prims = 4096;
+/// Frame buffer sizes for the batched primitive queue. When the buffers fill
+/// mid-frame the queued primitives are flushed early and the queue reopens. A
+/// big stress scene (thousands of boxes in one flex container) merges into a
+/// few giant runs, so the defaults need headroom for it; tune with
+/// -Dbatch-verts / -Dbatch-idx / -Dbatch-prims.
+const max_batch_verts = options.batch_verts;
+const max_batch_idx = options.batch_idx;
+const max_batch_prims = options.batch_prims;
 /// Transient textures awaiting destruction after the next batch flush.
 const max_pending = 128;
 
@@ -335,13 +332,15 @@ pub fn plugCache(self: *Window, ctx: *lu.Context) void {
 /// section. The section is nesting-aware, so a cache call that happens while
 /// another is open (a cached texture drawn from inside a shadow lookup) still
 /// folds into a single timing span without corrupting the enclosing phase.
-/// Mirrors `if (self.debug_info) |*d| ...` used for the other phases.
+/// Mirrors the other phases: reads the plugged `Context.dbg` directly.
 fn cacheBegin(self: *Window) void {
-    if (self.debug_info) |*d| d.begin(.cache);
+    if (comptime !lu.Debug.enabled) return;
+    if (self.ctx) |c| c.dbg.begin(.cache);
 }
 
 fn cacheEnd(self: *Window) void {
-    if (self.debug_info) |*d| d.end(.cache);
+    if (comptime !lu.Debug.enabled) return;
+    if (self.ctx) |c| c.dbg.end(.cache);
 }
 
 fn lookupCached(ptr: *anyopaque, key: u64, fingerprint: u64) ?u64 {
@@ -458,7 +457,12 @@ pub fn render(self: *Window, root: *lu.Element) void {
     self.evictStale();
     self.batchReset();
     self.pn = 0;
-    if (self.debug_info) |*d| d.begin(.layout);
+    if (comptime lu.Debug.enabled) {
+        if (self.ctx) |c| {
+            c.dbg.begin(.layout);
+            c.dbg.beginCustom("layout");
+        }
+    }
     // Top-down layout: size the root from the window, wire it to its layout,
     // and let the layout tree size and position every descendant.
     root.size = self.size;
@@ -466,12 +470,23 @@ pub fn render(self: *Window, root: *lu.Element) void {
     const root_layout = &(root.layout orelse return);
     root_layout.element = root;
     _ = root_layout.lay();
-    if (self.debug_info) |*d| d.end(.layout);
-    if (self.debug_info) |*d| d.begin(.draw);
+    if (comptime lu.Debug.enabled) {
+        if (self.ctx) |c| {
+            c.dbg.endCustom("layout");
+            c.dbg.end(.layout);
+            c.dbg.begin(.draw);
+            c.dbg.beginCustom("draw");
+        }
+    }
     self.drawElement(root, .{ .pos = root.pos, .size = root.size });
     self.flushBatch();
     self.drainPending();
-    if (self.debug_info) |*d| d.end(.draw);
+    if (comptime lu.Debug.enabled) {
+        if (self.ctx) |c| {
+            c.dbg.endCustom("draw");
+            c.dbg.end(.draw);
+        }
+    }
     self.events.draw.emit({});
     self.process(root);
 }
@@ -817,28 +832,6 @@ pub fn overrides(self: *Window) lu.Element.Overrides {
     return .{ .size = self.size };
 }
 
-/// Enables frame profiling and returns the shared `DebugInfo` (re-inited fresh
-/// if it was released). Every call to `debug()` must be matched by a
-/// `debugRelease()`; the actual profiler object is torn down when the last
-/// watcher releases, so timing overhead is zero when nobody is looking.
-pub fn debug(self: *Window) *lu.Debug.DebugInfo {
-    if (self.debug_info == null)
-        self.debug_info = lu.Debug.DebugInfo.init();
-    self.debug_refs += 1;
-    return &self.debug_info.?;
-}
-
-/// Releases one `debug()` reference (idempotent). When the last watcher
-/// releases, the profiler object is deinited; a later `debug()` re-inits it.
-pub fn debugRelease(self: *Window) void {
-    if (self.debug_refs == 0) return;
-    self.debug_refs -= 1;
-    if (self.debug_refs == 0) {
-        self.debug_info.?.deinit();
-        self.debug_info = null;
-    }
-}
-
 fn ensureScratch(self: *Window) void {
     if (self.scratch_ready) return;
     self.scratch_fba = std.heap.FixedBufferAllocator.init(self.scratch);
@@ -935,12 +928,19 @@ fn clipEq(a: ClipRec, b: ClipRec) bool {
 fn emitPrim(self: *Window, tex: ?*sdl.SDL_Texture, clip: ClipRec, verts: []const sdl.SDL_Vertex, idx: []const c_int) void {
     if (verts.len == 0 or idx.len == 0) return;
     const b = &self.batch;
+    // The data must fit before a primitive is recorded: flushing an open run
+    // splits it cleanly, but a run recorded with a vstart/vlen for verts that
+    // are never appended would make the flush draw unwritten buffer regions.
+    if (b.nverts + verts.len > b.verts.len or b.nidx + idx.len > b.idx.len) {
+        self.flushBatch();
+        return self.emitPrim(tex, clip, verts, idx);
+    }
+    if (b.nprims >= b.prims.len) {
+        self.flushBatch();
+        return self.emitPrim(tex, clip, verts, idx);
+    }
     const same_run = b.open and b.cur_tex == tex and clipEq(b.cur_clip, clip);
     if (!same_run) {
-        if (b.nprims >= b.prims.len) {
-            self.flushBatch();
-            return self.emitPrim(tex, clip, verts, idx);
-        }
         b.open = true;
         b.cur_tex = tex;
         b.cur_clip = clip;
@@ -953,10 +953,6 @@ fn emitPrim(self: *Window, tex: ?*sdl.SDL_Texture, clip: ClipRec, verts: []const
             .ilen = idx.len,
         };
         b.nprims += 1;
-    }
-    if (b.nverts + verts.len > b.verts.len or b.nidx + idx.len > b.idx.len) {
-        self.flushBatch();
-        return self.emitPrim(tex, clip, verts, idx);
     }
     const p = &b.prims[b.nprims - 1];
     @memcpy(b.verts[b.nverts .. b.nverts + verts.len], verts);

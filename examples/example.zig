@@ -155,18 +155,16 @@ pub fn main() !void {
     var app = AppState{ .win = &window };
     window.events.key = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onKey } } } };
 
-    var dbg = window.debug();
-    defer window.debugRelease();
-    var frame: u64 = 0;
+    ctx.dbg.enable(true);
     while (true) {
-        dbg.begin(.frame);
-        dbg.begin(.events);
+        ctx.dbg.begin(.frame);
+        ctx.dbg.begin(.events);
         window.update();
-        dbg.end(.events);
+        ctx.dbg.end(.events);
         if (window.shouldQuit() or app.quit) return;
 
         // Immediate mode: reclaim the element pool, rebuild the tree, render.
-        dbg.begin(.build);
+        ctx.dbg.begin(.build);
         ctx.clear();
 
         // A light canvas so the black drop shadows stay visible.
@@ -322,24 +320,17 @@ pub fn main() !void {
 
         // Nothing is building any more; the window lays the tree out on render.
         root.layout.?.end();
-        dbg.end(.build);
+        ctx.dbg.end(.build);
 
         _ = sdl.renderClear(window.renderer);
 
         // React to the live window size: override the root, then render.
         root.override(window.overrides());
         window.render(&root);
-        dbg.begin(.present);
+        ctx.dbg.begin(.present);
         _ = sdl.renderPresent(window.renderer);
-        dbg.end(.present);
-        dbg.end(.frame);
-
-        // Print a report every full 200-frame window: it averages those exact
-        // frames, so each line is directly comparable to the next.
-        frame += 1;
-        if (frame % lu.Debug.DebugInfo.HistoryWindow == 0) {
-            dbg.print();
-        }
+        ctx.dbg.end(.present);
+        ctx.dbg.end(.frame);
     }
 }
 

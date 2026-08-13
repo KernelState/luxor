@@ -9,16 +9,19 @@
 /// that vtable.
 const std = @import("std");
 const builtin = @import("builtin");
+const options = @import("options");
 const lu = @import("luxor.zig");
 
 /// The number of requests/children a single layout can hold (the per-layout
 /// static arrays). Elements are referenced by pointer (into the widget's
 /// element pool), never by value, so `Element` can embed a `Layout` by value
-/// without a size-recursion loop.
-pub const Inner = 200;
+/// without a size-recursion loop. Configurable at build time with
+/// `-Dlayout-inner=<n>`; the default matches the library's baseline.
+pub const Inner = options.inner;
 /// Size of working scratch buffers used while laying out a container. Content
-/// with more children than this cannot be laid out.
-pub const Max = 1000;
+/// with more children than this cannot be laid out. Configurable at build time
+/// with `-Dlayout-max=<n>`.
+pub const Max = options.max;
 
 pub const Layout = struct {
     /// The layout kind (flex, grid, ...).
@@ -217,7 +220,7 @@ pub const Layout = struct {
             if (builtin.mode == .Debug) {
                 @panic("Reached maximum layout requests");
             } else {
-                std.log.warn("Reached maximum layout requests, please contact the developer to fix this");
+                std.log.warn("Reached maximum layout requests, please contact the developer to fix this", .{});
                 return @intCast(self.rindex);
             }
         }

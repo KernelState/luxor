@@ -6,6 +6,7 @@
 /// one of these per application, it's more like a piece of context.
 const std = @import("std");
 const builtin = @import("builtin");
+const options = @import("options");
 const lu = @import("luxor.zig");
 const c = @cImport({
     @cInclude("freetype2/freetype/freetype.h");
@@ -57,6 +58,11 @@ layout_cache: ?LayoutCacheSink = null,
 /// makes that cache a no-op: the rasterization/decode runs fresh every frame,
 /// so you can measure the real cost of text/images side by side. Default all-on.
 flags: Flags = .{},
+/// The frame profiler + plugin host, embedded so any widget can record
+/// sections, custom-trace spans and announced steps without an `if (dbg)`
+/// dance at the call sites. Zero-initialized `Context`s get `active = false`,
+/// so everything above is a no-op until the app calls `ctx.dbg.enable(true)`.
+dbg: lu.Debug.DebugInfo = .{},
 /// Per-frame event state for the view (the window). The Window's post-draw
 /// processing pass rewrites it every frame from the SDL events it pumped;
 /// widgets read it in `evalEvents` when they initialize elements, so an
@@ -75,7 +81,8 @@ plen: usize = 0,
 
 /// Maximum elements a widget can build before the pool must be cleared. The
 /// example's screen (dozens of boxes, buttons and labels) fits comfortably.
-pub const PoolN = 512;
+/// Configurable at build time with `-Delement-pool=<n>`.
+pub const PoolN = options.pool;
 
 /// A Window-provided uploader for persistent per-element textures. The cache
 /// is looked up *before* Context decides to cache on CPU: if `lookup` returns a
@@ -111,7 +118,7 @@ pub const LayoutEntry = struct {
     /// window resized and reallocated the container) is a miss, not a stale hit.
     container: lu.Rect,
     n: usize,
-    kids: [200]Child,
+    kids: [lu.LayoutInner]Child,
     /// Last frame this layout was consulted or stored; idle entries are evicted.
     last_seen: u64,
 
@@ -314,6 +321,7 @@ fn publish(self: *Context, e: *lu.Element) ?u32 {
 /// `min_size`/`max_size`, growth and alignment for the element. `e` must live
 /// in the element pool so the parent's request can hold a stable pointer.
 pub fn publishRequest(self: *Context, e: *lu.Element, req: lu.Layout.Request) ?u32 {
+    self.dbg.announce("publish");
     const parent = self.current orelse return null;
     const id = parent.request(req);
     parent.addElement(id, e);
@@ -620,9 +628,12 @@ fn textSizeCached(self: *Context, font: *Font, text: []const u8, size: u32, dire
     // face is reused at several sizes, and `wrapLines`/line-height math reads
     // `font.pixel_size` after measuring. `setCharSize` no-ops when unchanged.
     try font.setCharSize(size);
-    if (self.textsize_memo.get(font, text, size, direction, weight)) |r|
+    if (self.textsize_memo.get(font, text, size, direction, weight)) |r| {
+        self.dbg.announce("measure hit");
         return r;
+    }
     const r = try font.textSize(self.frame_arena.allocator(), text, size, direction, weight);
+    self.dbg.announce("measure miss");
     self.textsize_memo.put(font, text, size, direction, weight, r);
     return r;
 }
@@ -755,9 +766,12 @@ fn renderTextCached(self: *Context, fnSelf: *Font, text: []const u8, area: lu.Re
     const fingerprint = textLayKey(fnSelf, text, area, spacing, size, direction, color, render, wrap, weight);
     if (self.flags.gpu_cache) {
         if (self.gpu_cache) |gc| {
-            if (gc.lookup(gc.ptr, key, fingerprint) != null)
+            if (gc.lookup(gc.ptr, key, fingerprint) != null) {
+                self.dbg.announce("gpu cache hit");
                 return lu.Background.cached(key);
+            }
             // Miss on the GPU: rasterize transiently and let the Window upload.
+            self.dbg.announce("gpu cache miss");
             const buf = try fnSelf.renderText(
                 self.frame_arena.allocator(),
                 text,
@@ -771,16 +785,22 @@ fn renderTextCached(self: *Context, fnSelf: *Font, text: []const u8, area: lu.Re
                 wrap,
                 weight,
             );
-            if (gc.upload(gc.ptr, key, fingerprint, buf) != null)
+            if (gc.upload(gc.ptr, key, fingerprint, buf) != null) {
+                self.dbg.announce("gpu upload");
                 return lu.Background.cached(key);
+            }
             // The Window declined the upload; fall through to CPU.
         }
     }
     if (self.flags.text_cache) {
         if (self.text_cache.get(key)) |entry| {
-            if (entry.fingerprint == fingerprint) return lu.Background.buffer(entry.buffer);
+            if (entry.fingerprint == fingerprint) {
+                self.dbg.announce("text cache hit");
+                return lu.Background.buffer(entry.buffer);
+            }
         }
     }
+    self.dbg.announce("text rasterize");
     const buf = try fnSelf.renderText(
         self.arena.allocator(),
         text,
@@ -888,9 +908,12 @@ fn textLay(layout: *lu.Layout) void {
 /// wrapped strings (the example's long label) skip shaping after frame one.
 fn wrapLinesCached(self: *Context, font: *Font, text: []const u8, size: u32, direction: Font.Direction, spacing: lu.Rect, wrap_w: u32, weight: u16) !u32 {
     try font.setCharSize(size);
-    if (self.wrap_memo.get(font, text, size, direction, spacing, wrap_w, weight)) |lines|
+    if (self.wrap_memo.get(font, text, size, direction, spacing, wrap_w, weight)) |lines| {
+        self.dbg.announce("wrap hit");
         return lines;
+    }
     const lines = try wrapLines(font, self.frame_arena.allocator(), text, size, direction, spacing, wrap_w, weight);
+    self.dbg.announce("wrap miss");
     self.wrap_memo.put(font, text, size, direction, spacing, wrap_w, weight, lines);
     return lines;
 }
@@ -899,6 +922,7 @@ fn wrapLinesCached(self: *Context, font: *Font, text: []const u8, size: u32, dir
 /// rasterized here: the `text` layout renders it when the box is laid out,
 /// so it can wrap to the width it is actually given.
 pub fn label(self: *Context, text: []const u8, overrides: lu.Element.Overrides, opts: LabelOpts, comptime src: std.builtin.SourceLocation) !*lu.Element {
+    self.dbg.announce("label");
     const cfg = self.frame_arena.allocator().create(TextConfig) catch unreachable;
     cfg.* = .{
         .font = &self.fonts[opts.font_idx],
@@ -939,6 +963,7 @@ pub fn label(self: *Context, text: []const u8, overrides: lu.Element.Overrides, 
 /// applies `overrides`, and returns a plain element. No contents, no opts. The
 /// element is owned by the widget's pool (stable address, no heap).
 pub fn box(self: *Context, size: lu.Rect, overrides: lu.Element.Overrides, comptime src: std.builtin.SourceLocation) *lu.Element {
+        self.dbg.announce("box");
     const e = self.allocElement();
     e.* = self.base(size);
     e.id = idOf(src);
@@ -1026,6 +1051,7 @@ pub const ButtonOpts = struct {
 
 /// A tappable box with a centered label.
 pub fn button(self: *Context, text: []const u8, overrides: lu.Element.Overrides, opts: ButtonOpts, comptime src: std.builtin.SourceLocation) !*lu.Element {
+    self.dbg.announce("button");
     const eid = idOf(src);
     const inner = try self.textElement(text, opts.label, eid, overrides.id_extra orelse 0);
     const pad = opts.padding;
