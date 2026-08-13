@@ -485,7 +485,6 @@ pub const DebugInfo = struct {
 
     /// The per-section totals shared by the periodic report and the live spike
     /// review; see `printSections`.
-
     /// Writes a report to stderr averaged over the `n` frames recorded since the
     /// last periodic report (the ring keeps at most `HistoryWindow`, so the
     /// newest `n` samples are used): FPS, frame avg/min/max plus p50/p95/p99,

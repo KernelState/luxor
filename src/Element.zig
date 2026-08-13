@@ -63,26 +63,26 @@ pub const Overrides = struct {
 };
 
 pub fn override(self: *Element, o: Overrides) void {
-        if (o.size) |v| self.size = v;
-        if (o.pos) |v| self.pos = v;
-        if (o.border) |v| self.border = v;
-        if (o.border_color) |v| self.border_color = v;
-        if (o.border_radius) |v| self.border_radius = v;
-        if (o.background) |v| self.background = v;
-        if (o.has_effects) self.effects = o.effects;
-        if (o.layout) |v| self.layout = v;
-        if (o.padding) |v| self.padding = v;
-        if (o.margin) |v| self.margin = v;
-        if (o.focusable) |v| self.focusable = v;
-        if (o.id_extra) |v| self.id_extra = v;
-        if (o.events) |v| self.events = v;
-    }
+    if (o.size) |v| self.size = v;
+    if (o.pos) |v| self.pos = v;
+    if (o.border) |v| self.border = v;
+    if (o.border_color) |v| self.border_color = v;
+    if (o.border_radius) |v| self.border_radius = v;
+    if (o.background) |v| self.background = v;
+    if (o.has_effects) self.effects = o.effects;
+    if (o.layout) |v| self.layout = v;
+    if (o.padding) |v| self.padding = v;
+    if (o.margin) |v| self.margin = v;
+    if (o.focusable) |v| self.focusable = v;
+    if (o.id_extra) |v| self.id_extra = v;
+    if (o.events) |v| self.events = v;
+}
 
-    /// The element's draw-time shape in the parent's coordinate space: position
-    /// and size from where it is being drawn, border radius from its settings.
-    /// The `Geometry` feeds the per-element caches in the Window (shadows, blur,
-    /// gradients), so a rebuilt element at the same place and shape reuses the
-    /// previous frame's raster instead of recomputing it.
-    pub fn geometry(self: *const Element, area: lu.Area) lu.Geometry {
-        return .{ .pos = area.pos, .size = area.size, .radius = self.border_radius };
-    }
+/// The element's draw-time shape in the parent's coordinate space: position
+/// and size from where it is being drawn, border radius from its settings.
+/// The `Geometry` feeds the per-element caches in the Window (shadows, blur,
+/// gradients), so a rebuilt element at the same place and shape reuses the
+/// previous frame's raster instead of recomputing it.
+pub fn geometry(self: *const Element, area: lu.Area) lu.Geometry {
+    return .{ .pos = area.pos, .size = area.size, .radius = self.border_radius };
+}

@@ -709,7 +709,8 @@ fn textSizeCached(self: *Context, font: *Font, text: []const u8, size: u32, dire
 /// Configuration for a `text` layout. Holds the font, the string and how to
 /// draw it; the layout reads it during `lay`, so rendering is deferred until
 /// the label has been given its box.
-pub const TextConfig = struct {    font: *Font,
+pub const TextConfig = struct {
+    font: *Font,
     text: []const u8,
     /// Pixel size of the font.
     size: u32 = 24,
@@ -1037,7 +1038,7 @@ pub fn label(self: *Context, text: []const u8, overrides: lu.Element.Overrides, 
 /// applies `overrides`, and returns a plain element. No contents, no opts. The
 /// element is owned by the widget's pool (stable address, no heap).
 pub fn box(self: *Context, size: lu.Rect, overrides: lu.Element.Overrides, comptime src: std.builtin.SourceLocation) *lu.Element {
-        self.dbg.announce("box");
+    self.dbg.announce("box");
     const e = self.allocElement();
     e.* = self.base(size);
     e.id = idOf(src);

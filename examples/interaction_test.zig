@@ -134,8 +134,8 @@ pub fn main() !void {
     root.layout.?.start();
     const box = ctx.box(.{ .w = 300, .h = 100 }, .{
         .events = .{
-            .hover = .{ .handle = .{ .fptrs = &.{.{ .data = &state, .func = &onHover } } } },
-            .click = .{ .handle = .{ .fptrs = &.{.{ .data = &state, .func = &onClick } } } },
+            .hover = .{ .handle = .{ .fptrs = &.{.{ .data = &state, .func = &onHover }} } },
+            .click = .{ .handle = .{ .fptrs = &.{.{ .data = &state, .func = &onClick }} } },
         },
     }, @src());
     const box_id = box.id;
@@ -173,7 +173,7 @@ pub fn main() !void {
 
     // ---- Scenario C: drag activates once, state tracks the mouse, ends on release. ----
     reset(&window, &state);
-    box.events.drag = .{ .handle = .{ .fptrs = &.{.{ .data = &state, .func = &onDrag } } } };
+    box.events.drag = .{ .handle = .{ .fptrs = &.{.{ .data = &state, .func = &onDrag }} } };
     pushButton(win_id, 10, 10, true);
     frame(&window, &root);
     check(state.drag_activates == 1, "C drag activates once on press");
@@ -196,7 +196,7 @@ pub fn main() !void {
     // ---------- Scenario D: keyboard edges fire activate/deactivate. ----------
     reset(&window, &state);
     box.events.drag = .{ .handle = null };
-    window.events.key = .{ .handle = .{ .fptrs = &.{.{ .data = &state, .func = &onKey } } } };
+    window.events.key = .{ .handle = .{ .fptrs = &.{.{ .data = &state, .func = &onKey }} } };
     pushKey(win_id, true);
     frame(&window, &root);
     check(state.key_down == 1, "D key down");

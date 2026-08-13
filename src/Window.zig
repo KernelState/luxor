@@ -1389,8 +1389,8 @@ fn storeShadow(self: *Window, key: u64, tex: *sdl.SDL_Texture, w: i32, h: i32) v
 fn shadowKey(e: *const lu.Element, iw: i32, ih: i32, ox: i32, oy: i32, spr: i32, blur: i32, rr: i32, color: lu.Color, mask: lu.Effect.Shadow.ShadowMask) u64 {
     var hasher = std.hash.Wyhash.init(0x5ed12a4acf31c1f3);
     const vals = [12]i32{
-        iw,         ih,         ox,         oy,
-        spr,        blur,       rr,         @as(i32, color.r),
+        iw,                ih,                ox,                oy,
+        spr,               blur,              rr,                @as(i32, color.r),
         @as(i32, color.g), @as(i32, color.b), @as(i32, color.a), @intFromEnum(mask),
     };
     hasher.update(std.mem.asBytes(&vals));

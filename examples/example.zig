@@ -150,7 +150,7 @@ pub fn main() !void {
     }
 
     var app = AppState{ .win = &window };
-    window.events.key = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onKey } } } };
+    window.events.key = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onKey }} } };
 
     ctx.dbg.enable(true);
     while (true) {
@@ -221,7 +221,7 @@ pub fn main() !void {
             // reflects last frame's hit-test and the hook handles are attached.
             const btn = try ctx.button(toolbar_slices[i], .{
                 .id_extra = i,
-                .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onClick } } } } },
+                .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onClick }} } } },
             }, .{ .color = lu.Color.fromU32(col) }, @src());
             // Hover styling reflects the *previous* frame's hit-test (the view
             // publishes hover after the frame is drawn); lighten the fill while
@@ -300,11 +300,11 @@ pub fn main() !void {
         _ = ctx.publishRequest(&slider_row, .{ .min_size = .{ .w = 0, .h = 0 } });
         slider_row.layout.?.start();
         _ = ctx.checkbox(app.checkbox_value, .{
-            .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onCheckbox } } } } },
+            .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onCheckbox }} } } },
         }, .{}, @src());
         _ = ctx.progress_bar(app.slider_value, .{}, .{}, @src());
         const slider = ctx.slider(app.slider_value, .{
-            .events = .{ .drag = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onSliderDrag } } } } },
+            .events = .{ .drag = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onSliderDrag }} } } },
         }, .{}, @src());
         // The drag hook fires once when a drag starts and ends (during the
         // post-draw processing pass, so `slider` is laid out and the handler can

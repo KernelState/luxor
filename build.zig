@@ -309,8 +309,8 @@ fn makeLuxorModule(
         m.addIncludePath(b.path("vendor/freetype2/"));
     }
     if (caps.images) {
-        m.addCSourceFile(.{ .file = b.path("vendor/luxor_c/image_shim.c"), .flags = &.{ "-std=c11" } });
-        m.addCSourceFile(.{ .file = b.path("vendor/luxor_c/svg_shim.c"), .flags = &.{ "-std=c11" } });
+        m.addCSourceFile(.{ .file = b.path("vendor/luxor_c/image_shim.c"), .flags = &.{"-std=c11"} });
+        m.addCSourceFile(.{ .file = b.path("vendor/luxor_c/svg_shim.c"), .flags = &.{"-std=c11"} });
         m.addIncludePath(b.path("vendor/luxor_c"));
         m.addIncludePath(b.path("vendor/nanosvg"));
         m.linkSystemLibrary("png", .{});
