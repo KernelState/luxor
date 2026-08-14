@@ -86,6 +86,14 @@ pub const Pos = struct {
     y: u32,
 };
 
+/// A signed point used for element-relative coordinates (the pointer offset from
+/// an element's top-left corner, or a drag's current pointer offset from where
+/// the drag started). May be negative when the pointer is left/above the origin.
+pub const Offset = struct {
+    x: i32,
+    y: i32,
+};
+
 pub const Area = struct {
     size: Rect,
     pos: Pos,
@@ -330,17 +338,23 @@ pub const Background = struct {
 /// `active` state reflects last frame while the hook callbacks fire (during the
 /// processing pass) and their effects appear next frame.
 ///
-/// Element-specific events carry the stable id of the element they targeted
-/// last frame (null = none); non-element-specific events carry their data only.
+/// Element-specific events live in per-interaction lists of stable element ids
+/// (`hovered`, `clicked`, `focused`, `dragged`), each carrying element-relative
+/// data; the `is*` methods interrogate them by id. Non-element-specific events
+/// carry their data only.
 pub const View = struct {
-    /// The element under the pointer when the last frame was processed.
-    hovered: ?u64 = null,
-    /// The element being pressed (a click in progress); cleared on release.
-    clicked: ?u64 = null,
-    /// The element that owns keyboard focus.
-    focused: ?u64 = null,
-    /// The element being dragged; cleared on release.
-    dragged: ?u64 = null,
+    /// The element under the pointer last frame, with the pointer offset from
+    /// the element's own top-left corner.
+    hovered: std.ArrayListUnmanaged(Entry.Id) = .empty,
+    /// Elements with a click in progress last frame (a press that hasn't
+    /// released into them), with the press pointer offset from the element.
+    clicked: std.ArrayListUnmanaged(Entry.Id) = .empty,
+    /// Elements that owned keyboard focus last frame, tagged by how it was
+    /// granted (keyboard vs mouse).
+    focused: std.ArrayListUnmanaged(Entry.Focus) = .empty,
+    /// Elements being dragged last frame, with the current pointer offset from
+    /// where the drag started.
+    dragged: std.ArrayListUnmanaged(Entry.Id) = .empty,
     /// Current pointer position in window coordinates.
     pointer: Pos = .{ .x = 0, .y = 0 },
     /// Whether the pointer is inside the window.
@@ -354,7 +368,86 @@ pub const View = struct {
     key_down: bool = false,
     /// Whether the window was asked to close.
     exit: bool = false,
+
+    /// True when `id` was under the pointer last frame; returns the pointer
+    /// offset from the element's top-left corner when it was.
+    pub fn isHovered(self: *const View, id: u64) ?Offset {
+        return lookup(self.hovered.items, id);
+    }
+
+    /// True when `id` had a click in progress last frame; returns the press
+    /// pointer offset from the element's top-left corner when it did.
+    pub fn isClicked(self: *const View, id: u64) ?Offset {
+        return lookup(self.clicked.items, id);
+    }
+
+    /// True when `id` owned keyboard focus last frame; returns how that focus
+    /// was granted (keyboard or mouse) when it did.
+    pub fn isFocused(self: *const View, id: u64) ?FocusSource {
+        const idx = indexOfId(Entry.Focus, self.focused.items, id) orelse return null;
+        return self.focused.items[idx].source;
+    }
+
+    /// True when `id` was being dragged last frame; returns the current pointer
+    /// offset from where the drag started when it was.
+    pub fn isDragged(self: *const View, id: u64) ?Offset {
+        const idx = indexOfId(Entry.Id, self.dragged.items, id) orelse return null;
+        return self.dragged.items[idx].local;
+    }
+
+    /// Clears every per-element interaction list, retaining capacity so the
+    /// next frame's processing pass can repopulate them without reallocating.
+    pub fn reset(self: *View) void {
+        self.hovered.clearRetainingCapacity();
+        self.clicked.clearRetainingCapacity();
+        self.focused.clearRetainingCapacity();
+        self.dragged.clearRetainingCapacity();
+    }
+
+    /// Releases the backing buffers of every per-element interaction list.
+    /// Called with the allocator they were allocated from.
+    pub fn deinit(self: *View, allocator: std.mem.Allocator) void {
+        self.hovered.deinit(allocator);
+        self.clicked.deinit(allocator);
+        self.focused.deinit(allocator);
+        self.dragged.deinit(allocator);
+    }
 };
+
+/// Shared shapes of the records the `View` lists hold. All are *unmanaged*
+/// (no allocator stored); the processing pass owns their lifetime.
+pub const Entry = struct {
+    /// An element id plus an element-relative pointer offset: the shape of
+    /// `hovered` and `clicked` entries.
+    pub const Id = struct {
+        id: u64,
+        local: Offset = .{ .x = 0, .y = 0 },
+    };
+
+    /// How an element came to own keyboard focus.
+    pub const Focus = struct {
+        id: u64,
+        source: FocusSource,
+    };
+};
+
+/// How an element came to own keyboard focus.
+pub const FocusSource = enum {
+    keyboard,
+    mouse,
+};
+
+/// Returns the `local` payload of the entry with id `id`, or null.
+fn lookup(entries: []const Entry.Id, id: u64) ?Offset {
+    const i = indexOfId(Entry.Id, entries, id) orelse return null;
+    return entries[i].local;
+}
+
+/// Returns the index of the entry with id `id`, or null.
+fn indexOfId(comptime T: type, entries: []const T, id: u64) ?usize {
+    for (entries, 0..) |e, i| if (e.id == id) return i;
+    return null;
+}
 
 pub fn Hook(comptime T: type) type {
     return struct {
@@ -370,10 +463,13 @@ pub fn Hook(comptime T: type) type {
             };
         };
 
-        /// Fires the handlers with `true`. Does not touch `active`: element
-        /// hooks get their render state from `fromId` at init time instead, so
-        /// the view's one-frame-lagged event state is what widgets draw.
+        /// Marks the hook active and fires the handlers with `true`. The
+        /// processing pass calls this when an event *enters* the element (a
+        /// hover enter, a press, a focus grant, a drag start), so the handlers
+        /// see the edge, not a per-frame repeat. `active` is the render state
+        /// widgets read during their build.
         pub fn activate(self: *Self, data: T) void {
+            self.active = true;
             if (self.handle) |h| {
                 switch (h) {
                     .fptrs => |ps| {
@@ -383,9 +479,10 @@ pub fn Hook(comptime T: type) type {
             }
         }
 
-        /// Fires the handlers with `false`. Does not touch `active` (see
-        /// `activate`).
+        /// Marks the hook inactive and fires the handlers with `false`. The
+        /// processing pass calls this when the event *leaves* the element.
         pub fn deactivate(self: *Self, data: T) void {
+            self.active = false;
             if (self.handle) |h| {
                 switch (h) {
                     .fptrs => |ps| {
@@ -395,13 +492,13 @@ pub fn Hook(comptime T: type) type {
             }
         }
 
-        /// Evaluates `active` from the view's per-frame event state: `active`
-        /// becomes true only when `id` is the element the view reports for this
-        /// event. Called by widgets when an element is initialized (after the
-        /// user's overrides), so the element renders last frame's interaction
-        /// state rather than a hook-local latch.
-        pub fn fromId(self: *Self, id: u64, hit: ?u64) void {
-            self.active = if (hit) |h| h == id else false;
+        /// Sets `active` without firing the handlers. Called by widgets when an
+        /// element is initialized (after the user's overrides): `active` is
+        /// re-derived every frame from the view's per-element lists (`is*`), so
+        /// the element renders last frame's interaction state while the hook
+        /// callbacks fired by the processing pass take effect next frame.
+        pub fn setActive(self: *Self, active: bool) void {
+            self.active = active;
         }
 
         /// Fires the handlers with the current `active` state, without changing
@@ -423,4 +520,100 @@ pub fn Hook(comptime T: type) type {
             } else false;
         }
     };
+}
+
+test "isHovered/isClicked return the element-relative offset" {
+    var view = View{};
+    defer view.deinit(std.testing.allocator);
+
+    try view.hovered.append(std.testing.allocator, .{ .id = 7, .local = .{ .x = 3, .y = 5 } });
+    try view.clicked.append(std.testing.allocator, .{ .id = 9, .local = .{ .x = -2, .y = 4 } });
+
+    const ho = view.isHovered(7).?;
+    try std.testing.expectEqual(@as(i32, 3), ho.x);
+    try std.testing.expectEqual(@as(i32, 5), ho.y);
+    const cl = view.isClicked(9).?;
+    try std.testing.expectEqual(@as(i32, -2), cl.x);
+    try std.testing.expectEqual(@as(i32, 4), cl.y);
+    try std.testing.expectEqual(@as(?Offset, null), view.isHovered(99));
+    try std.testing.expectEqual(@as(?Offset, null), view.isClicked(7));
+}
+
+test "isDragged returns the offset from the drag origin" {
+    var view = View{};
+    defer view.deinit(std.testing.allocator);
+
+    try view.dragged.append(std.testing.allocator, .{ .id = 12, .local = .{ .x = 8, .y = -6 } });
+    const off = view.isDragged(12).?;
+    try std.testing.expectEqual(@as(i32, 8), off.x);
+    try std.testing.expectEqual(@as(i32, -6), off.y);
+    try std.testing.expectEqual(@as(?Offset, null), view.isDragged(13));
+}
+
+test "isFocused returns the focus source and reset clears every list" {
+    var view = View{};
+    defer view.deinit(std.testing.allocator);
+
+    try view.hovered.append(std.testing.allocator, .{ .id = 1, .local = .{ .x = 0, .y = 0 } });
+    try view.focused.append(std.testing.allocator, .{ .id = 2, .source = .keyboard });
+    try view.dragged.append(std.testing.allocator, .{ .id = 3, .local = .{ .x = 0, .y = 0 } });
+
+    try std.testing.expectEqual(@as(?FocusSource, .keyboard), view.isFocused(2));
+    try std.testing.expectEqual(@as(?FocusSource, null), view.isFocused(9));
+
+    view.reset();
+    try std.testing.expectEqual(@as(?Offset, null), view.isHovered(1));
+    try std.testing.expectEqual(@as(?FocusSource, null), view.isFocused(2));
+    try std.testing.expectEqual(@as(?Offset, null), view.isDragged(3));
+}
+
+test "entry lookup keeps first matching id" {
+    var view = View{};
+    defer view.deinit(std.testing.allocator);
+
+    try view.clicked.append(std.testing.allocator, .{ .id = 4, .local = .{ .x = 1, .y = 1 } });
+    try view.clicked.append(std.testing.allocator, .{ .id = 4, .local = .{ .x = 9, .y = 9 } });
+    const off = view.isClicked(4).?;
+    try std.testing.expectEqual(@as(i32, 1), off.x);
+}
+
+test "hook activate/deactivate set active and fire handlers on the edge only" {
+    const HState = struct {
+        fired: [4]bool,
+        actives: [4]bool,
+        i: u8,
+    };
+    const fired: [4]bool = .{ false } ** 4;
+    const actives: [4]bool = .{ false } ** 4;
+    var state = HState{ .fired = fired, .actives = actives, .i = 0 };
+    const Ctx = struct {
+        fn f(data: *anyopaque, _: Offset, active: bool) void {
+            const st: *HState = @ptrCast(@alignCast(data));
+            st.fired[st.i] = true;
+            st.actives[st.i] = active;
+            st.i += 1;
+        }
+    };
+    var hook: Hook(Offset) = .{ .handle = .{ .fptrs = &.{.{ .data = &state, .func = &Ctx.f }} } };
+
+    hook.activate(.{ .x = 1, .y = 2 });
+    try std.testing.expect(hook.active);
+    try std.testing.expectEqual(@as(u8, 1), state.i);
+    try std.testing.expect(state.fired[0] and state.actives[0]);
+
+    hook.activate(.{ .x = 3, .y = 4 });
+    try std.testing.expect(hook.active);
+    try std.testing.expectEqual(@as(u8, 2), state.i);
+
+    hook.setActive(false);
+    try std.testing.expect(!hook.active);
+    try std.testing.expectEqual(@as(u8, 2), state.i);
+
+    hook.deactivate(.{ .x = 5, .y = 6 });
+    try std.testing.expect(!hook.active);
+    try std.testing.expectEqual(@as(u8, 3), state.i);
+    try std.testing.expect(state.fired[2] and !state.actives[2]);
+
+    hook.deactivate(.{ .x = 7, .y = 8 });
+    try std.testing.expectEqual(@as(u8, 4), state.i);
 }

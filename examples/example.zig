@@ -37,7 +37,7 @@ const AppState = struct {
     /// Completed clicks on the toolbar buttons (the hook fires true on press,
     /// false when the press is released inside the same button).
     click_count: u32 = 0,
-    /// Driven by the slider: while `ctx.events.dragged` names the slider, the
+    /// Driven by the slider: while the view reports this slider as dragged, the
     /// build phase maps `ctx.events.pointer` onto the track. The drag hook only
     /// fires once at press/release; it captures the slider's laid-out position.
     slider_value: f32 = 0.66,
@@ -53,23 +53,35 @@ const AppState = struct {
 fn onKey(data: *anyopaque, key: lu.Key, down: bool) void {
     const app: *AppState = @ptrCast(@alignCast(data));
     if (down and key == .escape) app.quit = true;
+    // F1 toggles the profiler's report output (measurement keeps running).
+    if (down and key == .f1)
+        if (app.win.ctx) |ctx| {
+            ctx.dbg.reporting = !ctx.dbg.reporting;
+            std.log.info("profiler reports {s}", .{if (ctx.dbg.reporting) "on" else "off"});
+        };
 }
 
-fn onClick(data: *anyopaque, _: void, pressed: bool) void {
+fn onClick(data: *anyopaque, _: lu.Offset, pressed: bool) void {
+    std.log.info("toolbar click", .{});
     const app: *AppState = @ptrCast(@alignCast(data));
     if (!pressed) app.click_count += 1;
 }
 
-fn onCheckbox(data: *anyopaque, _: void, pressed: bool) void {
+fn onClickBad(_: *anyopaque, _: lu.Offset, _: bool) void {
+    std.log.info("toolbar missed", .{});
+}
+
+fn onCheckbox(data: *anyopaque, _: lu.Offset, pressed: bool) void {
     const app: *AppState = @ptrCast(@alignCast(data));
     if (!pressed) app.checkbox_value = !app.checkbox_value;
 }
 
 /// Fires once when a drag starts (during the post-draw processing pass, so the
 /// slider element has been laid out) and once when it ends. Per-frame tracking
-/// happens in the build phase from `ctx.events.dragged` + `ctx.events.pointer`;
-/// this only remembers where the slider's track sits so that mapping works.
-fn onSliderDrag(data: *anyopaque, _: u32, _: bool) void {
+/// happens in the build phase from `ctx.events.isDragged(id)` +
+/// `ctx.events.pointer`; this only remembers where the slider's track sits so
+/// that mapping works.
+fn onSliderDrag(data: *anyopaque, _: lu.Offset, _: bool) void {
     const app: *AppState = @ptrCast(@alignCast(data));
     const el = app.slider_el orelse return;
     app.slider_pos = el.pos;
@@ -96,6 +108,9 @@ pub fn main() !void {
     // `applyFlags` only ever disables a cache (via env), so restore the defaults
     // explicitly or every cache silently stays off.
     ctx.flags = .{};
+    // Same for the profiler: zeroing wipes `active`/`reporting` to off, so
+    // restore the defaults before the explicit `ctx.dbg.enable(true)` below.
+    ctx.dbg = .{};
     ctx.initAlloc();
     ctx.freetype = try lu.Context.Freetype.init();
     ctx.leaf_layout = .{ .vtable = &lu.Layout.leaf, .parent = null };
@@ -152,7 +167,7 @@ pub fn main() !void {
     var app = AppState{ .win = &window };
     window.events.key = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onKey }} } };
 
-    ctx.dbg.enable(true);
+    ctx.dbg.enable(false);
     while (true) {
         ctx.dbg.begin(.frame);
         ctx.dbg.begin(.events);
@@ -171,7 +186,7 @@ pub fn main() !void {
             .background = lu.Background.solid(lu.Color{ .r = 0xDC, .g = 0xE4, .b = 0xF0, .a = 0xFF }),
             .layout = .{ .vtable = &lu.Layout.flex, .parent = null, .data = &root_cfg },
             .ctx = ctx,
-            .events = lu.Context.noEvents,
+            .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onClickBad }} } } },
         };
 
         // Start with the root as the current parent. Nested containers push the
@@ -209,7 +224,7 @@ pub fn main() !void {
             .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
             .layout = .{ .vtable = &lu.Layout.flex, .parent = &root.layout.?, .data = &toolbar_cfg },
             .ctx = ctx,
-            .events = lu.Context.noEvents,
+            .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onClickBad }} } } },
         };
         // Stretch the toolbar across the window width (main is fixed), wrap the
         // buttons, and let its height come from the wrapped content.
@@ -311,7 +326,7 @@ pub fn main() !void {
         // capture its position). While the view reports this slider as dragged,
         // re-map the pointer onto the track every frame right here in the build.
         app.slider_el = slider;
-        if (ctx.events.dragged != null and ctx.events.dragged.? == slider.id)
+        if (ctx.events.isDragged(slider.id) != null)
             sliderFromPointer(&app, slider);
         slider_row.layout.?.end();
 

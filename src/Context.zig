@@ -365,16 +365,17 @@ fn base(self: *Context, size: lu.Rect) lu.Element {
 }
 
 /// Evaluates an element's interaction hooks against the view's per-frame event
-/// state, setting each hook's `active` from the element it targeted last frame.
-/// Must run after the user's `Overrides` (which wire the handlers and may set
-/// `id_extra`) so `active` reflects the element exactly as built. Elements
-/// render last frame's state: a button pressed this frame lights up next frame,
-/// and the hook callbacks fired by the view's processing pass take effect then.
+/// state, deriving each hook's `active` from whether the view reports the
+/// element for that interaction last frame. Must run after the user's
+/// `Overrides` (which wire the handlers and may set `id_extra`) so `active`
+/// reflects the element exactly as built. Elements render last frame's state: a
+/// button pressed this frame lights up next frame, and the hook callbacks fired
+/// by the view's processing pass take effect then.
 fn evalEvents(self: *Context, e: *lu.Element) void {
-    e.events.hover.fromId(e.id, self.events.hovered);
-    e.events.click.fromId(e.id, self.events.clicked);
-    e.events.focus.fromId(e.id, self.events.focused);
-    e.events.drag.fromId(e.id, self.events.dragged);
+    e.events.hover.setActive(self.events.isHovered(e.id) != null);
+    e.events.click.setActive(self.events.isClicked(e.id) != null);
+    e.events.focus.setActive(self.events.isFocused(e.id) != null);
+    e.events.drag.setActive(self.events.isDragged(e.id) != null);
 }
 
 /// Requests `e`'s size and position from the current parent layout (set with a

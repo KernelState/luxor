@@ -33,12 +33,16 @@ focusable: bool = true,
 const Element = @This();
 
 pub const Events = struct {
-    hover: lu.Hook(void) = .{},
-    click: lu.Hook(void) = .{},
-    drag: lu.Hook(u32) = .{},
+    /// Fires on enter/leave with the pointer offset from the element's origin.
+    hover: lu.Hook(lu.Offset) = .{},
+    /// Fires on press/release with the press pointer offset from the origin.
+    click: lu.Hook(lu.Offset) = .{},
+    /// Fires on drag start/end with the pointer offset from the drag origin.
+    drag: lu.Hook(lu.Offset) = .{},
     render: lu.Hook(void) = .{},
     modify: lu.Hook(void) = .{},
-    focus: lu.Hook(void) = .{},
+    /// Fires on focus grant/revoke with how focus was granted.
+    focus: lu.Hook(lu.FocusSource) = .{},
     key: lu.Hook(void) = .{},
 };
 
@@ -58,7 +62,7 @@ pub const Overrides = struct {
     id_extra: ?u64 = null,
     /// Event hooks to attach to the element. Applied like the other overrides,
     /// so the widget evaluates them against the view's per-frame event state
-    /// (`fromId`) *after* this, and the element renders last frame's state.
+    /// *after* this, and the element renders last frame's state.
     events: ?Events = null,
 };
 

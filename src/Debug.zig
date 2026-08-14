@@ -166,6 +166,14 @@ pub const DebugInfo = struct {
     /// turning it off mid-run just stops the measurement.
     active: bool = true,
 
+    /// Runtime on/off for the *printed reports* (the periodic report, live
+    /// spike reviews, and the plugin report blocks), independent of `active`:
+    /// measurement keeps running while this is off, so stats still accumulate
+    /// and flipping it back on resumes printing (with the cadence re-anchored
+    /// on the next frame). Setters keep wrapped values as-is, so `main` can do
+    /// `ctx.dbg.reporting = stay`.
+    reporting: bool = true,
+
     // --- custom trace (its own subsystem, hashmap-shaped) ---
     custom: [MaxCustom]CustomAcc = [_]CustomAcc{.{}} ** MaxCustom,
     custom_count: usize = 0,
@@ -361,12 +369,15 @@ pub const DebugInfo = struct {
     /// Prints the periodic report once `report_interval_ns` of real time has
     /// elapsed since the last one, so output arrives on a seconds cadence
     /// (2s) no matter how fast or slowly frames are coming. The report covers
-    /// exactly the frames captured since the previous report.
+    /// exactly the frames captured since the previous report. Silenced while
+    /// `reporting` is off, but the cadence clock still advances so toggling it
+    /// back on starts a fresh interval instead of dumping immediately.
     fn _maybePeriodic(self: *DebugInfo) void {
         if (comptime !enabled) return;
         const current = now();
         if (current - self.last_report_ns >= report_interval_ns) {
             self.last_report_ns = current;
+            if (!self.reporting) return;
             const captured = self.report_frames;
             self.report_frames = 0;
             self.print(captured);
@@ -376,8 +387,12 @@ pub const DebugInfo = struct {
     /// Prints a full live review when a frame departs from the window's running
     /// average: a one-line header (with the elapsed runtime and whether it is a
     /// 10% low), then the same per-section block the periodic report shows, so
-    /// you can skim which phase is dragging the frame down.
+    /// you can skim which phase is dragging the frame down. Silenced entirely
+    /// while `reporting` is off (no detection cost either, since it only ever
+    /// prints).
     fn _detectSpike(self: *DebugInfo, total_ns: u64) void {
+        if (comptime !enabled) return;
+        if (!self.reporting) return;
         const n = self.scount;
         var buf: [HistoryWindow]u64 = undefined;
         self.windowSortedCopy(&buf, n);
@@ -493,6 +508,7 @@ pub const DebugInfo = struct {
     pub fn print(self: *const DebugInfo, captured: usize) void {
         if (comptime !enabled) return;
         if (!self.active) return;
+        if (!self.reporting) return;
         // The ring only holds `HistoryWindow`, so n is that at most.
         const n = @min(captured, HistoryWindow);
         if (n == 0) {
@@ -804,4 +820,39 @@ test "plugin hooks fire on frame end and report" {
     try std.testing.expect(state.frames == 4);
     info.print(4);
     try std.testing.expect(state.reports == 1);
+}
+
+test "reporting off silences reports but keeps measuring" {
+    const State = struct {
+        frames: u32 = 0,
+        reports: u32 = 0,
+
+        fn onF(data: *anyopaque, _: *DebugInfo) void {
+            const s: *@This() = @ptrCast(@alignCast(data));
+            s.frames += 1;
+        }
+        fn onR(data: *anyopaque, _: *DebugInfo) void {
+            const s: *@This() = @ptrCast(@alignCast(data));
+            s.reports += 1;
+        }
+    };
+    var state = State{};
+    var info = DebugInfo.init();
+    info.nplugins = 0; // drop the built-in example plugin so counts are ours
+    _ = info.plug(&.{ .name = "test", .onFrame = &State.onF, .onReport = &State.onR }, &state);
+
+    info.reporting = false;
+    for (0..4) |_| {
+        info.begin(.frame);
+        info.end(.frame);
+    }
+    try std.testing.expect(state.frames == 4, "measurement still runs while reporting is off");
+    info.print(4);
+    try std.testing.expect(state.reports == 0, "report silenced while reporting is off");
+    try std.testing.expect(info.report_frames == 4, "captured frames are not dropped while silenced");
+
+    info.reporting = true;
+    info.print(4);
+    try std.testing.expect(state.reports == 1, "report prints again once re-enabled");
+    try std.testing.expect(info.count[@intFromEnum(Section.frame)] == 4);
 }

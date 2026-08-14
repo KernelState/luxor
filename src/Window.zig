@@ -61,8 +61,9 @@ resized: ?lu.Rect = null,
 /// The key of the last `KEY_DOWN`/`KEY_UP` edge, reset each frame.
 key: ?lu.Key = null,
 key_down: bool = false,
-/// Button passed to drag hooks while a drag is in progress.
-drag_button: u32 = 0,
+/// Where the pointer was when the current drag started, in window coordinates.
+/// The view reports a dragged element's offset from this origin each frame.
+drag_origin: lu.Pos = .{ .x = 0, .y = 0 },
 /// Edge flags accumulated by `update` and consumed by the processing pass at
 /// the end of `render`, so per-frame rebuilds don't drop a press/release that
 /// arrived between frames.
@@ -579,10 +580,17 @@ pub fn update(self: *Window) void {
 fn process(self: *Window, root: *lu.Element) void {
     const ctx = self.ctx orelse return;
     const root_area = lu.Area{ .pos = root.pos, .size = root.size };
-    const hit = if (self.pointer_inside)
-        self.hitTest(root, root_area, null, self.pointer)
+
+    // Every element between the root and the deepest hit under the pointer,
+    // root first. A click lands on the whole chain, so a nested element and
+    // every ancestor that contains the cursor all see the press.
+    const buf = self.scratchAlloc(*lu.Element, lu.PoolN) catch return;
+    const chain_len = if (self.pointer_inside)
+        self.hitChain(root, root_area, null, self.pointer, buf)
     else
-        null;
+        0;
+    const chain = buf[0..chain_len];
+    const hit = if (chain.len != 0) chain[chain.len - 1] else null;
 
     // Non-element-specific state mirrors the raw input from `update`.
     ctx.events.pointer = self.pointer;
@@ -593,92 +601,142 @@ fn process(self: *Window, root: *lu.Element) void {
     ctx.events.key_down = self.key_down;
     ctx.events.exit = self.quit;
 
-    // Hover: fire enter/leave against the previous frame's hovered element, and
-    // record this frame's hovered element in the view.
-    const hit_id = if (hit) |h| h.id else 0;
-    const prev_hovered = ctx.events.hovered orelse 0;
-    ctx.events.hovered = if (hit) |h| h.id else null;
-    if (hit_id != prev_hovered) {
-        if (prev_hovered != 0)
-            if (self.findElement(root, prev_hovered)) |old| old.events.hover.deactivate({});
-        if (hit) |h| h.events.hover.activate({});
+    // Hover: diff *this frame's hit chain* against the previous frame's hovered
+    // list, firing enter/leave onto the hooks, then republish the view list.
+    // The previous entries are snapshotted first: clearing the list below
+    // memsets its backing buffer (Zig 0.16 `clearRetainingCapacity`), which
+    // would poison a slice aliasing it.
+    const prev_n = ctx.events.hovered.items.len;
+    const prev_hovered: []lu.Entry.Id = self.scratchAlloc(lu.Entry.Id, prev_n) catch &.{};
+    @memcpy(prev_hovered, ctx.events.hovered.items);
+    for (prev_hovered) |old| {
+        if (containsIdChain(chain, old.id)) continue;
+        if (self.findElement(root, old.id)) |e| e.events.hover.deactivate(old.local);
+    }
+    ctx.events.hovered.clearRetainingCapacity();
+    for (chain) |e| {
+        const local = offsetFrom(self.pointer, e.pos);
+        const is_prev = containsId(prev_hovered, e.id);
+        if (!is_prev) e.events.hover.activate(local);
+        ctx.events.hovered.append(ctx.arena, .{ .id = e.id, .local = local }) catch {};
     }
 
     if (self.left_pressed) {
         self.left_pressed = false;
         if (hit) |h| {
-            // A press starts a click; when the element also has a drag hook the
-            // press becomes the drag's start instead (the click hook still
-            // fires, but the release below never completes it).
-            ctx.events.clicked = h.id;
-            h.events.click.activate({});
-            if (h.events.drag.isEnabled()) {
-                ctx.events.dragged = h.id;
-                self.drag_button = @intFromEnum(lu.MouseButton.left);
-                // One call when the drag starts; the app reads `ctx.events`
-                // (dragged + pointer) during its build to follow the mouse.
-                h.events.drag.activate(self.drag_button);
-                self.focus(root, h);
-            } else {
-                self.focus(root, h);
+            // Every element in the chain knows it was pressed, from the root
+            // down to the deepest hit.
+            ctx.events.clicked.clearRetainingCapacity();
+            for (chain) |e| {
+                const local = offsetFrom(self.pointer, e.pos);
+                ctx.events.clicked.append(ctx.arena, .{ .id = e.id, .local = local }) catch {};
+                e.events.click.activate(local);
             }
+            // Any chain element with a drag hook takes over the drag. One drag
+            // origin serves the whole chain (each drag hook reports its own
+            // offset from the common start, and `dragged` tracks each id).
+            ctx.events.dragged.clearRetainingCapacity();
+            for (chain) |e| {
+                if (e.events.drag.isEnabled()) {
+                    if (ctx.events.dragged.items.len == 0) self.drag_origin = self.pointer;
+                    ctx.events.dragged.append(ctx.arena, .{ .id = e.id, .local = .{ .x = 0, .y = 0 } }) catch {};
+                    // One call when the drag starts; the app reads `ctx.events`
+                    // (dragged + pointer) during its build to follow the mouse.
+                    e.events.drag.activate(.{ .x = 0, .y = 0 });
+                }
+            }
+            // Focus follows the deepest hit only.
+            self.focus(root, h, .mouse);
         } else {
-            ctx.events.clicked = null;
+            ctx.events.clicked.clearRetainingCapacity();
+            ctx.events.dragged.clearRetainingCapacity();
             // Pressing empty space drops keyboard focus.
-            if (ctx.events.focused) |pid|
-                if (self.findElement(root, pid)) |old| old.events.focus.deactivate({});
-            ctx.events.focused = null;
+            const prev_focus = ctx.events.focused.items;
+            for (prev_focus) |old|
+                if (self.findElement(root, old.id)) |e| e.events.focus.deactivate(old.source);
+            ctx.events.focused.clearRetainingCapacity();
         }
     }
 
     if (self.left_released) {
         self.left_released = false;
-        if (ctx.events.dragged) |did| {
-            if (self.findElement(root, did)) |d|
-                d.events.drag.deactivate(self.drag_button);
-            ctx.events.dragged = null;
-        } else if (ctx.events.clicked) |cid| {
+        if (ctx.events.dragged.items.len != 0) {
+            const drag_n = ctx.events.dragged.items.len;
+            const drags: []lu.Entry.Id = self.scratchAlloc(lu.Entry.Id, drag_n) catch &.{};
+            @memcpy(drags, ctx.events.dragged.items);
+            ctx.events.dragged.clearRetainingCapacity();
+            const end = offsetFrom(self.pointer, self.drag_origin);
+            for (drags) |d|
+                if (self.findElement(root, d.id)) |el| el.events.drag.deactivate(end);
+        } else if (ctx.events.clicked.items.len != 0) {
             // Only a release inside the element that took the press completes
             // the click (the hook fires `false`); elsewhere the press is left
-            // discrete because the element is rebuilt next frame anyway.
-            if (hit) |h| if (h.id == cid) h.events.click.deactivate({});
-            ctx.events.clicked = null;
+            // discrete because the element is rebuilt next frame anyway. Since
+            // the whole chain took the press, every chain element still under
+            // the pointer completes it.
+            const click_n = ctx.events.clicked.items.len;
+            const clicks: []lu.Entry.Id = self.scratchAlloc(lu.Entry.Id, click_n) catch &.{};
+            @memcpy(clicks, ctx.events.clicked.items);
+            ctx.events.clicked.clearRetainingCapacity();
+            for (clicks) |c|
+                if (containsIdChain(chain, c.id))
+                    if (self.findElement(root, c.id)) |el| el.events.click.deactivate(c.local);
+        }
+    }
+
+    // While a drag is in progress the reported offset tracks the pointer.
+    if (ctx.events.dragged.items.len != 0) {
+        const drag_origin = self.drag_origin;
+        for (ctx.events.dragged.items) |*d| {
+            d.local = offsetFrom(self.pointer, drag_origin);
         }
     }
 }
 
 /// Moves keyboard focus to `hit` if it is focusable and differs from the
-/// current focus, debouncing the old element's `focus` hook.
-fn focus(self: *Window, root: *lu.Element, hit: *lu.Element) void {
+/// current focus, debouncing the old element's `focus` hook. `source` records
+/// how the focus was granted (a click grants mouse focus; a key edge would
+/// grant keyboard focus), reported via `View.isFocused`.
+fn focus(self: *Window, root: *lu.Element, hit: *lu.Element, source: lu.FocusSource) void {
     const ctx = self.ctx orelse return;
     if (!hit.focusable) return;
-    const prev = ctx.events.focused;
-    if (prev) |pid| if (pid == hit.id) return;
-    if (prev) |pid|
-        if (self.findElement(root, pid)) |old| old.events.focus.deactivate({});
-    ctx.events.focused = hit.id;
-    hit.events.focus.activate({});
+    const prev = ctx.events.focused.items;
+    if (prev.len != 0 and prev[0].id == hit.id) return;
+    for (prev) |old|
+        if (self.findElement(root, old.id)) |e| e.events.focus.deactivate(old.source);
+    ctx.events.focused.clearRetainingCapacity();
+    ctx.events.focused.append(ctx.arena, .{ .id = hit.id, .source = source }) catch {};
+    hit.events.focus.activate(source);
 }
 
-/// Recursively finds the topmost element under `pos`. Mirror of the draw walk:
-/// children draw over their parent, so the deepest hit wins, and the effective
-/// clip of every ancestor (`clip` plus the element's own box and content box)
-/// gates the search so nothing invisible is returned.
-fn hitTest(self: *Window, e: *lu.Element, area: lu.Area, clip: ?lu.Area, pos: lu.Pos) ?*lu.Element {
-    if (!posInArea(pos, area)) return null;
-    if (clip) |c| if (!posInArea(pos, c)) return null;
+/// Recursively collects every element under `pos`, from `e` down to the
+/// deepest hit, into `out` (which must be at least `lu.PoolN` long). Returns
+/// the number of elements collected, all of which contain `pos`. `out[0]` is
+/// `e` itself (when it contains `pos`); deeper ancestors come after. Mirror of
+/// the draw walk: children draw over their parent, so the deepest hit wins, and
+/// the effective clip of every ancestor (`clip` plus the element's own box and
+/// content box) gates the search so nothing invisible is returned.
+fn hitChain(self: *Window, e: *lu.Element, area: lu.Area, clip: ?lu.Area, pos: lu.Pos, out: []*lu.Element) usize {
+    if (out.len == 0) return 0;
+    if (!posInArea(pos, area)) return 0;
+    if (clip) |c| if (!posInArea(pos, c)) return 0;
+    out[0] = e;
+    var n: usize = 1;
     if (e.layout) |*lay| {
         if (lay.cindex > 0) {
             const child_clip = intersectClip(clip, contentArea(e, area));
-            var top: ?*lu.Element = null;
+            var top_n: usize = 0;
             for (0..lay.cindex) |i| {
                 const child = lay.children.items[i];
-                if (self.hitTest(child, .{ .pos = child.pos, .size = child.size }, child_clip, pos)) |h| top = h;
+                // Each child (re)writes into `out[1..]`; the last child that
+                // contains `pos` is the topmost (drawn last), so it wins.
+                const k = self.hitChain(child, .{ .pos = child.pos, .size = child.size }, child_clip, pos, out[1..]);
+                if (k != 0) top_n = k;
             }
-            if (top) |t| return t;
+            if (top_n != 0) n += top_n;
         }
     }
-    return e;
+    return n;
 }
 
 /// Depth-first search for the element with stable id `id` in the laid-out tree.
@@ -697,6 +755,26 @@ fn findElement(self: *Window, e: *lu.Element, id: u64) ?*lu.Element {
 fn posInArea(pos: lu.Pos, area: lu.Area) bool {
     return pos.x >= area.pos.x and pos.y >= area.pos.y and
         pos.x < area.pos.x + area.size.w and pos.y < area.pos.y + area.size.h;
+}
+
+/// The pointer offset from an origin, as a signed value.
+fn offsetFrom(pointer: lu.Pos, origin: lu.Pos) lu.Offset {
+    return .{
+        .x = @as(i32, @intCast(pointer.x)) - @as(i32, @intCast(origin.x)),
+        .y = @as(i32, @intCast(pointer.y)) - @as(i32, @intCast(origin.y)),
+    };
+}
+
+/// Whether an entry list contains an element with id `id`.
+fn containsId(entries: []const lu.Entry.Id, id: u64) bool {
+    for (entries) |e| if (e.id == id) return true;
+    return false;
+}
+
+/// Whether a hit chain contains an element with id `id`.
+fn containsIdChain(chain: []const *lu.Element, id: u64) bool {
+    for (chain) |e| if (e.id == id) return true;
+    return false;
 }
 
 /// Intersects an optional clip rect with `area`, or returns `area` when no clip

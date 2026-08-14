@@ -93,15 +93,16 @@ pub fn build(b: *std.Build) void {
     // same backing memory. The persistence split exists because the frame side
     // must be reclaimable every frame while cached rasters outlive it, and
     // FixedBufferAllocator's LIFO-only free forbids interleaving them on one
-    // bump. 8MB gives ~5MB to the persistent side and ~3MB to the per-frame
-    // side; the stress example's 1500 children fit comfortably, and apps with
-    // heavier image caches or batch caps can raise this. 0 disables the
-    // embedded buffer.
+    // bump. 12MB gives ~7.5MB to the persistent side (batch buffers, the
+    // scratch pool, the view's per-element event lists, and cache rasters) and
+    // ~4.5MB to the per-frame side; the stress example's 1500 children fit
+    // comfortably, and apps with heavier image caches or batch caps can raise
+    // this. 0 disables the embedded buffer.
     const fba_bytes = b.option(
         usize,
         "fba-bytes",
-        "Context fixed-buffer allocator size in bytes (default 8MB)",
-    ) orelse 8 << 20;
+        "Context fixed-buffer allocator size in bytes (default 12MB)",
+    ) orelse 12 << 20;
 
     const sdl = b.dependency("zsdl3", .{
         .sdl_image = false,
@@ -221,6 +222,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_tests = b.addTest(.{
         .root_module = lib.root_module,
+        .use_llvm = true,
     });
 
     const run_lib_tests = b.addRunArtifact(lib_tests);
@@ -242,6 +244,7 @@ pub fn build(b: *std.Build) void {
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .use_llvm = true,
     });
 
     const run_exe_tests = b.addRunArtifact(exe_tests);
