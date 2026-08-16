@@ -1280,9 +1280,9 @@ fn drawElement(self: *Window, e: *lu.Element, area: lu.Area) void {
     }
 }
 
-/// Draws every `shadow` effect in `e.effects` whose mask matches `mask`.
+/// Draws every `shadow` effect in `e.style.effects` whose mask matches `mask`.
 fn drawShadows(self: *Window, e: *lu.Element, area: lu.Area, mask: lu.Effect.Shadow.ShadowMask) void {
-    const effects = e.effects orelse return;
+    const effects = e.style.effects;
     for (effects) |effect| {
         switch (effect) {
             .shadow => |sh| if (sh.mask == mask) self.drawShadow(e, area, sh),
@@ -1333,7 +1333,7 @@ fn drawShadow(self: *Window, e: *lu.Element, area: lu.Area, sh: lu.Effect.Shadow
     const oy: i32 = @intFromFloat(@round(sh.y_offset));
     const spr: i32 = @intFromFloat(@round(sh.spread));
     const blur: i32 = @intFromFloat(@round(@max(0.0, sh.blur)));
-    const color = tint(sh.color, e.effects);
+    const color = tint(sh.color, e.style.effects);
 
     const iw: i32 = @as(i32, @intCast(area.size.w)) + 2 * spr;
     const ih: i32 = @as(i32, @intCast(area.size.h)) + 2 * spr;
@@ -1346,7 +1346,7 @@ fn drawShadow(self: *Window, e: *lu.Element, area: lu.Area, sh: lu.Effect.Shadow
     const n: usize = @as(usize, @intCast(rw)) * @as(usize, @intCast(rh));
     if (n > max_shadow_pixels) return;
 
-    const rr = clampRadius(e.border_radius, iw, ih);
+    const rr = clampRadius(e.style.border_radius, iw, ih);
     const key = shadowKey(e, iw, ih, ox, oy, spr, blur, rr, color, sh.mask);
     self.cacheBegin();
     const shadow_entry = self.shadow_cache.getMutable(key);
@@ -1567,8 +1567,8 @@ fn boxBlur(alloc: std.mem.Allocator, src: []const f32, dst: []f32, w: usize, h: 
 
 /// The usable box of an element after removing its border and padding.
 fn contentArea(e: *const lu.Element, area: lu.Area) lu.Area {
-    const b = e.border;
-    const p = e.padding;
+    const b = e.style.border;
+    const p = e.style.padding;
     return .{
         .pos = .{
             .x = area.pos.x + b.left + p.left,
@@ -1582,18 +1582,18 @@ fn contentArea(e: *const lu.Element, area: lu.Area) lu.Area {
 }
 
 fn drawBackground(self: *Window, e: *lu.Element, area: lu.Area) void {
-    const alpha = totalOpacity(e.effects) * totalOpacity(e.background.effects);
-    if (hasBlur(e.background.effects))
-        self.drawBlurBackdrop(area, e.border_radius, alpha, e.background.effects);
-    switch (e.background.base) {
+    const alpha = totalOpacity(e.style.effects) * totalOpacity(e.style.background.effects);
+    if (hasBlur(e.style.background.effects))
+        self.drawBlurBackdrop(area, e.style.border_radius, alpha, e.style.background.effects);
+    switch (e.style.background.base) {
         .solid => |c| {
-            self.fillRoundedRect(area, e.border_radius, tint(tint(c, e.effects), e.background.effects));
+            self.fillRoundedRect(area, e.style.border_radius, tint(tint(c, e.style.effects), e.style.background.effects));
         },
-        .image => |img| self.drawImageBackground(img, area, e.border_radius, alpha),
-        .gradient => |g| self.drawGradientBackground(e, g, area, e.border_radius, alpha),
-        .buffer => |pb| self.drawBufferBackground(e, pb, area, e.border_radius, alpha),
-        .image_buffer => |b| self.drawBufferFitBackground(e, b, area, e.border_radius, alpha),
-        .cached => |c| self.drawCachedBackground(c.key, area, e.border_radius, alpha),
+        .image => |img| self.drawImageBackground(img, area, e.style.border_radius, alpha),
+        .gradient => |g| self.drawGradientBackground(e, g, area, e.style.border_radius, alpha),
+        .buffer => |pb| self.drawBufferBackground(e, pb, area, e.style.border_radius, alpha),
+        .image_buffer => |b| self.drawBufferFitBackground(e, b, area, e.style.border_radius, alpha),
+        .cached => |c| self.drawCachedBackground(c.key, area, e.style.border_radius, alpha),
     }
 }
 
@@ -1616,7 +1616,7 @@ fn drawCachedBackground(self: *Window, key: u64, area: lu.Area, radius: lu.Corne
 }
 
 fn drawBorder(self: *Window, e: *lu.Element, area: lu.Area) void {
-    const b = e.border;
+    const b = e.style.border;
     if (b.top == 0 and b.bottom == 0 and b.left == 0 and b.right == 0)
         return;
 
@@ -1639,18 +1639,18 @@ fn drawBorder(self: *Window, e: *lu.Element, area: lu.Area) void {
         },
     };
 
-    switch (e.border_color) {
+    switch (e.style.border_color) {
         .gradient => |g| self.drawGradientBorder(e, g, area, &bars),
         .color => |c| {
-            const color = tint(tint(c, e.effects), e.background.effects);
-            switch (e.background.base) {
+            const color = tint(tint(c, e.style.effects), e.style.background.effects);
+            switch (e.style.background.base) {
                 .solid => |bg| {
                     const inner: lu.Area = .{
                         .pos = .{ .x = area.pos.x + b.left, .y = area.pos.y + b.top },
                         .size = .{ .w = area.size.w -| (b.left + b.right), .h = area.size.h -| (b.top + b.bottom) },
                     };
-                    self.fillRoundedRect(area, e.border_radius, color);
-                    self.fillRoundedRect(inner, e.border_radius, tint(tint(bg, e.effects), e.background.effects));
+                    self.fillRoundedRect(area, e.style.border_radius, color);
+                    self.fillRoundedRect(inner, e.style.border_radius, tint(tint(bg, e.style.effects), e.style.background.effects));
                 },
                 .image, .gradient, .buffer, .image_buffer, .cached => {
                     for (bars) |bar| self.fillRect(bar, color);

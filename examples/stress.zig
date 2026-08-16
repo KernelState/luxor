@@ -117,7 +117,7 @@ pub fn main() !void {
         var root = lu.Element{
             .size = .{ .w = 1400, .h = 900 },
             .pos = .{ .x = 0, .y = 0 },
-            .background = lu.Background.solid(lu.Color{ .r = 0xDC, .g = 0xE4, .b = 0xF0, .a = 0xFF }),
+            .style = .{ .background = lu.Background.solid(lu.Color{ .r = 0xDC, .g = 0xE4, .b = 0xF0, .a = 0xFF }) },
             .layout = .{ .vtable = &lu.Layout.flex, .parent = null, .data = &root_cfg },
             .ctx = ctx,
             .events = lu.Context.noEvents,
@@ -133,7 +133,7 @@ pub fn main() !void {
         var field = lu.Element{
             .size = .{ .w = 0, .h = 0 },
             .pos = .{ .x = 0, .y = 0 },
-            .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
+            .style = .{ .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }) },
             .layout = .{ .vtable = &lu.Layout.flex, .parent = &root.layout.?, .data = &field_cfg },
             .ctx = ctx,
             .events = lu.Context.noEvents,
@@ -165,8 +165,10 @@ pub fn main() !void {
                 const tw: u32 = 24 + @as(u32, @intCast(i % 3)) * 6;
                 _ = ctx.box(.{ .w = tw, .h = tw }, .{
                     .id_extra = i,
-                    .background = .{ .base = .{ .solid = lu.Color.fromU32(tile_colors[i % tile_colors.len]) }, .effects = &.{} },
-                    .border_radius = .all(4),
+                    .style = .{
+                        .background = .{ .base = .{ .solid = lu.Color.fromU32(tile_colors[i % tile_colors.len]) }, .effects = &.{} },
+                        .border_radius = .all(4),
+                    },
                 }, @src());
             }
         }

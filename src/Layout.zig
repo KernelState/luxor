@@ -1036,7 +1036,7 @@ fn mkElement(w: u32, h: u32) *lu.Element {
     e.* = .{
         .size = .{ .w = w, .h = h },
         .pos = .{ .x = 0, .y = 0 },
-        .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 255 }),
+        .style = .{ .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 255 }) },
         .layout = leaf_layout,
         .events = .{
             .hover = .{ .handle = null },

@@ -140,7 +140,7 @@ pub fn main() !void {
     var root = lu.Element{
         .size = .{ .w = 800, .h = 600 },
         .pos = .{ .x = 0, .y = 0 },
-        .background = lu.Background.solid(.{ .r = 0xDC, .g = 0xE4, .b = 0xF0, .a = 0xFF }),
+        .style = .{ .background = lu.Background.solid(.{ .r = 0xDC, .g = 0xE4, .b = 0xF0, .a = 0xFF }) },
         .layout = .{ .vtable = &lu.Layout.flex, .parent = null, .data = &root_cfg },
         .ctx = ctx,
         .events = lu.Context.noEvents,

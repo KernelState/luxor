@@ -108,6 +108,17 @@ dbg: lu.Debug.DebugInfo = .{},
 /// (fired by that same pass) have effects visible next frame. Survives
 /// `clear()`.
 events: lu.View = .{},
+/// The app's theme: a palette of named colors, read through `getColor`
+/// (`ctx.getColor(.primary)`). Themes assign a new `ColorTheme` value here.
+theme: lu.ColorTheme = .{},
+/// Per-kind default styles, keyed by a comptime hash of the kind's enum-literal
+/// identity (type name + tag), so any enum works: the built-in `lu.Kind` tags
+/// and a third-party widget's own enum alike. `setStyle` writes here; `base`
+/// applies the built-in defaults and then these on top, so restyling a kind
+/// merges onto its built-in look instead of replacing it.
+/// The stored values use the `Style.Overrides` format (not
+/// `Element.Overrides`), so the same struct describes a default and an override.
+default_styles: std.AutoHashMapUnmanaged(u64, lu.Style.Overrides) = .{},
 
 /// Static pool of `Element`s the builds allocate from. Layouts reference their
 /// children by pointer into this pool (never by value), so `Element` can embed
@@ -348,20 +359,128 @@ pub const noEvents = lu.Element.Events{
     .key = .{ .handle = null },
 };
 
-/// The bare element every widget starts from: transparent background, leaf
-/// layout, no events, not focusable. Widgets build on top of this, set their
-/// contents, then apply the user's `Overrides` last.
-fn base(self: *Context, size: lu.Rect) lu.Element {
+/// The bare element every widget starts from: the default style for `kind`,
+/// identified by an enum literal. Built-in widgets pass a `lu.Kind` literal
+/// (`.label`, `.button`, ...); a third-party widget passes a literal from its
+/// own enum. `base` starts from the built-in defaults for that literal and
+/// layers any `setStyle` overrides on top (transparent background, leaf layout,
+/// no events, not focusable otherwise).
+fn base(self: *Context, size: lu.Rect, comptime kind: anytype) lu.Element {
+    var style = builtinDefaults(kind).onto(lu.Style{});
+    if (self.default_styles.get(kindKey(kind))) |o| style = o.onto(style);
     return .{
         .size = size,
         .pos = .{ .x = 0, .y = 0 },
-        .border_radius = .all(0),
-        .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
+        .style = style,
         .layout = self.leaf_layout,
         .events = noEvents,
         .ctx = self,
         .focusable = false,
     };
+}
+
+/// The built-in per-widget defaults, keyed by the kind's enum literal: whatever
+/// enum a literal belongs to, its *tag* picks the built-in look (`.button` from
+/// `lu.Kind` or from a third-party enum both get the button defaults). A literal
+/// with no matching tag falls through to transparent/no default — its own
+/// widget code brings that widget's look.
+fn builtinDefaults(comptime kind: anytype) lu.Style.Overrides {
+    const k = std.meta.stringToEnum(lu.Kind, @tagName(kind)) orelse return .{};
+    return switch (k) {
+        .base, .box, .label, .image => .{},
+        .button => .{
+            .background = lu.Background.solid(.gray),
+            .border_radius = .all(4),
+            .padding = .all(8),
+        },
+        .checkbox => .{
+            .border = .all(2),
+            .border_color = .{ .color = .gray },
+            .border_radius = .all(4),
+        },
+        .progress_bar, .slider => .{
+            .background = lu.Background.solid(.dark_gray),
+            .border_radius = .all(6),
+        },
+    };
+}
+
+/// A stable full-key for an enum literal: its type name + tag name hashed at
+/// comptime. Two literals collide only if the same enum type carries the same
+/// tag, so built-in `lu.Kind` keys and any third-party widget's enum keys
+/// coexist without stepping on each other.
+fn kindKey(comptime kind: anytype) u64 {
+    return comptime blk: {
+        const bytes = @typeName(@TypeOf(kind)) ++ @tagName(kind);
+        var h: u64 = 14695981039346656037;
+        for (bytes) |ch| h = (h ^ ch) *% 1099511628211;
+        break :blk h;
+    };
+}
+
+/// Returns one of the `theme` palette colors by its `ThemeColor` tag
+/// (`ctx.getColor(.primary)`). The tag names mirror the `ColorTheme` fields.
+pub fn getColor(self: *const Context, comptime name: lu.ThemeColor) lu.Color {
+    return switch (name) {
+        .background => self.theme.background,
+        .surface => self.theme.surface,
+        .surface_raised => self.theme.surface_raised,
+        .surface_sunken => self.theme.surface_sunken,
+        .foreground => self.theme.foreground,
+        .text => self.theme.text,
+        .text_secondary => self.theme.text_secondary,
+        .text_disabled => self.theme.text_disabled,
+        .text_inverse => self.theme.text_inverse,
+        .text_link => self.theme.text_link,
+        .primary => self.theme.primary,
+        .on_primary => self.theme.on_primary,
+        .primary_hover => self.theme.primary_hover,
+        .primary_pressed => self.theme.primary_pressed,
+        .primary_container => self.theme.primary_container,
+        .on_primary_container => self.theme.on_primary_container,
+        .secondary => self.theme.secondary,
+        .on_secondary => self.theme.on_secondary,
+        .secondary_container => self.theme.secondary_container,
+        .on_secondary_container => self.theme.on_secondary_container,
+        .success => self.theme.success,
+        .on_success => self.theme.on_success,
+        .success_container => self.theme.success_container,
+        .warning => self.theme.warning,
+        .on_warning => self.theme.on_warning,
+        .warning_container => self.theme.warning_container,
+        .danger => self.theme.danger,
+        .on_danger => self.theme.on_danger,
+        .danger_container => self.theme.danger_container,
+        .info => self.theme.info,
+        .on_info => self.theme.on_info,
+        .border => self.theme.border,
+        .border_strong => self.theme.border_strong,
+        .divider => self.theme.divider,
+        .outline => self.theme.outline,
+        .hover => self.theme.hover,
+        .pressed => self.theme.pressed,
+        .disabled => self.theme.disabled,
+        .on_disabled => self.theme.on_disabled,
+        .selected => self.theme.selected,
+        .focus => self.theme.focus,
+        .input => self.theme.input,
+        .input_border => self.theme.input_border,
+        .tooltip => self.theme.tooltip,
+        .scrollbar => self.theme.scrollbar,
+        .scrollbar_hover => self.theme.scrollbar_hover,
+        .shadow => self.theme.shadow,
+    };
+}
+
+/// Merges `overrides` onto the default style for the kind named by the enum
+/// literal `kind`. Called by themes to restyle every widget of a kind: `base`
+/// picks these up on the next build, layered over the built-in default (so a
+/// theme that sets only `background` keeps the kind's padding/radius). Works
+/// for any enum — built-in `lu.Kind` tags and a third-party widget's own.
+/// Values use the `Style.Overrides` format (the same struct the element/user
+/// overrides use), not `Element.Overrides`.
+pub fn setStyle(self: *Context, comptime kind: anytype, overrides: lu.Style.Overrides) void {
+    self.default_styles.put(self.arena, kindKey(kind), overrides) catch return;
 }
 
 /// Evaluates an element's interaction hooks against the view's per-frame event
@@ -383,7 +502,7 @@ fn evalEvents(self: *Context, e: *lu.Element) void {
 /// got, or null when there is no current parent. This is the only place a
 /// widget talks to a layout.
 fn publish(self: *Context, e: *lu.Element) ?u32 {
-    return self.publishRequest(e, .{ .min_size = e.size, .pos = e.pos, .margin = e.margin });
+    return self.publishRequest(e, .{ .min_size = e.size, .pos = e.pos, .margin = e.style.margin });
 }
 
 /// Like `publish`, but with a hand-written `Request` so callers control
@@ -962,7 +1081,7 @@ fn textLay(layout: *lu.Layout) void {
             .x = 0,
             .y = @divTrunc(box_h -| block_h, 2),
         },
-        .background = bg,
+        .style = .{ .background = bg },
         .layout = ctx.leaf_layout,
         .ctx = ctx,
         .events = noEvents,
@@ -1013,11 +1132,11 @@ pub fn label(self: *Context, text: []const u8, overrides: lu.Element.Overrides, 
     };
     const natural = try self.textSizeCached(&self.fonts[opts.font_idx], text, opts.size, opts.direction, opts.weight);
     const e = self.allocElement();
-    e.* = self.base(.{ .w = 0, .h = 0 });
+    e.* = self.base(.{ .w = 0, .h = 0 }, .label);
     e.id = idOf(src);
     e.override(overrides);
     self.evalEvents(e);
-    const border = e.border;
+    const border = e.style.border;
     const pad = opts.padding;
     e.size = .{
         .w = natural.w + pad.left + pad.right + border.left + border.right,
@@ -1041,7 +1160,7 @@ pub fn label(self: *Context, text: []const u8, overrides: lu.Element.Overrides, 
 pub fn box(self: *Context, size: lu.Rect, overrides: lu.Element.Overrides, comptime src: std.builtin.SourceLocation) *lu.Element {
     self.dbg.announce("box");
     const e = self.allocElement();
-    e.* = self.base(size);
+    e.* = self.base(size, .box);
     e.id = idOf(src);
     e.override(overrides);
     self.evalEvents(e);
@@ -1100,7 +1219,7 @@ fn textElement(self: *Context, text: []const u8, opts: LabelOpts, eid: u64, extr
     e.* = .{
         .size = text_size,
         .pos = .{ .x = 0, .y = 0 },
-        .background = bg,
+        .style = .{ .background = bg },
         .layout = self.leaf_layout,
         .focusable = false,
         .ctx = self,
@@ -1132,13 +1251,13 @@ pub fn button(self: *Context, text: []const u8, overrides: lu.Element.Overrides,
     const inner = try self.textElement(text, opts.label, eid, overrides.id_extra orelse 0);
     const pad = opts.padding;
     const e = self.allocElement();
-    e.* = self.base(.{ .w = 0, .h = 0 });
+    e.* = self.base(.{ .w = 0, .h = 0 }, .button);
     e.id = eid;
-    e.background = lu.Background.solid(opts.color);
-    e.border_radius = opts.radius;
+    e.style.background = lu.Background.solid(opts.color);
+    e.style.border_radius = opts.radius;
     e.override(overrides);
     self.evalEvents(e);
-    const border = e.border;
+    const border = e.style.border;
     e.size = .{
         .w = inner.size.w + pad.left + pad.right + border.left + border.right,
         .h = inner.size.h + pad.top + pad.bottom + border.top + border.bottom,
@@ -1149,7 +1268,7 @@ pub fn button(self: *Context, text: []const u8, overrides: lu.Element.Overrides,
     _ = self.publishRequest(e, .{
         .min_size = opts.min_size orelse e.size,
         .pos = e.pos,
-        .margin = e.margin,
+        .margin = e.style.margin,
         .max_size = opts.max_size,
         .grow = opts.grow,
     });
@@ -1171,12 +1290,12 @@ pub const CheckboxOpts = struct {
 /// the boolean and rebuilds the widget when it changes.
 pub fn checkbox(self: *Context, checked: bool, overrides: lu.Element.Overrides, opts: CheckboxOpts, comptime src: std.builtin.SourceLocation) *lu.Element {
     const e = self.allocElement();
-    e.* = self.base(opts.size);
+    e.* = self.base(opts.size, .checkbox);
     e.id = idOf(src);
-    e.border = opts.border;
-    e.border_color = .{ .color = opts.border_color };
-    e.border_radius = opts.radius;
-    if (checked) e.background = lu.Background.solid(opts.checked_color);
+    e.style.border = opts.border;
+    e.style.border_color = .{ .color = opts.border_color };
+    e.style.border_radius = opts.radius;
+    if (checked) e.style.background = lu.Background.solid(opts.checked_color);
     e.override(overrides);
     self.evalEvents(e);
     _ = self.publish(e);
@@ -1197,19 +1316,19 @@ pub const ProgressBarOpts = struct {
 pub fn progress_bar(self: *Context, value: f32, overrides: lu.Element.Overrides, opts: ProgressBarOpts, comptime src: std.builtin.SourceLocation) *lu.Element {
     const v = std.math.clamp(value, 0.0, 1.0);
     const e = self.allocElement();
-    e.* = self.base(opts.size);
+    e.* = self.base(opts.size, .progress_bar);
     e.id = idOf(src);
-    e.background = lu.Background.solid(opts.track_color);
-    e.border_radius = opts.radius;
+    e.style.background = lu.Background.solid(opts.track_color);
+    e.style.border_radius = opts.radius;
     e.layout = self.makeAbsolute();
 
     const fill_w: u32 = @intFromFloat(@as(f32, @floatFromInt(opts.size.w)) * v);
     if (fill_w > 0) {
         const fill = self.allocElement();
-        fill.* = self.base(.{ .w = fill_w, .h = opts.size.h });
-        fill.background = lu.Background.solid(opts.fill_color);
+        fill.* = self.base(.{ .w = fill_w, .h = opts.size.h }, .base);
+        fill.style.background = lu.Background.solid(opts.fill_color);
         const r = opts.radius;
-        fill.border_radius = if (fill_w >= opts.size.w)
+        fill.style.border_radius = if (fill_w >= opts.size.w)
             r
         else
             .{ .top_left = r.top_left, .bottom_left = r.bottom_left, .top_right = 0, .bottom_right = 0 };
@@ -1240,19 +1359,19 @@ pub const SliderOpts = struct {
 pub fn slider(self: *Context, value: f32, overrides: lu.Element.Overrides, opts: SliderOpts, comptime src: std.builtin.SourceLocation) *lu.Element {
     const v = std.math.clamp(value, 0.0, 1.0);
     const e = self.allocElement();
-    e.* = self.base(opts.size);
+    e.* = self.base(opts.size, .slider);
     e.id = idOf(src);
-    e.background = lu.Background.solid(opts.track_color);
-    e.border_radius = opts.radius;
+    e.style.background = lu.Background.solid(opts.track_color);
+    e.style.border_radius = opts.radius;
     e.layout = self.makeAbsolute();
 
     const fill_w: u32 = @intFromFloat(@as(f32, @floatFromInt(opts.size.w)) * v);
     if (fill_w > 0) {
         const fill = self.allocElement();
-        fill.* = self.base(.{ .w = fill_w, .h = opts.size.h });
-        fill.background = lu.Background.solid(opts.fill_color);
+        fill.* = self.base(.{ .w = fill_w, .h = opts.size.h }, .base);
+        fill.style.background = lu.Background.solid(opts.fill_color);
         const r = opts.radius;
-        fill.border_radius = if (fill_w >= opts.size.w)
+        fill.style.border_radius = if (fill_w >= opts.size.w)
             r
         else
             .{ .top_left = r.top_left, .bottom_left = r.bottom_left, .top_right = 0, .bottom_right = 0 };
@@ -1265,9 +1384,9 @@ pub fn slider(self: *Context, value: f32, overrides: lu.Element.Overrides, opts:
     const kx: u32 = @intFromFloat(@as(f32, @floatFromInt(travel)) * v);
     const ky = (opts.size.h -| knob_size) / 2;
     const knob = self.allocElement();
-    knob.* = self.base(.{ .w = knob_size, .h = knob_size });
-    knob.background = lu.Background.solid(opts.knob_color);
-    knob.border_radius = .all(knob_size / 2);
+    knob.* = self.base(.{ .w = knob_size, .h = knob_size }, .base);
+    knob.style.background = lu.Background.solid(opts.knob_color);
+    knob.style.border_radius = .all(knob_size / 2);
     const knob_id = e.layout.?.request(.{ .min_size = knob.size, .pos = .{ .x = kx, .y = ky } });
     e.layout.?.addElement(knob_id, knob);
 
@@ -1309,9 +1428,9 @@ pub fn image(self: *Context, source: lu.ImageSource, overrides: lu.Element.Overr
         });
     const natural = lu.Rect{ .w = decoded.width, .h = decoded.height };
     const e = self.allocElement();
-    e.* = self.base(natural);
+    e.* = self.base(natural, .image);
     e.id = idOf(src);
-    e.background = lu.Background.imageBuffer(.{
+    e.style.background = lu.Background.imageBuffer(.{
         .buffer = .{
             .pixels = decoded.pixels,
             .width = decoded.width,

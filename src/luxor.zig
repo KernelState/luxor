@@ -144,7 +144,7 @@ pub const Geometry = struct {
     radius: Corners,
 
     pub fn fromElement(e: *const Element, area: Area) Geometry {
-        return .{ .pos = area.pos, .size = area.size, .radius = e.border_radius };
+        return .{ .pos = area.pos, .size = area.size, .radius = e.style.border_radius };
     }
 };
 
@@ -163,6 +163,89 @@ pub const Color = struct {
         };
     }
 
+    /// Linearly interpolates between this color and `other` by `t` (0.0 = self,
+    /// 1.0 = other). Colors are treated as gamma-encoded sRGB, i.e. the
+    /// interpolation is an approximation of the perceptual blend.
+    pub fn lerp(self: Color, other: Color, t: f32) Color {
+        return .{
+            .r = lerp8(self.r, other.r, t),
+            .g = lerp8(self.g, other.g, t),
+            .b = lerp8(self.b, other.b, t),
+            .a = lerp8(self.a, other.a, t),
+        };
+    }
+
+    /// Lightens (positive) or darkens (negative) the color by a signed
+    /// percentage in the range -1.0 .. 1.0: 0.5 blends halfway toward white,
+    /// -0.5 blends halfway toward black. The direct alpha is unchanged.
+    pub fn lighten(self: Color, amount: f32) Color {
+        const t = std.math.clamp(amount, -1.0, 1.0);
+        if (t >= 0) return self.lerp(Color.white, t);
+        return self.lerp(Color.black, -t);
+    }
+
+    /// Builds a color from HSL. `h` is a hue angle in degrees (0..360), `s` and
+    /// `l` are unit fractions (0.0..1.0). Out-of-range inputs are clamped.
+    pub fn fromHSL(h: f32, s: f32, l: f32) Color {
+        const hh = @mod(h, 360.0);
+        const ss = std.math.clamp(s, 0.0, 1.0);
+        const ll = std.math.clamp(l, 0.0, 1.0);
+        const c = (1 - @abs(2 * ll - 1)) * ss;
+        const hp = hh / 60.0;
+        const x = c * (1 - @as(f32, @abs(@mod(hp, 2.0) - 1)));
+        var rgb: [3]f32 = undefined;
+        if (hp < 1) {
+            rgb = .{ c, x, 0 };
+        } else if (hp < 2) {
+            rgb = .{ x, c, 0 };
+        } else if (hp < 3) {
+            rgb = .{ 0, c, x };
+        } else if (hp < 4) {
+            rgb = .{ 0, x, c };
+        } else if (hp < 5) {
+            rgb = .{ x, 0, c };
+        } else {
+            rgb = .{ c, 0, x };
+        }
+        const m = ll - c / 2;
+        return .{
+            .r = @intFromFloat(std.math.clamp(rgb[0] + m, 0.0, 255.0)),
+            .g = @intFromFloat(std.math.clamp(rgb[1] + m, 0.0, 255.0)),
+            .b = @intFromFloat(std.math.clamp(rgb[2] + m, 0.0, 255.0)),
+            .a = 255,
+        };
+    }
+
+    /// Builds a color from OKLCH. `l` (lightness) and `c` (chroma) are unit
+    /// fractions (0.0..1.0), `h` is a hue angle in degrees (0..360). Converts
+    /// through OKLab to linear sRGB, then applies the sRGB gamma curve.
+    pub fn fromOKLCH(l: f32, c: f32, h: f32) Color {
+        const ll = std.math.clamp(l, 0.0, 1.0);
+        const cc = std.math.clamp(c, 0.0, 1.0);
+        const theta = @mod(h, 360.0) * std.math.pi / 180.0;
+        const a = cc * @cos(theta);
+        const b = cc * @sin(theta);
+
+        const l_ = ll + 0.3963377774 * a + 0.2158037573 * b;
+        const m_ = ll - 0.1055613458 * a - 0.0638541728 * b;
+        const s_ = ll - 0.0894841775 * a - 1.2914855480 * b;
+
+        const lc = l_ * l_ * l_;
+        const mc = m_ * m_ * m_;
+        const sc = s_ * s_ * s_;
+
+        const r_lin = 4.0767416621 * lc - 3.3077115913 * mc + 0.2309699292 * sc;
+        const g_lin = -1.2684380046 * lc + 2.6097574011 * mc - 0.3413193965 * sc;
+        const b_lin = -0.0041960863 * lc - 0.7034186147 * mc + 1.7076147010 * sc;
+
+        return .{
+            .r = @intFromFloat(std.math.clamp(srgbFromLinear(r_lin), 0.0, 255.0)),
+            .g = @intFromFloat(std.math.clamp(srgbFromLinear(g_lin), 0.0, 255.0)),
+            .b = @intFromFloat(std.math.clamp(srgbFromLinear(b_lin), 0.0, 255.0)),
+            .a = 255,
+        };
+    }
+
     pub const black = Color.fromU32(0x000000FF);
     pub const white = Color.fromU32(0xFFFFFFFF);
     pub const red = Color.fromU32(0xFF0000FF);
@@ -170,6 +253,126 @@ pub const Color = struct {
     pub const blue = Color.fromU32(0x0000FFFF);
     pub const gray = Color.fromU32(0x808080FF);
     pub const dark_gray = Color.fromU32(0x333333FF);
+};
+
+fn lerp8(a: u8, b: u8, t: f32) u8 {
+    const tt = std.math.clamp(t, 0.0, 1.0);
+    return @intFromFloat(@round(@as(f32, @floatFromInt(a)) + (@as(f32, @floatFromInt(b)) - @as(f32, @floatFromInt(a))) * tt));
+}
+
+/// Encodes a linear sRGB component (0..1) with the sRGB gamma curve, producing
+/// an 8-bit channel value.
+fn srgbFromLinear(v: f32) f32 {
+    if (std.math.clamp(v, 0.0, 1.0) <= 0.0031308) return 12.92 * v;
+    return 1.055 * std.math.pow(f32, v, 1.0 / 2.4) - 0.055;
+}
+
+/// A named palette of theme colors. Keep every field here mirrored by a
+/// `ThemeColor` tag (same name) so `Context.getColor` can switch over them.
+pub const ColorTheme = struct {
+    // Base surfaces and text.
+    background: Color = Color.fromU32(0xFF0F1419),
+    surface: Color = Color.fromU32(0xFF1A212B),
+    surface_raised: Color = Color.fromU32(0xFF232C38),
+    surface_sunken: Color = Color.fromU32(0xFF0B0F14),
+    foreground: Color = Color.fromU32(0xFFE6EDF3),
+    text: Color = Color.fromU32(0xFFE6EDF3),
+    text_secondary: Color = Color.fromU32(0xFF9DA7B3),
+    text_disabled: Color = Color.fromU32(0xFF6B7480),
+    text_inverse: Color = Color.fromU32(0xFF0F1419),
+    text_link: Color = Color.fromU32(0xFF58A6FF),
+    // Primary / accent and their on-variants.
+    primary: Color = Color.fromU32(0xFF2F81F7),
+    on_primary: Color = Color.fromU32(0xFF0B0F14),
+    primary_hover: Color = Color.fromU32(0xFF4A93F8),
+    primary_pressed: Color = Color.fromU32(0xFF1F6FEB),
+    primary_container: Color = Color.fromU32(0xFF15263B),
+    on_primary_container: Color = Color.fromU32(0xFF9EC8FF),
+    secondary: Color = Color.fromU32(0xFF4D5565),
+    on_secondary: Color = Color.fromU32(0xFFE6EDF3),
+    secondary_container: Color = Color.fromU32(0xFF262D3A),
+    on_secondary_container: Color = Color.fromU32(0xFFC9D1D9),
+    success: Color = Color.fromU32(0xFF3FB950),
+    on_success: Color = Color.fromU32(0xFF0B0F14),
+    success_container: Color = Color.fromU32(0xFF14331A),
+    warning: Color = Color.fromU32(0xFFD29922),
+    on_warning: Color = Color.fromU32(0xFF0B0F14),
+    warning_container: Color = Color.fromU32(0xFF332912),
+    danger: Color = Color.fromU32(0xFFF85149),
+    on_danger: Color = Color.fromU32(0xFF0B0F14),
+    danger_container: Color = Color.fromU32(0xFF38181B),
+    info: Color = Color.fromU32(0xFF58A6FF),
+    on_info: Color = Color.fromU32(0xFF0B0F14),
+    // Borders and dividers.
+    border: Color = Color.fromU32(0xFF30363D),
+    border_strong: Color = Color.fromU32(0xFF484F58),
+    divider: Color = Color.fromU32(0xFF262C33),
+    outline: Color = Color.fromU32(0xFF484F58),
+    // Interactive states.
+    hover: Color = Color.fromU32(0x1FFFFFFF),
+    pressed: Color = Color.fromU32(0x33FFFFFF),
+    disabled: Color = Color.fromU32(0xFF484F58),
+    on_disabled: Color = Color.fromU32(0xFF8B949E),
+    selected: Color = Color.fromU32(0x332F81F7),
+    focus: Color = Color.fromU32(0xFF2F81F7),
+    // Widget surfaces.
+    input: Color = Color.fromU32(0xFF0D1117),
+    input_border: Color = Color.fromU32(0xFF30363D),
+    tooltip: Color = Color.fromU32(0xFF1A212B),
+    scrollbar: Color = Color.fromU32(0xFF6B7480),
+    scrollbar_hover: Color = Color.fromU32(0xFF9DA7B3),
+    shadow: Color = Color.fromU32(0x55000000),
+};
+
+/// One tag per `ColorTheme` field, by name. Pass one to `Context.getColor`.
+pub const ThemeColor = enum {
+    background,
+    surface,
+    surface_raised,
+    surface_sunken,
+    foreground,
+    text,
+    text_secondary,
+    text_disabled,
+    text_inverse,
+    text_link,
+    primary,
+    on_primary,
+    primary_hover,
+    primary_pressed,
+    primary_container,
+    on_primary_container,
+    secondary,
+    on_secondary,
+    secondary_container,
+    on_secondary_container,
+    success,
+    on_success,
+    success_container,
+    warning,
+    on_warning,
+    warning_container,
+    danger,
+    on_danger,
+    danger_container,
+    info,
+    on_info,
+    border,
+    border_strong,
+    divider,
+    outline,
+    hover,
+    pressed,
+    disabled,
+    on_disabled,
+    selected,
+    focus,
+    input,
+    input_border,
+    tooltip,
+    scrollbar,
+    scrollbar_hover,
+    shadow,
 };
 
 /// An image background, referencing a texture registered on the window.
@@ -330,6 +533,70 @@ pub const Background = struct {
     pub fn cached(key: u64) Background {
         return .{ .base = .{ .cached = .{ .key = key } }, .effects = &.{} };
     }
+};
+
+/// Everything that makes an element look the way it looks: border, background,
+/// effects, and the spacing around that content. The `Context`'s per-kind
+/// default styles and the element/user/th rebases all live in this one place
+/// instead of scattering style fields across `Element`.
+pub const Style = struct {
+    border: Sides = .all(0),
+    border_color: Border = .{ .color = .black },
+    border_radius: Corners = .all(0),
+    background: Background = Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
+    /// Effects applied to the element (shadows, blur, opacity).
+    effects: []const Effect = &.{},
+    padding: Sides = .all(0),
+    margin: Sides = .all(0),
+
+    /// Constructor-style overrides: every field optional, applied with `apply`.
+    /// This is the format both the `Context`'s per-kind default-styles hashmap
+    /// and themes save into (so themes and defaults share one shape), and the
+    /// format `Element.Overrides.style` uses to override an element's styles.
+    pub const Overrides = struct {
+        border: ?Sides = null,
+        border_color: ?Border = null,
+        border_radius: ?Corners = null,
+        background: ?Background = null,
+        effects: ?[]const Effect = null,
+        padding: ?Sides = null,
+        margin: ?Sides = null,
+
+        /// Applies each set field onto `style`.
+        pub fn apply(self: Overrides, style: *Style) void {
+            if (self.border) |v| style.border = v;
+            if (self.border_color) |v| style.border_color = v;
+            if (self.border_radius) |v| style.border_radius = v;
+            if (self.background) |v| style.background = v;
+            if (self.effects) |v| style.effects = v;
+            if (self.padding) |v| style.padding = v;
+            if (self.margin) |v| style.margin = v;
+        }
+
+        /// Merges `self` onto `base`, returning a style with `self`'s set
+        /// fields winning. `apply` mutates in place; this is the value form.
+        pub fn onto(self: Overrides, base: Style) Style {
+            var out = base;
+            self.apply(&out);
+            return out;
+        }
+    };
+};
+
+/// The preset style-keys the built-in widgets identify themselves by. A kind is
+/// an *enum literal*, not a registry of every widget: the library's widgets
+/// call `Context.base(size, .button)` etc., and a third-party widget brings its
+/// own enum and passes its own literals the same way. Anything that takes a
+/// kind (`base`, `setStyle`) accepts any enum via the literal.
+pub const Kind = enum {
+    base,
+    box,
+    button,
+    label,
+    checkbox,
+    progress_bar,
+    slider,
+    image,
 };
 
 /// Per-frame event state for the view (the window). The Window's post-draw

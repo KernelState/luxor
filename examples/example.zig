@@ -183,7 +183,7 @@ pub fn main() !void {
         var root = lu.Element{
             .size = .{ .w = 800, .h = 600 },
             .pos = .{ .x = 0, .y = 0 },
-            .background = lu.Background.solid(lu.Color{ .r = 0xDC, .g = 0xE4, .b = 0xF0, .a = 0xFF }),
+            .style = .{ .background = lu.Background.solid(lu.Color{ .r = 0xDC, .g = 0xE4, .b = 0xF0, .a = 0xFF }) },
             .layout = .{ .vtable = &lu.Layout.flex, .parent = null, .data = &root_cfg },
             .ctx = ctx,
             .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onClickBad }} } } },
@@ -195,8 +195,10 @@ pub fn main() !void {
         root.layout.?.start();
 
         _ = try ctx.label("Hello, World! adflahflajhlfhjkhdalvjnzn.dv,mneafhdpoapohz;dfjkhalejkhlajkdhapdoifehwa---", .{
-            .border_radius = .all(4),
-            .background = .{ .base = .{ .solid = .red }, .effects = &.{} },
+            .style = .{
+                .border_radius = .all(4),
+                .background = .{ .base = .{ .solid = .red }, .effects = &.{} },
+            },
         }, .{ .size = 28, .color = .white }, @src());
         _ = try ctx.label("\u{645}\u{631}\u{62D}\u{628}\u{627} \u{628}\u{644}\u{639}\u{627}\u{644}\u{645}", .{}, .{
             .font_idx = 1,
@@ -221,7 +223,7 @@ pub fn main() !void {
         var toolbar = lu.Element{
             .size = .{ .w = 0, .h = 0 },
             .pos = .{ .x = 0, .y = 0 },
-            .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
+            .style = .{ .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }) },
             .layout = .{ .vtable = &lu.Layout.flex, .parent = &root.layout.?, .data = &toolbar_cfg },
             .ctx = ctx,
             .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onClickBad }} } } },
@@ -242,14 +244,14 @@ pub fn main() !void {
             // publishes hover after the frame is drawn); lighten the fill while
             // it's under the pointer.
             if (btn.events.hover.active)
-                btn.background = .{ .base = .{ .solid = lu.Color.fromU32(0xFFFFFFFF) }, .effects = &.{} };
+                btn.style.background.base = .{ .solid = btn.style.background.base.solid.lighten(0.5) };
         }
         toolbar.layout.?.end();
 
         var button_field = lu.Element{
             .size = .{ .w = 0, .h = 0 },
             .pos = .{ .x = 0, .y = 0 },
-            .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
+            .style = .{ .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }) },
             .layout = .{ .vtable = &lu.Layout.flex, .parent = &root.layout.?, .data = &button_field_cfg },
             .ctx = ctx,
             .events = lu.Context.noEvents,
@@ -296,10 +298,11 @@ pub fn main() !void {
             };
             _ = ctx.box(.{ .w = 40, .h = 40 }, .{
                 .id_extra = i,
-                .background = .{ .base = .{ .solid = lu.Color.fromU32(col) }, .effects = &.{} },
-                .border_radius = .all(6),
-                .has_effects = true,
-                .effects = effects,
+                .style = .{
+                    .background = .{ .base = .{ .solid = lu.Color.fromU32(col) }, .effects = &.{} },
+                    .border_radius = .all(6),
+                    .effects = effects,
+                },
             }, @src());
         }
         grid.layout.?.end();
@@ -307,7 +310,7 @@ pub fn main() !void {
         var slider_row = lu.Element{
             .size = .{ .w = 0, .h = 0 },
             .pos = .{ .x = 0, .y = 0 },
-            .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }),
+            .style = .{ .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }) },
             .layout = .{ .vtable = &lu.Layout.flex, .parent = &root.layout.?, .data = &slider_row_cfg },
             .ctx = ctx,
             .events = lu.Context.noEvents,
