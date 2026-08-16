@@ -236,15 +236,11 @@ pub fn main() !void {
             // The click hook rides in through the overrides: widgets evaluate
             // `fromId` *after* overrides, so `btn.events.hover.active` below
             // reflects last frame's hit-test and the hook handles are attached.
-            const btn = try ctx.button(toolbar_slices[i], .{
+            _ = try ctx.button(toolbar_slices[i], .{
                 .id_extra = i,
                 .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onClick }} } } },
+                .hover = .{ .background = .{ .base = .{ .solid = lu.Color.fromU32(col).lighten(0.5) } } },
             }, .{ .color = lu.Color.fromU32(col) }, @src());
-            // Hover styling reflects the *previous* frame's hit-test (the view
-            // publishes hover after the frame is drawn); lighten the fill while
-            // it's under the pointer.
-            if (btn.events.hover.active)
-                btn.style.background.base = .{ .solid = btn.style.background.base.solid.lighten(0.5) };
         }
         toolbar.layout.?.end();
 

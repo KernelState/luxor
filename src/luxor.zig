@@ -492,7 +492,7 @@ pub const ImageSource = union(enum) {
 
 pub const Background = struct {
     base: Base,
-    effects: []const Effect,
+    effects: []const Effect = &.{},
 
     pub const Base = union(enum) {
         image: Image,
@@ -585,9 +585,10 @@ pub const Style = struct {
 
 /// The preset style-keys the built-in widgets identify themselves by. A kind is
 /// an *enum literal*, not a registry of every widget: the library's widgets
-/// call `Context.base(size, .button)` etc., and a third-party widget brings its
-/// own enum and passes its own literals the same way. Anything that takes a
-/// kind (`base`, `setStyle`) accepts any enum via the literal.
+/// call `Context.base(size, .button, id, id_extra)` etc., and a third-party
+/// widget brings its own enum and passes its own literals the same way.
+/// Anything that takes a kind (`base`, `setStyle`) accepts any enum via the
+/// literal.
 pub const Kind = enum {
     base,
     box,

@@ -363,20 +363,32 @@ pub const noEvents = lu.Element.Events{
 /// identified by an enum literal. Built-in widgets pass a `lu.Kind` literal
 /// (`.label`, `.button`, ...); a third-party widget passes a literal from its
 /// own enum. `base` starts from the built-in defaults for that literal and
-/// layers any `setStyle` overrides on top (transparent background, leaf layout,
-/// no events, not focusable otherwise).
-fn base(self: *Context, size: lu.Rect, comptime kind: anytype) lu.Element {
+/// layers any `setStyle` overrides on top, seeds the interaction styles
+/// (`hover`/`press`, or none for kinds without them), assigns the element's
+/// identity (`id` from the widget's call site, `id_extra` for loop iterations)
+/// and evaluates last frame's interaction state, so `events.*.active` is
+/// populated. The widget then applies its own look and the user's `Overrides`;
+/// `Element.override` runs the final pass (`stylize`) that layers hover/press
+/// on top with the last word.
+fn base(self: *Context, size: lu.Rect, comptime kind: anytype, id: u64, id_extra: u64) lu.Element {
     var style = builtinDefaults(kind).onto(lu.Style{});
     if (self.default_styles.get(kindKey(kind))) |o| style = o.onto(style);
-    return .{
+    const ix = builtinInteractions(kind);
+    var el = lu.Element{
         .size = size,
         .pos = .{ .x = 0, .y = 0 },
         .style = style,
+        .hover = ix.hover,
+        .press = ix.press,
         .layout = self.leaf_layout,
         .events = noEvents,
         .ctx = self,
         .focusable = false,
+        .id = id,
+        .id_extra = id_extra,
     };
+    self.evalEvents(&el);
+    return el;
 }
 
 /// The built-in per-widget defaults, keyed by the kind's enum literal: whatever
@@ -402,6 +414,28 @@ fn builtinDefaults(comptime kind: anytype) lu.Style.Overrides {
             .background = lu.Background.solid(.dark_gray),
             .border_radius = .all(6),
         },
+    };
+}
+
+const InteractionDefaults = struct {
+    hover: ?lu.Style.Overrides = null,
+    press: ?lu.Style.Overrides = null,
+};
+
+/// The built-in per-widget hover/press styles, keyed the same way as
+/// `builtinDefaults` (by the kind's enum-literal tag). These are what `base`
+/// seeds `Element.hover`/`.press` with, so a kind gets interaction effects
+/// with no extra wiring; `Element.override` can replace either through
+/// `Overrides.hover`/`.press`, and the final `stylize` pass applies the winner
+/// on top of the finished style.
+fn builtinInteractions(comptime kind: anytype) InteractionDefaults {
+    const k = std.meta.stringToEnum(lu.Kind, @tagName(kind)) orelse return .{};
+    return switch (k) {
+        .button => .{
+            .hover = .{ .effects = &.{.{ .shadow = .{ .mask = .out, .color = .{ .r = 0, .g = 0, .b = 0, .a = 56 }, .y_offset = 0, .blur = 10 } } } },
+            .press = .{ .effects = &.{.{ .shadow = .{ .mask = .in, .color = .{ .r = 0, .g = 0, .b = 0, .a = 90 }, .blur = 8 } } } },
+        },
+        .base, .box, .label, .checkbox, .progress_bar, .slider, .image => .{},
     };
 }
 
@@ -485,16 +519,28 @@ pub fn setStyle(self: *Context, comptime kind: anytype, overrides: lu.Style.Over
 
 /// Evaluates an element's interaction hooks against the view's per-frame event
 /// state, deriving each hook's `active` from whether the view reports the
-/// element for that interaction last frame. Must run after the user's
-/// `Overrides` (which wire the handlers and may set `id_extra`) so `active`
-/// reflects the element exactly as built. Elements render last frame's state: a
-/// button pressed this frame lights up next frame, and the hook callbacks fired
-/// by the view's processing pass take effect then.
+/// element for that interaction last frame. Called by `base` once the element's
+/// identity is assigned, so every element (built-in, third-party, or an inner
+/// leaf) starts with the right render state; widgets mutate style/layout after
+/// with no effect on `active`. Elements render last frame's state: a button
+/// pressed this frame lights up next frame, and the hook callbacks fired by
+/// the view's processing pass take effect then.
 fn evalEvents(self: *Context, e: *lu.Element) void {
     e.events.hover.setActive(self.events.isHovered(e.id) != null);
     e.events.click.setActive(self.events.isClicked(e.id) != null);
     e.events.focus.setActive(self.events.isFocused(e.id) != null);
     e.events.drag.setActive(self.events.isDragged(e.id) != null);
+}
+
+/// The final say over what an element looks like, run from `Element.override`
+/// after the user's `Overrides` (which every widget applies last): re-derive
+/// the `active` flags — the user may have replaced `events`, wiping the ones
+/// `base` set — then layer the interaction styles onto the finished `style`.
+/// The pipeline is base defaults -> widget look -> user `Overrides` -> `stylize`
+/// (hover/press), each step applying only the fields it sets.
+pub fn stylize(self: *Context, e: *lu.Element) void {
+    self.evalEvents(e);
+    e.interact();
 }
 
 /// Requests `e`'s size and position from the current parent layout (set with a
@@ -1132,10 +1178,8 @@ pub fn label(self: *Context, text: []const u8, overrides: lu.Element.Overrides, 
     };
     const natural = try self.textSizeCached(&self.fonts[opts.font_idx], text, opts.size, opts.direction, opts.weight);
     const e = self.allocElement();
-    e.* = self.base(.{ .w = 0, .h = 0 }, .label);
-    e.id = idOf(src);
+    e.* = self.base(.{ .w = 0, .h = 0 }, .label, idOf(src), overrides.id_extra orelse 0);
     e.override(overrides);
-    self.evalEvents(e);
     const border = e.style.border;
     const pad = opts.padding;
     e.size = .{
@@ -1160,10 +1204,8 @@ pub fn label(self: *Context, text: []const u8, overrides: lu.Element.Overrides, 
 pub fn box(self: *Context, size: lu.Rect, overrides: lu.Element.Overrides, comptime src: std.builtin.SourceLocation) *lu.Element {
     self.dbg.announce("box");
     const e = self.allocElement();
-    e.* = self.base(size, .box);
-    e.id = idOf(src);
+    e.* = self.base(size, .box, idOf(src), overrides.id_extra orelse 0);
     e.override(overrides);
-    self.evalEvents(e);
     _ = self.publish(e);
     return e;
 }
@@ -1216,17 +1258,8 @@ fn textElement(self: *Context, text: []const u8, opts: LabelOpts, eid: u64, extr
         extra,
     );
     const e = self.allocElement();
-    e.* = .{
-        .size = text_size,
-        .pos = .{ .x = 0, .y = 0 },
-        .style = .{ .background = bg },
-        .layout = self.leaf_layout,
-        .focusable = false,
-        .ctx = self,
-        .events = noEvents,
-        .id = eid,
-        .id_extra = extra,
-    };
+    e.* = self.base(text_size, .label, eid, extra);
+    e.style.background = bg;
     return e;
 }
 
@@ -1248,15 +1281,14 @@ pub const ButtonOpts = struct {
 pub fn button(self: *Context, text: []const u8, overrides: lu.Element.Overrides, opts: ButtonOpts, comptime src: std.builtin.SourceLocation) !*lu.Element {
     self.dbg.announce("button");
     const eid = idOf(src);
-    const inner = try self.textElement(text, opts.label, eid, overrides.id_extra orelse 0);
+    const extra = overrides.id_extra orelse 0;
+    const inner = try self.textElement(text, opts.label, eid, extra);
     const pad = opts.padding;
     const e = self.allocElement();
-    e.* = self.base(.{ .w = 0, .h = 0 }, .button);
-    e.id = eid;
+    e.* = self.base(.{ .w = 0, .h = 0 }, .button, eid, extra);
     e.style.background = lu.Background.solid(opts.color);
     e.style.border_radius = opts.radius;
     e.override(overrides);
-    self.evalEvents(e);
     const border = e.style.border;
     e.size = .{
         .w = inner.size.w + pad.left + pad.right + border.left + border.right,
@@ -1290,14 +1322,12 @@ pub const CheckboxOpts = struct {
 /// the boolean and rebuilds the widget when it changes.
 pub fn checkbox(self: *Context, checked: bool, overrides: lu.Element.Overrides, opts: CheckboxOpts, comptime src: std.builtin.SourceLocation) *lu.Element {
     const e = self.allocElement();
-    e.* = self.base(opts.size, .checkbox);
-    e.id = idOf(src);
+    e.* = self.base(opts.size, .checkbox, idOf(src), overrides.id_extra orelse 0);
     e.style.border = opts.border;
     e.style.border_color = .{ .color = opts.border_color };
     e.style.border_radius = opts.radius;
     if (checked) e.style.background = lu.Background.solid(opts.checked_color);
     e.override(overrides);
-    self.evalEvents(e);
     _ = self.publish(e);
     return e;
 }
@@ -1316,8 +1346,7 @@ pub const ProgressBarOpts = struct {
 pub fn progress_bar(self: *Context, value: f32, overrides: lu.Element.Overrides, opts: ProgressBarOpts, comptime src: std.builtin.SourceLocation) *lu.Element {
     const v = std.math.clamp(value, 0.0, 1.0);
     const e = self.allocElement();
-    e.* = self.base(opts.size, .progress_bar);
-    e.id = idOf(src);
+    e.* = self.base(opts.size, .progress_bar, idOf(src), overrides.id_extra orelse 0);
     e.style.background = lu.Background.solid(opts.track_color);
     e.style.border_radius = opts.radius;
     e.layout = self.makeAbsolute();
@@ -1325,7 +1354,7 @@ pub fn progress_bar(self: *Context, value: f32, overrides: lu.Element.Overrides,
     const fill_w: u32 = @intFromFloat(@as(f32, @floatFromInt(opts.size.w)) * v);
     if (fill_w > 0) {
         const fill = self.allocElement();
-        fill.* = self.base(.{ .w = fill_w, .h = opts.size.h }, .base);
+        fill.* = self.base(.{ .w = fill_w, .h = opts.size.h }, .base, 0, 0);
         fill.style.background = lu.Background.solid(opts.fill_color);
         const r = opts.radius;
         fill.style.border_radius = if (fill_w >= opts.size.w)
@@ -1337,7 +1366,6 @@ pub fn progress_bar(self: *Context, value: f32, overrides: lu.Element.Overrides,
     }
 
     e.override(overrides);
-    self.evalEvents(e);
     _ = self.publish(e);
     return e;
 }
@@ -1359,8 +1387,7 @@ pub const SliderOpts = struct {
 pub fn slider(self: *Context, value: f32, overrides: lu.Element.Overrides, opts: SliderOpts, comptime src: std.builtin.SourceLocation) *lu.Element {
     const v = std.math.clamp(value, 0.0, 1.0);
     const e = self.allocElement();
-    e.* = self.base(opts.size, .slider);
-    e.id = idOf(src);
+    e.* = self.base(opts.size, .slider, idOf(src), overrides.id_extra orelse 0);
     e.style.background = lu.Background.solid(opts.track_color);
     e.style.border_radius = opts.radius;
     e.layout = self.makeAbsolute();
@@ -1368,7 +1395,7 @@ pub fn slider(self: *Context, value: f32, overrides: lu.Element.Overrides, opts:
     const fill_w: u32 = @intFromFloat(@as(f32, @floatFromInt(opts.size.w)) * v);
     if (fill_w > 0) {
         const fill = self.allocElement();
-        fill.* = self.base(.{ .w = fill_w, .h = opts.size.h }, .base);
+        fill.* = self.base(.{ .w = fill_w, .h = opts.size.h }, .base, 0, 0);
         fill.style.background = lu.Background.solid(opts.fill_color);
         const r = opts.radius;
         fill.style.border_radius = if (fill_w >= opts.size.w)
@@ -1384,14 +1411,13 @@ pub fn slider(self: *Context, value: f32, overrides: lu.Element.Overrides, opts:
     const kx: u32 = @intFromFloat(@as(f32, @floatFromInt(travel)) * v);
     const ky = (opts.size.h -| knob_size) / 2;
     const knob = self.allocElement();
-    knob.* = self.base(.{ .w = knob_size, .h = knob_size }, .base);
+    knob.* = self.base(.{ .w = knob_size, .h = knob_size }, .base, 0, 0);
     knob.style.background = lu.Background.solid(opts.knob_color);
     knob.style.border_radius = .all(knob_size / 2);
     const knob_id = e.layout.?.request(.{ .min_size = knob.size, .pos = .{ .x = kx, .y = ky } });
     e.layout.?.addElement(knob_id, knob);
 
     e.override(overrides);
-    self.evalEvents(e);
     _ = self.publish(e);
     return e;
 }
@@ -1428,8 +1454,7 @@ pub fn image(self: *Context, source: lu.ImageSource, overrides: lu.Element.Overr
         });
     const natural = lu.Rect{ .w = decoded.width, .h = decoded.height };
     const e = self.allocElement();
-    e.* = self.base(natural, .image);
-    e.id = idOf(src);
+    e.* = self.base(natural, .image, idOf(src), overrides.id_extra orelse 0);
     e.style.background = lu.Background.imageBuffer(.{
         .buffer = .{
             .pixels = decoded.pixels,
@@ -1440,7 +1465,6 @@ pub fn image(self: *Context, source: lu.ImageSource, overrides: lu.Element.Overr
         .filter = opts.filter,
     });
     e.override(overrides);
-    self.evalEvents(e);
     _ = self.publish(e);
     return e;
 }

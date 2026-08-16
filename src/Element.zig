@@ -8,6 +8,13 @@ pos: lu.Pos,
 /// and their opts; they and themes/overrides write to it in `Style.Overrides`
 /// format.
 style: lu.Style = .{},
+/// Style overrides layered on while the element is hovered. Seeded per-kind by
+/// `base`, replaceable through `Overrides.hover`.
+hover: ?lu.Style.Overrides = null,
+/// Style overrides layered on while the element is pressed (a click in
+/// progress). Wins over `hover`; seeded per-kind by `base`, replaceable
+/// through `Overrides.press`.
+press: ?lu.Style.Overrides = null,
 /// Stable identity of this element, derived from its call site's `@src()`
 /// (file:line:column). Elements are rebuilt every frame, so the same source
 /// position produces the same id, letting caches (textures, CPU buffers) key
@@ -51,6 +58,8 @@ pub const Overrides = struct {
     /// in `lu.Style.Overrides` format. Same shape the theme/default-styles
     /// hashmap holds, so the same overrides struct works for both.
     style: ?lu.Style.Overrides = null,
+    hover: ?lu.Style.Overrides = null,
+    press: ?lu.Style.Overrides = null,
     layout: ?lu.Layout = null,
     focusable: ?bool = null,
     id_extra: ?u64 = null,
@@ -64,10 +73,30 @@ pub fn override(self: *Element, o: Overrides) void {
     if (o.size) |v| self.size = v;
     if (o.pos) |v| self.pos = v;
     if (o.style) |s| s.apply(&self.style);
+    if (o.hover) |h| self.hover = h;
+    if (o.press) |p| self.press = p;
     if (o.layout) |v| self.layout = v;
     if (o.focusable) |v| self.focusable = v;
     if (o.id_extra) |v| self.id_extra = v;
     if (o.events) |v| self.events = v;
+    // The final say: user overrides land, then the interaction state re-applies
+    // (the user may have replaced `events`, which wipes the active flags `base`
+    // derived), then hover/press layer onto the finished `style`.
+    if (self.ctx) |ctx| ctx.stylize(self);
+}
+
+/// Applies the interaction state as the last styling layer, on top of the
+/// defaults and the user's style: while pressed (`click.active`) `press` layers
+/// onto `style`, else while hovered `hover` does. Both are `Style.Overrides`,
+/// so only the fields they set change. Called by `Context.stylize` from
+/// `override`, so the widget's look always survives; a press implies a hover,
+/// and pressed wins.
+pub fn interact(self: *Element) void {
+    if (self.events.click.active) {
+        if (self.press) |p| p.apply(&self.style);
+    } else if (self.events.hover.active) {
+        if (self.hover) |h| h.apply(&self.style);
+    }
 }
 
 /// The element's draw-time shape in the parent's coordinate space: position
