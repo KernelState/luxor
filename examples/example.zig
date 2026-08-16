@@ -62,14 +62,10 @@ fn onKey(data: *anyopaque, key: lu.Key, down: bool) void {
 }
 
 fn onClick(data: *anyopaque, _: lu.Offset, pressed: bool) void {
-    std.log.info("toolbar click", .{});
     const app: *AppState = @ptrCast(@alignCast(data));
     if (!pressed) app.click_count += 1;
 }
 
-fn onClickBad(_: *anyopaque, _: lu.Offset, _: bool) void {
-    std.log.info("toolbar missed", .{});
-}
 
 fn onCheckbox(data: *anyopaque, _: lu.Offset, pressed: bool) void {
     const app: *AppState = @ptrCast(@alignCast(data));
@@ -186,7 +182,6 @@ pub fn main() !void {
             .style = .{ .background = lu.Background.solid(lu.Color{ .r = 0xDC, .g = 0xE4, .b = 0xF0, .a = 0xFF }) },
             .layout = .{ .vtable = &lu.Layout.flex, .parent = null, .data = &root_cfg },
             .ctx = ctx,
-            .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onClickBad }} } } },
         };
 
         // Start with the root as the current parent. Nested containers push the
@@ -226,7 +221,6 @@ pub fn main() !void {
             .style = .{ .background = lu.Background.solid(.{ .r = 0, .g = 0, .b = 0, .a = 0 }) },
             .layout = .{ .vtable = &lu.Layout.flex, .parent = &root.layout.?, .data = &toolbar_cfg },
             .ctx = ctx,
-            .events = .{ .click = .{ .handle = .{ .fptrs = &.{.{ .data = &app, .func = &onClickBad }} } } },
         };
         // Stretch the toolbar across the window width (main is fixed), wrap the
         // buttons, and let its height come from the wrapped content.
